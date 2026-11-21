@@ -32,9 +32,9 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     @Published public var isPlayerExpanded: Bool = false
     @Published public var activeOverlayTab: ExpandedOverlayTab = .none
     @Published public var activeYouTubeVideoID: String? = nil
-    /// False by default so YouTube Music plays in pure Apple Music square-artwork Audio mode; user can toggle Video Clip mode if desired.
     @Published public var isYouTubeVideoVisible: Bool = false
     @Published public var playbackStatusBanner: String? = nil
+    public private(set) var capturedYouTubeAudioStreamURLs: [String: URL] = [:]
 
     // MARK: - Audio Enhancement Settings
 
@@ -55,6 +55,8 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
 
     private var primaryPlayer = AVPlayer()
     private var crossfadeSecondaryPlayer: AVPlayer?
+    private var backgroundKeepAliveAudioPlayer: AVAudioPlayer?
+    private var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
     private weak var youtubeWebView: WKWebView?
     private var timeObserverToken: Any?
     private var endOfTrackCancellable: AnyCancellable?
@@ -75,9 +77,68 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
 
     private init() {
         configureAudioSession()
+        prepareSilentBackgroundKeepAlivePlayer()
         configureRemoteCommandCenter()
         configureAudioNotifications()
         attachPeriodicTimeObserver()
+    }
+
+    public func recordCapturedYouTubeAudioStreamURL(_ url: URL, forVideoID videoID: String) {
+        capturedYouTubeAudioStreamURLs[videoID] = url
+    }
+
+    private func prepareSilentBackgroundKeepAlivePlayer() {
+        // Synthesize a tiny valid 1-second 8kHz 16-bit mono silent WAV in memory so iOS keeps the app's audio process awake in background
+        let sampleRate: UInt32 = 8000
+        let numSamples: UInt32 = 8000
+        let dataSize: UInt32 = numSamples * 2
+        let fileSize: UInt32 = 36 + dataSize
+        var wavData = Data()
+        wavData.append(contentsOf: [0x52, 0x49, 0x46, 0x46]) // "RIFF"
+        withUnsafeBytes(of: fileSize.littleEndian) { wavData.append(contentsOf: $0) }
+        wavData.append(contentsOf: [0x57, 0x41, 0x56, 0x45]) // "WAVE"
+        wavData.append(contentsOf: [0x66, 0x6D, 0x74, 0x20]) // "fmt "
+        withUnsafeBytes(of: UInt32(16).littleEndian) { wavData.append(contentsOf: $0) }
+        withUnsafeBytes(of: UInt16(1).littleEndian) { wavData.append(contentsOf: $0) }  // PCM
+        withUnsafeBytes(of: UInt16(1).littleEndian) { wavData.append(contentsOf: $0) }  // 1 channel
+        withUnsafeBytes(of: sampleRate.littleEndian) { wavData.append(contentsOf: $0) }
+        withUnsafeBytes(of: (sampleRate * 2).littleEndian) { wavData.append(contentsOf: $0) }
+        withUnsafeBytes(of: UInt16(2).littleEndian) { wavData.append(contentsOf: $0) }
+        withUnsafeBytes(of: UInt16(16).littleEndian) { wavData.append(contentsOf: $0) }
+        wavData.append(contentsOf: [0x64, 0x61, 0x74, 0x61]) // "data"
+        withUnsafeBytes(of: dataSize.littleEndian) { wavData.append(contentsOf: $0) }
+        wavData.append(Data(count: Int(dataSize)))
+
+        if let silentPlayer = try? AVAudioPlayer(data: wavData) {
+            silentPlayer.numberOfLoops = -1
+            silentPlayer.volume = 0.005
+            silentPlayer.prepareToPlay()
+            self.backgroundKeepAliveAudioPlayer = silentPlayer
+        }
+    }
+
+    private func setBackgroundKeepAliveActive(_ active: Bool) {
+        if active {
+            configureAudioSession(mixWithWebKit: activeYouTubeVideoID != nil)
+            if !(backgroundKeepAliveAudioPlayer?.isPlaying ?? false) {
+                backgroundKeepAliveAudioPlayer?.play()
+            }
+            if backgroundTaskID == .invalid {
+                backgroundTaskID = UIApplication.shared.beginBackgroundTask(withName: "AuraMusicBackgroundAudio") { [weak self] in
+                    guard let self else { return }
+                    if self.backgroundTaskID != .invalid {
+                        UIApplication.shared.endBackgroundTask(self.backgroundTaskID)
+                        self.backgroundTaskID = .invalid
+                    }
+                }
+            }
+        } else {
+            backgroundKeepAliveAudioPlayer?.pause()
+            if backgroundTaskID != .invalid {
+                UIApplication.shared.endBackgroundTask(backgroundTaskID)
+                backgroundTaskID = .invalid
+            }
+        }
     }
 
     // MARK: - YouTube IFrame JS Bridge Handlers
@@ -140,6 +201,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         isBuffering = false
         isPlaying = true
         playbackStatusBanner = nil
+        setBackgroundKeepAliveActive(true)
         refreshNowPlayingMetadata()
 
         // Native Swift 150ms smooth clock interpolator so lyrics highlight & scroll continuously even if WebKit throttles JS timers
@@ -182,10 +244,13 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
 
     // MARK: - Audio Session & System Notifications
 
-    private func configureAudioSession() {
+    private func configureAudioSession(mixWithWebKit: Bool = true) {
         do {
             let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playback, mode: .default, options: [.allowAirPlay, .allowBluetoothA2DP])
+            let options: AVAudioSession.CategoryOptions = mixWithWebKit
+                ? [.mixWithOthers, .allowAirPlay, .allowBluetoothA2DP]
+                : [.allowAirPlay, .allowBluetoothA2DP]
+            try session.setCategory(.playback, mode: .default, options: options)
             try session.setActive(true)
         } catch {
             // Simulator or restricted audio environment
@@ -193,6 +258,28 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     }
 
     private func configureAudioNotifications() {
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in
+                guard self.isPlaying else { return }
+                self.setBackgroundKeepAliveActive(true)
+                if self.activeYouTubeVideoID != nil {
+                    self.evaluateYouTubeJS("if(window.auraControl){window.auraControl.resume();}")
+                    try? await Task.sleep(nanoseconds: 250_000_000)
+                    if self.isPlaying {
+                        self.evaluateYouTubeJS("if(window.auraControl){window.auraControl.resume();}")
+                    }
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                    if self.isPlaying {
+                        self.evaluateYouTubeJS("if(window.auraControl){window.auraControl.resume();}")
+                    }
+                }
+            }
+        }
         NotificationCenter.default.addObserver(
             forName: AVAudioSession.interruptionNotification,
             object: AVAudioSession.sharedInstance(),
@@ -358,11 +445,13 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     private func loadAndStartPlayback(for track: UniversalTrack) async {
         configureAudioSession()
 
-        // 1. Check if downloaded or imported as a local file first
-        if let localRelative = track.localFileRelativePath,
+        // 1. Check if downloaded offline or imported as a local file first (works 100% offline in Airplane Mode)
+        let offlinePath = track.localFileRelativePath
+            ?? OfflineDownloadManager.shared.completedLocalRelativePath(for: track.id)
+        if let localRelative = offlinePath,
            let fileURL = resolveLocalFileURL(relativePath: localRelative),
            FileManager.default.fileExists(atPath: fileURL.path) {
-            startAVPlayer(with: fileURL, for: track, banner: nil)
+            startAVPlayer(with: fileURL, for: track, banner: "Offline Audio")
             return
         }
 
@@ -614,6 +703,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         primaryPlayer.pause()
         crossfadeSecondaryPlayer?.pause()
         ApplicationMusicPlayer.shared.pause()
+        setBackgroundKeepAliveActive(false)
         isPlaying = false
         refreshNowPlayingMetadata()
     }
@@ -622,6 +712,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         guard currentTrack != nil else { return }
         configureAudioSession()
         if activeYouTubeVideoID != nil {
+            setBackgroundKeepAliveActive(true)
             evaluateYouTubeJS("if(window.auraControl){window.auraControl.resume();}")
             isPlaying = true
         } else {
