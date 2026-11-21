@@ -858,11 +858,18 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
 
             function reportCapturedAudioURL(rawUrl) {
               if (!rawUrl || typeof rawUrl !== 'string') return;
-              if (rawUrl.indexOf('googlevideo.com/videoplayback') !== -1 &&
-                  (rawUrl.indexOf('mime=audio') !== -1 || rawUrl.indexOf('mime%3Daudio') !== -1)) {
-                var clean = rawUrl.replace(/&range=[^&]+/g, '').replace(/&rn=[^&]+/g, '').replace(/&rbuf=[^&]+/g, '');
+              var isVideoPlaybackAudio = rawUrl.indexOf('googlevideo.com/videoplayback') !== -1 &&
+                  (rawUrl.indexOf('mime=audio') !== -1 || rawUrl.indexOf('mime%3Daudio') !== -1);
+              var isHlsManifest = rawUrl.indexOf('manifest.googlevideo.com') !== -1 || rawUrl.indexOf('.m3u8') !== -1;
+              if (isVideoPlaybackAudio || isHlsManifest) {
+                var clean = isVideoPlaybackAudio
+                  ? rawUrl.replace(/&range=[^&]+/g, '').replace(/&rn=[^&]+/g, '').replace(/&rbuf=[^&]+/g, '')
+                  : rawUrl;
+                var isMp4OrHls = isHlsManifest || clean.indexOf('mime=audio/mp4') !== -1 || clean.indexOf('mime%3Daudio%2Fmp4') !== -1;
+                if (window._lastReportedAudioIsMp4 && !isMp4OrHls) return;
                 if (window._lastReportedAudioUrl !== clean && window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.auraYT) {
                   window._lastReportedAudioUrl = clean;
+                  if (isMp4OrHls) window._lastReportedAudioIsMp4 = true;
                   window.webkit.messageHandlers.auraYT.postMessage({
                     type: 'audioStream',
                     audioURL: clean,
@@ -873,6 +880,7 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
                 }
               }
             }
+            window._auraReportCapturedAudioURL = reportCapturedAudioURL;
 
             var origFetch = window.fetch;
             if (origFetch) {
@@ -998,12 +1006,18 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
             } catch(e) {}
           }
 
+          var lastTickPostAt = 0;
+          var lastTickState = -999;
+          window._auraPausedTickPostCount = 0;
+
           window.auraControl = {
             play: function() {
               window._auraSoftPaused = false;
               window._auraUserPaused = false;
               window._auraAllowPause = false;
               window._auraPendingUserResumeUntil = Date.now() + 2500;
+              lastTickState = 1;
+              lastTickPostAt = Date.now();
               try { if (navigator.mediaSession) navigator.mediaSession.playbackState = 'playing'; } catch(e) {}
               var v = document.querySelector('video');
               if (v) {
@@ -1026,10 +1040,13 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
               window._auraStartupProtectUntil = 0;
               window._auraBgProtectUntil = 0;
               window._auraPendingUserResumeUntil = 0;
+              lastTickState = 2;
+              lastTickPostAt = Date.now();
               try { if (navigator.mediaSession) navigator.mediaSession.playbackState = 'paused'; } catch(e) {}
               if (v) {
                 applyNativeMute(v, true);
                 try { v.playbackRate = 0.25; } catch(e) {}
+                window._auraPausedTickPostCount = (window._auraPausedTickPostCount || 0) + 1;
                 postMessageToSwift({
                   type: 'tick',
                   currentTime: window._auraSoftPauseTime || 0,
@@ -1051,6 +1068,8 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
               window._auraStartupProtectUntil = 0;
               window._auraBgProtectUntil = 0;
               window._auraPendingUserResumeUntil = 0;
+              lastTickState = 2;
+              lastTickPostAt = Date.now();
               try { if (navigator.mediaSession) navigator.mediaSession.playbackState = 'paused'; } catch(e) {}
               var v = document.querySelector('video');
               if (v) {
@@ -1064,6 +1083,7 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
               var mp = document.getElementById('movie_player');
               if (mp && mp.pauseVideo) { try { mp.pauseVideo(); } catch(e) {} }
               if (v) {
+                window._auraPausedTickPostCount = (window._auraPausedTickPostCount || 0) + 1;
                 postMessageToSwift({
                   type: 'tick',
                   currentTime: v.currentTime || 0,
@@ -1076,12 +1096,13 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
             },
             resume: function() {
               var wasSoftPaused = (window._auraSoftPaused === true);
-              var wasPaused = (window._auraUserPaused === true);
               window._auraSoftPaused = false;
               window._auraUserPaused = false;
               window._auraAllowPause = false;
               window._auraPendingUserResumeUntil = Date.now() + 2500;
               window._auraBgProtectUntil = Date.now() + 1800;
+              lastTickState = 1;
+              lastTickPostAt = Date.now();
               try { if (navigator.mediaSession) navigator.mediaSession.playbackState = 'playing'; } catch(e) {}
               var v = document.querySelector('video');
               if (v) {
@@ -1093,10 +1114,17 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
                 var mp = document.getElementById('movie_player');
                 if (mp && mp.unMute) { try { mp.unMute(); } catch(e) {} }
                 if (v.paused && !v.ended) {
-                  forceUnmuteAndPlayIfNeeded(v, wasPaused);
                   if (mp && mp.playVideo) { try { mp.playVideo(); } catch(e) {} }
                   try { v.play().catch(function(){}); } catch(e) {}
                 }
+                setTimeout(function() {
+                  if (!window._auraUserPaused && !window._auraSoftPaused && v && v.paused && !v.ended) {
+                    applyNativeMute(v, false);
+                    var mp2 = document.getElementById('movie_player');
+                    if (mp2 && mp2.playVideo) { try { mp2.playVideo(); } catch(e) {} }
+                    try { v.play().catch(function(){}); } catch(e) {}
+                  }
+                }, 150);
                 postMessageToSwift({
                   type: 'tick',
                   currentTime: v.currentTime || 0,
@@ -1190,16 +1218,16 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
           }
           installMediaSessionHandlers();
 
-          var lastTickPostAt = 0;
-          var lastTickState = -999;
           function postCurrentVideoTick(v, extraFlags) {
             if (!v) return;
             var dur = v.duration || 0;
             var nowMs = Date.now();
             if (window._auraSoftPaused === true) {
-              if (!extraFlags && lastTickState === 2 && (nowMs - lastTickPostAt) < 400) return;
+              // Once soft-paused state=2 has been reported, NEVER spam repeated state=2 ticks
+              if (!extraFlags && lastTickState === 2) return;
               lastTickPostAt = nowMs;
               lastTickState = 2;
+              window._auraPausedTickPostCount = (window._auraPausedTickPostCount || 0) + 1;
               postMessageToSwift({
                 type: 'tick',
                 currentTime: window._auraSoftPauseTime || 0,
@@ -1217,12 +1245,19 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
             } else if (v.paused) {
               st = (!window._auraUserPaused && (cur <= 0.05 || v.readyState < 3)) ? 3 : 2;
             }
-            // Throttle steady-state IPC messages to ~4-5Hz to eliminate WebKit->MainThread bridge congestion while keeping instant state transitions
+            // Never spam repeated paused ticks (state=2) while paused — emit once on transition only!
+            if (!extraFlags && st === 2 && lastTickState === 2) {
+              return;
+            }
+            // Throttle steady-state playing IPC messages to ~4-5Hz to eliminate WebKit->MainThread bridge congestion while keeping instant state transitions
             if (!extraFlags && st === lastTickState && (nowMs - lastTickPostAt) < 190) {
               return;
             }
             lastTickPostAt = nowMs;
             lastTickState = st;
+            if (st === 2) {
+              window._auraPausedTickPostCount = (window._auraPausedTickPostCount || 0) + 1;
+            }
             var pendingResume = nowMs < (window._auraPendingUserResumeUntil || 0);
             var payload = {
               type: 'tick',
@@ -1357,6 +1392,9 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
 
             if (!v.paused && v.currentTime > 0.25) {
               v._auraHasPlayedOnce = true;
+              if (window._auraReportCapturedAudioURL && v.currentSrc && v.currentSrc.indexOf('http') === 0) {
+                window._auraReportCapturedAudioURL(v.currentSrc);
+              }
             }
 
             forceUnmuteAndPlayIfNeeded(v, false);

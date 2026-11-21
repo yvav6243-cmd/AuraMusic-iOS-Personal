@@ -1042,4 +1042,236 @@ final class AuraMusicCoreTests: XCTestCase {
         XCTAssertEqual(afterExplicitPause?["userPaused"] as? Bool, true, "Explicit user pause MUST work immediately even during startup window")
         XCTAssertEqual(afterExplicitPause?["startupProtectUntil"] as? Double ?? -1, 0, accuracy: 0.001)
     }
+
+    // MARK: - Regression Tests for Unpause Lockout Bug (Run #78 Root Cause)
+
+    @MainActor
+    func testRepeatingPausedHeartbeatsNeverLockPlayPauseCooldownAndUnpauseWorksAfterOneSecond() async throws {
+        // EXACT reproduction of Run #78 bug:
+        // User pauses song, WebKit sends repeating state=2/userPaused=true ticks every ~150ms,
+        // and 1.1s later user taps Play (togglePlayPause) -> MUST SUCCEED and unpause immediately!
+        let engine = UniversalAudioPlayerEngine.shared
+        let track = UniversalTrack(
+            provider: .youtubeMusic,
+            providerTrackID: "unpause-regression-01",
+            title: "Starboy",
+            artist: "The Weeknd",
+            album: "Starboy",
+            duration: 230.0,
+            isStreamable: true
+        )
+
+        engine.play(track)
+        engine.activeYouTubeVideoID = track.providerTrackID
+        engine.resetPlayPauseCooldownForTesting()
+        XCTAssertTrue(engine.isPlaying)
+
+        // 1. User taps Pause at real wall time t0
+        let t0 = CACurrentMediaTime()
+        XCTAssertTrue(engine.togglePlayPause(at: t0), "Initial Pause tap must succeed")
+        XCTAssertFalse(engine.isPlaying)
+
+        // 2. Simulate 8 repeating JS paused ticks arriving over 1.2s while paused
+        for _ in 0..<8 {
+            try await Task.sleep(nanoseconds: 150_000_000)
+            engine.handleYouTubePlayerEvent(
+                currentTime: 32.0,
+                duration: 230.0,
+                stateCode: 2,
+                userPaused: true,
+                userResumed: false
+            )
+            XCTAssertFalse(engine.isPlaying)
+        }
+
+        // 3. Now (~1.2s after initial Pause) user taps Play -> MUST IMMEDIATELY UNPAUSE!
+        let didUnpause = engine.togglePlayPause(at: CACurrentMediaTime())
+        XCTAssertTrue(didUnpause, "Repeating paused ticks MUST NEVER lock the 1.0s Play/Pause cooldown!")
+        XCTAssertTrue(engine.isPlaying, "Song MUST unpause immediately when tapping Play after >=1.0s")
+        XCTAssertEqual(MPNowPlayingInfoCenter.default().playbackState, .playing)
+
+        engine.pause()
+        engine.activeYouTubeVideoID = nil
+    }
+
+    @MainActor
+    func testStaleInFlightPausedTickImmediatelyAfterResumeNeverSnapsBackToPause() {
+        let engine = UniversalAudioPlayerEngine.shared
+        let track = UniversalTrack(
+            provider: .youtubeMusic,
+            providerTrackID: "inflight-pause-race-01",
+            title: "I Got Love",
+            artist: "Miyagi & Эндшпиль",
+            album: "I Got Love",
+            duration: 277.0,
+            isStreamable: true
+        )
+
+        engine.play(track)
+        engine.activeYouTubeVideoID = track.providerTrackID
+        engine.pause()
+        XCTAssertFalse(engine.isPlaying)
+
+        // User taps Play -> resume() runs
+        engine.resume()
+        XCTAssertTrue(engine.isPlaying)
+
+        // 20ms later, an in-flight { state: 2, userPaused: true } tick that was queued before resume() arrives!
+        engine.handleYouTubePlayerEvent(
+            currentTime: 44.0,
+            duration: 277.0,
+            stateCode: 2,
+            userPaused: true,
+            userResumed: false
+        )
+        XCTAssertTrue(engine.isPlaying, "Stale in-flight paused tick right after resume() MUST NEVER snap Play back to Pause")
+        XCTAssertEqual(MPNowPlayingInfoCenter.default().playbackState, .playing)
+
+        engine.pause()
+        engine.activeYouTubeVideoID = nil
+    }
+
+    @MainActor
+    func testRepeatedIdempotentPauseCallsWhileAlreadyPausedNeverExtendOneSecondCooldown() {
+        let engine = UniversalAudioPlayerEngine.shared
+        let track = UniversalTrack(
+            provider: .youtubeMusic,
+            providerTrackID: "idempotent-pause-01",
+            title: "Asphalt 8",
+            artist: "MACAN",
+            album: "12",
+            duration: 136.0,
+            isStreamable: true
+        )
+
+        engine.play(track)
+        engine.activeYouTubeVideoID = track.providerTrackID
+        engine.resetPlayPauseCooldownForTesting()
+        XCTAssertTrue(engine.isPlaying)
+
+        // Pause transitions playing -> paused at t = 50.0s (arms cooldown to 50.0)
+        engine.pause(recordCooldownAt: 50.0)
+        XCTAssertFalse(engine.isPlaying)
+
+        // Redundant duplicate pause() arrives at t = 50.7s while ALREADY paused -> MUST NOT extend cooldown!
+        engine.pause(recordCooldownAt: 50.7)
+        XCTAssertFalse(engine.isPlaying)
+
+        // User taps Play at t = 51.05s (>= 1.0s after 50.0s, < 1.0s after 50.7s) -> MUST SUCCEED!
+        XCTAssertTrue(
+            engine.togglePlayPause(at: 51.05),
+            "Idempotent pause() while already paused must NEVER extend the 1.0s cooldown"
+        )
+        XCTAssertTrue(engine.isPlaying)
+
+        engine.pause()
+        engine.activeYouTubeVideoID = nil
+    }
+
+    @MainActor
+    func testResumeRecoversGracefullyWhenTrackLoadedWithoutActivePlayer() {
+        let engine = UniversalAudioPlayerEngine.shared
+        let track = UniversalTrack(
+            provider: .youtubeMusic,
+            providerTrackID: "recover-empty-player-01",
+            title: "Blinding Lights",
+            artist: "The Weeknd",
+            album: "After Hours",
+            duration: 200.0,
+            isStreamable: true
+        )
+
+        engine.play(track)
+        engine.pause()
+        engine.activeYouTubeVideoID = nil
+        XCTAssertFalse(engine.isPlaying)
+
+        // Tapping Play when activeYouTubeVideoID == nil and primaryPlayer has no item must recover & restart playback!
+        engine.resume()
+        XCTAssertTrue(engine.isPlaying, "resume() must recover and restart track playback when no active player item exists")
+        XCTAssertEqual(engine.currentTrack?.id, track.id)
+
+        engine.pause()
+        engine.activeYouTubeVideoID = nil
+    }
+
+    @MainActor
+    func testWebKitPauseDoesNotSpamState2TicksAndResumeClearsUserPausedCleanly() async throws {
+        let playerView = AuthorizedYouTubeIFramePlayerView(videoID: "YkY4X_OaF6o")
+        let coordinator = playerView.makeCoordinator()
+        let webView = AuthorizedYouTubeIFramePlayerView.makeConfiguredWebView(coordinator: coordinator)
+        let navWaiter = TestWKNavigationWaiter()
+        webView.navigationDelegate = navWaiter
+        defer {
+            webView.navigationDelegate = nil
+            webView.configuration.userContentController.removeScriptMessageHandler(forName: "auraYT")
+        }
+
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            navWaiter.continuation = cont
+            webView.loadHTMLString(
+                "<!doctype html><html><head><title>NoSpamTest</title></head><body><video id='v' playsinline></video></body></html>",
+                baseURL: URL(string: "https://m.youtube.com/watch?v=YkY4X_OaF6o")
+            )
+        }
+
+        var ready = false
+        for _ in 0..<15 {
+            if let ok = try? await webView.evaluateJavaScript("typeof window.auraControl === 'object' && document.querySelector('video') && document.querySelector('video')._auraListenersAttached === true") as? Bool,
+               ok {
+                ready = true
+                break
+            }
+            try await Task.sleep(nanoseconds: 200_000_000)
+        }
+        XCTAssertTrue(ready)
+
+        // 1. Trigger pause() and reset counter check
+        let countAfterPause = try await webView.evaluateJavaScript("""
+        (function() {
+          window._auraPausedTickPostCount = 0;
+          window.auraControl.pause();
+          return window._auraPausedTickPostCount;
+        })()
+        """) as? Int
+        XCTAssertEqual(countAfterPause, 1, "pause() should emit exactly one state=2 transition tick")
+
+        // 2. Wait 600ms (>3 intervals of 180ms) while paused -> count MUST stay 1 (ZERO repeating state=2 spam!)
+        try await Task.sleep(nanoseconds: 600_000_000)
+        let countAfterWaiting = try await webView.evaluateJavaScript("window._auraPausedTickPostCount") as? Int
+        XCTAssertEqual(countAfterWaiting, 1, "180ms WebKit interval MUST NOT spam state=2 ticks while paused")
+
+        // 3. Same check for background soft-pause -> wait 600ms -> STILL ZERO spam!
+        let countAfterBgSoftPause = try await webView.evaluateJavaScript("""
+        (function() {
+          window._auraPausedTickPostCount = 0;
+          window.auraControl.enterBackground(1200);
+          window.auraControl.pauseInBackground();
+          return window._auraPausedTickPostCount;
+        })()
+        """) as? Int
+        XCTAssertEqual(countAfterBgSoftPause, 1)
+
+        try await Task.sleep(nanoseconds: 600_000_000)
+        let countAfterBgWaiting = try await webView.evaluateJavaScript("window._auraPausedTickPostCount") as? Int
+        XCTAssertEqual(countAfterBgWaiting, 1, "Background soft-pause MUST NOT spam state=2 ticks either")
+
+        // 4. Resume clears _auraUserPaused and _auraSoftPaused cleanly
+        let resumed = try await webView.evaluateJavaScript("""
+        (function() {
+          window.auraControl.resume();
+          var v = document.querySelector('video');
+          return {
+            userPaused: window._auraUserPaused === true,
+            softPaused: window._auraSoftPaused === true,
+            realMuted: window._auraOrigMutedDesc ? window._auraOrigMutedDesc.get.call(v) : true,
+            rate: v ? v.playbackRate : -1
+          };
+        })()
+        """) as? [String: Any]
+        XCTAssertEqual(resumed?["userPaused"] as? Bool, false)
+        XCTAssertEqual(resumed?["softPaused"] as? Bool, false)
+        XCTAssertEqual(resumed?["realMuted"] as? Bool, false)
+        XCTAssertEqual(resumed?["rate"] as? Double ?? -1, 1.0, accuracy: 0.01)
+    }
 }
