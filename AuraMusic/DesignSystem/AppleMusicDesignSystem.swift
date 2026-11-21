@@ -19,7 +19,7 @@ public enum AuraTheme {
 
 // MARK: - Cached Artwork View with Apple Music Specular Rim & Shadow
 
-public struct AuraArtworkView: View {
+public struct AuraArtworkView: View, Equatable {
     public let url: URL?
     public let size: CGFloat
     public let cornerRadius: CGFloat
@@ -28,6 +28,14 @@ public struct AuraArtworkView: View {
 
     @State private var loadedImage: UIImage?
     @Environment(\.colorScheme) private var colorScheme
+
+    public static func == (lhs: AuraArtworkView, rhs: AuraArtworkView) -> Bool {
+        lhs.url == rhs.url &&
+        lhs.size == rhs.size &&
+        lhs.cornerRadius == rhs.cornerRadius &&
+        lhs.isPlayingElevated == rhs.isPlayingElevated &&
+        lhs.placeholderSymbol == rhs.placeholderSymbol
+    }
 
     public init(
         url: URL?,
@@ -41,9 +49,11 @@ public struct AuraArtworkView: View {
         self.cornerRadius = cornerRadius
         self.isPlayingElevated = isPlayingElevated
         self.placeholderSymbol = placeholderSymbol
+        self._loadedImage = State(initialValue: ArtworkCacheManager.shared.cachedMemoryImage(for: url))
     }
 
     public var body: some View {
+        let displayImage = loadedImage ?? ArtworkCacheManager.shared.cachedMemoryImage(for: url)
         ZStack {
             RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                 .fill(
@@ -56,8 +66,8 @@ public struct AuraArtworkView: View {
                     )
                 )
 
-            if let loadedImage {
-                Image(uiImage: loadedImage)
+            if let displayImage {
+                Image(uiImage: displayImage)
                     .resizable()
                     .scaledToFill()
                     .frame(width: size, height: size)
@@ -84,6 +94,10 @@ public struct AuraArtworkView: View {
                 loadedImage = nil
                 return
             }
+            if let memHit = ArtworkCacheManager.shared.cachedMemoryImage(for: url) {
+                loadedImage = memHit
+                return
+            }
             loadedImage = await ArtworkCacheManager.shared.image(for: url)
         }
     }
@@ -91,21 +105,26 @@ public struct AuraArtworkView: View {
 
 // MARK: - Animated Apple Music Fluid Artwork Mesh Background
 
-public struct DynamicArtworkMeshBackground: View {
+public struct DynamicArtworkMeshBackground: View, Equatable {
     public let artworkURL: URL?
     public var isAnimating: Bool = true
 
-    @State private var palette: [Color] = [
-        Color(red: 0.98, green: 0.14, blue: 0.23),
-        Color(red: 0.42, green: 0.09, blue: 0.38),
-        Color(red: 0.12, green: 0.08, blue: 0.22),
-        Color(red: 0.06, green: 0.06, blue: 0.10)
-    ]
-    @State private var phaseShift: Bool = false
+    @State private var palette: [Color]
+
+    public static func == (lhs: DynamicArtworkMeshBackground, rhs: DynamicArtworkMeshBackground) -> Bool {
+        lhs.artworkURL == rhs.artworkURL && lhs.isAnimating == rhs.isAnimating
+    }
 
     public init(artworkURL: URL?, isAnimating: Bool = true) {
         self.artworkURL = artworkURL
         self.isAnimating = isAnimating
+        let defaultPalette: [Color] = [
+            Color(red: 0.98, green: 0.14, blue: 0.23),
+            Color(red: 0.42, green: 0.09, blue: 0.38),
+            Color(red: 0.12, green: 0.08, blue: 0.22),
+            Color(red: 0.06, green: 0.06, blue: 0.10)
+        ]
+        self._palette = State(initialValue: ArtworkCacheManager.shared.cachedDominantColors(for: artworkURL) ?? defaultPalette)
     }
 
     public var body: some View {

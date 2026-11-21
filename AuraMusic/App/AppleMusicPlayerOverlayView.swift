@@ -8,12 +8,9 @@ public struct AppleMusicPlayerOverlayView: View {
     @ObservedObject var player: UniversalAudioPlayerEngine = .shared
     @ObservedObject var persistence: PersistenceController = .shared
     @ObservedObject var downloadManager: OfflineDownloadManager = .shared
-    @ObservedObject var lyricsService: LyricsService = .shared
 
     @Namespace private var playerAnimationNamespace
     @State private var dragOffset: CGFloat = 0
-    @State private var isScrubbing: Bool = false
-    @State private var scrubTimeValue: Double = 0
     @State private var showAddToPlaylistSheet: Bool = false
     @State private var showShareSheet: Bool = false
     @State private var showCustomCoverPicker: Bool = false
@@ -134,6 +131,7 @@ public struct AppleMusicPlayerOverlayView: View {
     private func expandedFullScreenPlayer(track: UniversalTrack) -> some View {
         ZStack {
             DynamicArtworkMeshBackground(artworkURL: track.artworkURL, isAnimating: player.isPlaying)
+                .equatable()
 
             VStack(spacing: 0) {
                 // Grabber Pill
@@ -173,7 +171,7 @@ public struct AppleMusicPlayerOverlayView: View {
                         trackTitleAndActionsRow(track: track)
                     }
 
-                    playbackTimeScrubber(track: track)
+                    ExpandedPlaybackScrubberView(track: track, player: player)
 
                     primaryTransportControls
 
@@ -253,42 +251,12 @@ public struct AppleMusicPlayerOverlayView: View {
                     .padding(.horizontal, 28)
             }
 
-            // Live Synchronized Lyric Line Preview Pill (Tap to open Full-Screen Apple Music Lyrics)
-            Button {
+            // Live Synchronized Lyric Line Preview Pill (isolated from main player redraws -> 120 FPS!)
+            LiveLyricPreviewPillView {
                 withAnimation(AuraTheme.springInteractive) {
                     player.activeOverlayTab = .lyrics
                 }
-            } label: {
-                HStack(spacing: 8) {
-                    Image(systemName: "quote.bubble.fill")
-                        .font(.system(size: 13, weight: .bold))
-                        .foregroundStyle(.white.opacity(0.9))
-                    if let activeLine = lyricsService.activeLyricLineText(at: player.currentTime) {
-                        Text(activeLine)
-                            .font(.system(size: 14, weight: .bold))
-                            .foregroundStyle(.white)
-                            .lineLimit(1)
-                    } else if lyricsService.isLoading {
-                        Text("Loading Synchronized Lyrics…")
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundStyle(.white.opacity(0.75))
-                    } else {
-                        Text("View Full-Screen Lyrics")
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundStyle(.white.opacity(0.85))
-                    }
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 10, weight: .bold))
-                        .foregroundStyle(.white.opacity(0.6))
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 9)
-                .background(
-                    Capsule(style: .continuous)
-                        .fill(Color.white.opacity(0.16))
-                )
             }
-            .buttonStyle(.plain)
             .padding(.horizontal, 24)
 
             Spacer(minLength: 4)
@@ -455,51 +423,7 @@ public struct AppleMusicPlayerOverlayView: View {
         }
     }
 
-    // MARK: - Scrubber & Transport Controls
-
-    private func playbackTimeScrubber(track: UniversalTrack) -> some View {
-        let total = max(player.duration, track.duration, 1)
-        let activeValue = isScrubbing ? scrubTimeValue : min(player.currentTime, total)
-        let remaining = max(0, total - activeValue)
-
-        return VStack(spacing: 6) {
-            Slider(
-                value: Binding(
-                    get: { activeValue },
-                    set: { newValue in
-                        isScrubbing = true
-                        scrubTimeValue = newValue
-                    }
-                ),
-                in: 0...total,
-                onEditingChanged: { editing in
-                    if !editing {
-                        player.seek(to: scrubTimeValue)
-                        isScrubbing = false
-                    }
-                }
-            )
-            .tint(.white)
-
-            HStack {
-                Text(Self.formatSeconds(activeValue))
-                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(.white.opacity(0.65))
-
-                Spacer()
-
-                Text(track.provider.shortBadgeName)
-                    .font(.system(size: 10, weight: .bold, design: .rounded))
-                    .foregroundStyle(.white.opacity(0.75))
-
-                Spacer()
-
-                Text("-\(Self.formatSeconds(remaining))")
-                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(.white.opacity(0.65))
-            }
-        }
-    }
+    // MARK: - Transport Controls
 
     private var primaryTransportControls: some View {
         HStack(spacing: 52) {
@@ -696,5 +620,120 @@ public struct AppleMusicPlayerOverlayView: View {
         let m = total / 60
         let s = total % 60
         return String(format: "%d:%02d", m, s)
+    }
+}
+
+// MARK: - Isolated 120 FPS Leaf Subviews (Only these re-render on PlaybackClock ticks!)
+
+private struct ExpandedPlaybackScrubberView: View {
+    let track: UniversalTrack
+    let player: UniversalAudioPlayerEngine
+    @ObservedObject private var clock: PlaybackClock = .shared
+
+    @State private var isScrubbing: Bool = false
+    @State private var scrubTimeValue: Double = 0
+
+    var body: some View {
+        let total = max(clock.duration, track.duration, 1)
+        let activeValue = isScrubbing ? scrubTimeValue : min(clock.currentTime, total)
+        let remaining = max(0, total - activeValue)
+
+        VStack(spacing: 6) {
+            Slider(
+                value: Binding(
+                    get: { activeValue },
+                    set: { newValue in
+                        isScrubbing = true
+                        scrubTimeValue = newValue
+                    }
+                ),
+                in: 0...total,
+                onEditingChanged: { editing in
+                    if !editing {
+                        player.seek(to: scrubTimeValue)
+                        isScrubbing = false
+                    }
+                }
+            )
+            .tint(.white)
+
+            HStack {
+                Text(Self.formatSeconds(activeValue))
+                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.65))
+
+                Spacer()
+
+                Text(track.provider.shortBadgeName)
+                    .font(.system(size: 10, weight: .bold, design: .rounded))
+                    .foregroundStyle(.white.opacity(0.75))
+
+                Spacer()
+
+                Text("-\(Self.formatSeconds(remaining))")
+                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.65))
+            }
+        }
+    }
+
+    private static func formatSeconds(_ value: TimeInterval) -> String {
+        guard value.isFinite && value >= 0 else { return "0:00" }
+        let total = Int(value.rounded())
+        let m = total / 60
+        let s = total % 60
+        return String(format: "%d:%02d", m, s)
+    }
+}
+
+private struct LiveLyricPreviewPillView: View {
+    let onTap: () -> Void
+    @ObservedObject private var lyricsService: LyricsService = .shared
+    @State private var displayedLine: String? = nil
+
+    var body: some View {
+        Button(action: onTap) {
+            HStack(spacing: 8) {
+                Image(systemName: "quote.bubble.fill")
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundStyle(.white.opacity(0.9))
+                if let activeLine = displayedLine {
+                    Text(activeLine)
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                } else if lyricsService.isLoading {
+                    Text("Loading Synchronized Lyrics…")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.75))
+                } else {
+                    Text("View Full-Screen Lyrics")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.85))
+                }
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(.white.opacity(0.6))
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 9)
+            .background(
+                Capsule(style: .continuous)
+                    .fill(Color.white.opacity(0.16))
+            )
+        }
+        .buttonStyle(.plain)
+        .onAppear {
+            displayedLine = lyricsService.activeLyricLineText(at: PlaybackClock.shared.currentTime)
+        }
+        .onChange(of: lyricsService.currentDocument?.id) { _, _ in
+            displayedLine = lyricsService.activeLyricLineText(at: PlaybackClock.shared.currentTime)
+        }
+        .onReceive(PlaybackClock.shared.$currentTime) { newTime in
+            let nextLine = lyricsService.activeLyricLineText(at: newTime)
+            if nextLine != displayedLine {
+                displayedLine = nextLine
+            }
+        }
     }
 }

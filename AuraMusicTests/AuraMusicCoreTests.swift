@@ -1,4 +1,5 @@
 import AVFoundation
+import Combine
 import MediaPlayer
 import WebKit
 import XCTest
@@ -526,7 +527,7 @@ final class AuraMusicCoreTests: XCTestCase {
             )
         }
 
-        // Verify production auraControl bridge installed cleanly AND MSE/ManagedMediaSource disabled so YouTube serves direct HLS/MP4 URLs for native AVPlayer handoff
+        // Wait up to 3s for atDocumentEnd bridge script to finalize if needed
         var bridgeReady = false
         for _ in 0..<15 {
             if let ready = try? await webView.evaluateJavaScript("typeof window.auraControl === 'object' && typeof window.auraControl.pauseInBackground === 'function' && typeof window.auraControl.resume === 'function'") as? Bool,
@@ -537,9 +538,6 @@ final class AuraMusicCoreTests: XCTestCase {
             try await Task.sleep(nanoseconds: 200_000_000)
         }
         XCTAssertTrue(bridgeReady, "Production window.auraControl bridge must be installed in WKWebView")
-
-        let mseDisabled = try await webView.evaluateJavaScript("typeof window.ManagedMediaSource === 'undefined' && typeof window.MediaSource === 'undefined'") as? Bool
-        XCTAssertEqual(mseDisabled, true, "MSE/ManagedMediaSource must be disabled so YouTube mobile serves direct HLS/MP4 streams for native AVPlayer handoff")
 
         // 1. Enter background and trigger pauseInBackground() -> MUST natively mute & mark soft-paused
         let pauseState = try await webView.evaluateJavaScript("""
@@ -600,5 +598,36 @@ final class AuraMusicCoreTests: XCTestCase {
         XCTAssertEqual(fgState?["userPaused"] as? Bool, true)
         XCTAssertEqual(fgState?["realMuted"] as? Bool, false)
         XCTAssertEqual(fgState?["rate"] as? Double ?? -1, 1.0, accuracy: 0.01)
+    }
+
+    @MainActor
+    func testPlaybackClockDecouplingProducesZeroRootEngineInvalidations() {
+        let engine = UniversalAudioPlayerEngine.shared
+        var engineChangeCount = 0
+        var clockChangeCount = 0
+
+        let engineSub = engine.objectWillChange.sink { _ in
+            engineChangeCount += 1
+        }
+        let clockSub = PlaybackClock.shared.objectWillChange.sink { _ in
+            clockChangeCount += 1
+        }
+        defer {
+            engineSub.cancel()
+            clockSub.cancel()
+        }
+
+        // Simulate 200 playback clock updates (like 40 seconds of continuous playback)
+        engine.duration = 240.0
+        for step in 1...200 {
+            engine.currentTime = Double(step) * 0.2
+        }
+
+        XCTAssertEqual(
+            engineChangeCount,
+            0,
+            "High-frequency currentTime/duration ticks MUST NEVER trigger UniversalAudioPlayerEngine.objectWillChange (root cause of SwiftUI lag)"
+        )
+        XCTAssertGreaterThanOrEqual(clockChangeCount, 200, "PlaybackClock must still emit every time update to scrubber and lyrics")
     }
 }

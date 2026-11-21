@@ -263,6 +263,11 @@ public final class PersistenceController: ObservableObject {
     private let favoriteAlbumsKey = "aura.favoriteAlbums.v1"
     private let searchHistoryKey = "aura.searchHistory.v1"
 
+    // O(1) in-memory lookup caches rebuilt once per reloadAll() to eliminate O(N) SwiftData scans inside ScrollView cells
+    private var favoriteTrackIDs: Set<String> = []
+    private var customArtworkURLByTrackID: [String: URL] = [:]
+    private var customArtworkFlagTrackIDs: Set<String> = []
+
     public init(inMemory: Bool = false) {
         let schema = Schema([
             PersistedTrackEntity.self,
@@ -296,7 +301,28 @@ public final class PersistenceController: ObservableObject {
         let trackDescriptor = FetchDescriptor<PersistedTrackEntity>(
             sortBy: [SortDescriptor(\.addedAt, order: .reverse)]
         )
-        self.libraryTracks = (try? context.fetch(trackDescriptor)) ?? []
+        let fetchedTracks = (try? context.fetch(trackDescriptor)) ?? []
+        self.libraryTracks = fetchedTracks
+
+        var favs = Set<String>()
+        var customURLs: [String: URL] = [:]
+        var customFlags = Set<String>()
+        for entity in fetchedTracks {
+            if entity.isFavorite {
+                favs.insert(entity.trackID)
+            }
+            if let artStr = entity.artworkURLString,
+               artStr.hasPrefix("file://"),
+               let url = URL(string: artStr) {
+                customURLs[entity.trackID] = url
+                if entity.customArtworkData != nil {
+                    customFlags.insert(entity.trackID)
+                }
+            }
+        }
+        self.favoriteTrackIDs = favs
+        self.customArtworkURLByTrackID = customURLs
+        self.customArtworkFlagTrackIDs = customFlags
 
         let playlistDescriptor = FetchDescriptor<PersistedPlaylistEntity>(
             sortBy: [SortDescriptor(\.updatedAt, order: .reverse)]
@@ -340,7 +366,8 @@ public final class PersistenceController: ObservableObject {
     public func upsertTrack(
         _ track: UniversalTrack,
         addToLibrary: Bool = true,
-        markFavorite: Bool? = nil
+        markFavorite: Bool? = nil,
+        reload: Bool = true
     ) -> PersistedTrackEntity {
         let id = track.id
         let descriptor = FetchDescriptor<PersistedTrackEntity>(
@@ -356,7 +383,7 @@ public final class PersistenceController: ObservableObject {
                 existing.artworkURLString = art
             }
             try? context.save()
-            reloadAll()
+            if reload { reloadAll() }
             return existing
         } else {
             let entity = PersistedTrackEntity(
@@ -379,7 +406,7 @@ public final class PersistenceController: ObservableObject {
             )
             context.insert(entity)
             try? context.save()
-            reloadAll()
+            if reload { reloadAll() }
             return entity
         }
     }
@@ -441,22 +468,15 @@ public final class PersistenceController: ObservableObject {
     }
 
     public func hasCustomArtwork(for trackID: String) -> Bool {
-        guard let entity = libraryTracks.first(where: { $0.trackID == trackID }) else { return false }
-        return (entity.artworkURLString ?? "").hasPrefix("file://") && entity.customArtworkData != nil
+        customArtworkFlagTrackIDs.contains(trackID)
     }
 
     public func effectiveArtworkURL(for track: UniversalTrack) -> URL? {
-        if let entity = libraryTracks.first(where: { $0.trackID == track.id }),
-           let customStr = entity.artworkURLString,
-           customStr.hasPrefix("file://"),
-           let customURL = URL(string: customStr) {
-            return customURL
-        }
-        return track.artworkURL
+        customArtworkURLByTrackID[track.id] ?? track.artworkURL
     }
 
     public func isTrackFavorite(_ trackID: String) -> Bool {
-        libraryTracks.first(where: { $0.trackID == trackID })?.isFavorite ?? false
+        favoriteTrackIDs.contains(trackID)
     }
 
     public func removeTrackFromLibrary(_ trackID: String) {
@@ -468,7 +488,7 @@ public final class PersistenceController: ObservableObject {
     }
 
     public func recordPlayback(of track: UniversalTrack, listenedSeconds: Double = 30) {
-        let entity = upsertTrack(track, addToLibrary: false)
+        let entity = upsertTrack(track, addToLibrary: false, reload: false)
         entity.playCount += 1
         entity.lastPlayedAt = .now
 

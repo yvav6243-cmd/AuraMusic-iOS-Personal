@@ -998,19 +998,25 @@ public struct AppleMusicInstrumentalDotsView: View, Equatable {
     }
 }
 
-// MARK: - Dedicated Lyric & Instrumental Row Views (Guaranteed Crisp Illumination)
+// MARK: - Dedicated Equatable Lyric & Instrumental Row Views (120 FPS + Guaranteed Crisp Illumination)
 
-private struct SyncedLyricTextRowView: View {
+private struct SyncedLyricTextRowView: View, Equatable {
     let text: String
     let isCurrent: Bool
     let isPast: Bool
+
+    static func == (lhs: SyncedLyricTextRowView, rhs: SyncedLyricTextRowView) -> Bool {
+        lhs.isCurrent == rhs.isCurrent &&
+        lhs.isPast == rhs.isPast &&
+        lhs.text == rhs.text
+    }
 
     var body: some View {
         Text(text)
             .font(.system(size: 25, weight: .bold))
             .foregroundStyle(.white.opacity(isCurrent ? 1.0 : (isPast ? 0.24 : 0.45)))
             .scaleEffect(isCurrent ? 1.05 : 0.96, anchor: .leading)
-            .shadow(color: isCurrent ? .white.opacity(0.22) : .clear, radius: 10)
+            .shadow(color: isCurrent ? .white.opacity(0.22) : .clear, radius: isCurrent ? 10 : 0)
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.vertical, 8)
             .padding(.horizontal, 14)
@@ -1025,9 +1031,13 @@ private struct SyncedLyricTextRowView: View {
     }
 }
 
-private struct SyncedInstrumentalDotsRowView: View {
+private struct SyncedInstrumentalDotsRowView: View, Equatable {
     let isCurrent: Bool
     let litDotsCount: Int
+
+    static func == (lhs: SyncedInstrumentalDotsRowView, rhs: SyncedInstrumentalDotsRowView) -> Bool {
+        lhs.isCurrent == rhs.isCurrent && lhs.litDotsCount == rhs.litDotsCount
+    }
 
     var body: some View {
         HStack {
@@ -1052,6 +1062,8 @@ public struct SynchronizedLyricsView: View {
     @ObservedObject var player: UniversalAudioPlayerEngine
     @ObservedObject var lyricsService: LyricsService = .shared
 
+    @State private var activeLineIndex: Int? = nil
+    @State private var activeDotStage: Int = 0
     @State private var isUserManualScrolling: Bool = false
     @State private var showTranslationOverlay: Bool = false
     @State private var showManualSearchSheet: Bool = false
@@ -1194,45 +1206,60 @@ public struct SynchronizedLyricsView: View {
         .padding(.vertical, 8)
     }
 
-    private func synchronizedLyricsScroll(doc: TrackLyricsDocument) -> some View {
-        // Single deterministic source of truth directly from playback time — can never get stuck or stale!
-        let currentActiveIndex = LyricSynchronizationEngine.activeLineIndex(
-            at: player.currentTime,
-            in: doc.syncedLines
-        )
+    private func syncActiveLineAndDots(at time: TimeInterval, in doc: TrackLyricsDocument) -> Int? {
+        let nextIdx = LyricSynchronizationEngine.activeLineIndex(at: time, in: doc.syncedLines)
+        let nextDots: Int
+        if let idx = nextIdx, doc.syncedLines[idx].isInstrumental {
+            nextDots = LyricSynchronizationEngine.litDotsCount(
+                at: time,
+                forLineAt: idx,
+                in: doc.syncedLines,
+                trackDuration: PlaybackClock.shared.duration
+            )
+        } else {
+            nextDots = 0
+        }
+        if activeLineIndex != nextIdx {
+            activeLineIndex = nextIdx
+        }
+        if activeDotStage != nextDots {
+            activeDotStage = nextDots
+        }
+        return nextIdx
+    }
 
-        return ScrollViewReader { proxy in
+    private func synchronizedLyricsScroll(doc: TrackLyricsDocument) -> some View {
+        ScrollViewReader { proxy in
             ScrollView(.vertical, showsIndicators: false) {
-                // Use VStack (not LazyVStack) so every row has exact known geometry and scrollTo never jumps after intro/pause dots
+                // VStack guarantees exact row frames for scrollTo; .equatable() rows ensure ONLY the 2 transitioning rows redraw!
                 VStack(alignment: .leading, spacing: 20) {
                     Spacer().frame(height: 24)
 
                     ForEach(doc.syncedLines) { line in
-                        let visualState = LyricSynchronizationEngine.rowVisualState(
-                            forLineAt: line.index,
-                            activeIndex: currentActiveIndex,
-                            currentTime: player.currentTime,
-                            in: doc.syncedLines,
-                            trackDuration: player.duration
-                        )
+                        let isCurrent = (activeLineIndex == line.index)
+                        let isPast = (activeLineIndex != nil) ? (line.index < activeLineIndex!) : false
 
                         Group {
                             if line.isInstrumental {
                                 SyncedInstrumentalDotsRowView(
-                                    isCurrent: visualState.isCurrent,
-                                    litDotsCount: visualState.litDotsCount
+                                    isCurrent: isCurrent,
+                                    litDotsCount: isCurrent ? activeDotStage : 0
                                 )
+                                .equatable()
                             } else {
                                 SyncedLyricTextRowView(
                                     text: line.text,
-                                    isCurrent: visualState.isCurrent,
-                                    isPast: visualState.isPast
+                                    isCurrent: isCurrent,
+                                    isPast: isPast
                                 )
+                                .equatable()
                             }
                         }
                         .id(line.index)
                         .onTapGesture {
                             isUserManualScrolling = false
+                            activeLineIndex = line.index
+                            activeDotStage = 0
                             player.seek(to: line.timestamp)
                             if !player.isPlaying {
                                 player.resume()
@@ -1249,25 +1276,25 @@ public struct SynchronizedLyricsView: View {
                 .padding(.horizontal, 20)
             }
             .onAppear {
-                let target = currentActiveIndex ?? 0
+                let initial = syncActiveLineAndDots(at: PlaybackClock.shared.currentTime, in: doc)
                 if !doc.syncedLines.isEmpty {
-                    proxy.scrollTo(target, anchor: UnitPoint(x: 0.5, y: 0.38))
+                    proxy.scrollTo(initial ?? 0, anchor: UnitPoint(x: 0.5, y: 0.38))
                 }
             }
             .onChange(of: doc.id) { _, _ in
                 isUserManualScrolling = false
-                let target = LyricSynchronizationEngine.activeLineIndex(
-                    at: player.currentTime,
-                    in: doc.syncedLines
-                ) ?? 0
+                let initial = syncActiveLineAndDots(at: PlaybackClock.shared.currentTime, in: doc)
                 if !doc.syncedLines.isEmpty {
-                    proxy.scrollTo(target, anchor: UnitPoint(x: 0.5, y: 0.38))
+                    proxy.scrollTo(initial ?? 0, anchor: UnitPoint(x: 0.5, y: 0.38))
                 }
             }
-            .onChange(of: currentActiveIndex) { _, newIdx in
-                guard !isUserManualScrolling, let target = newIdx else { return }
-                withAnimation(.interpolatingSpring(stiffness: 145, damping: 22)) {
-                    proxy.scrollTo(target, anchor: UnitPoint(x: 0.5, y: 0.38))
+            .onReceive(PlaybackClock.shared.$currentTime) { newTime in
+                let previousIdx = activeLineIndex
+                let nextIdx = syncActiveLineAndDots(at: newTime, in: doc)
+                if nextIdx != previousIdx, !isUserManualScrolling, let target = nextIdx {
+                    withAnimation(.interpolatingSpring(stiffness: 145, damping: 22)) {
+                        proxy.scrollTo(target, anchor: UnitPoint(x: 0.5, y: 0.38))
+                    }
                 }
             }
         }

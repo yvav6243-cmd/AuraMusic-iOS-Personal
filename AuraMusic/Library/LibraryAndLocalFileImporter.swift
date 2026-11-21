@@ -1008,7 +1008,6 @@ public struct TrackRowView: View {
 
     @ObservedObject var player: UniversalAudioPlayerEngine = .shared
     @ObservedObject var persistence: PersistenceController = .shared
-    @ObservedObject var downloadManager: OfflineDownloadManager = .shared
     @State private var showPlaylistPicker: Bool = false
     @State private var showShareSheet: Bool = false
     @State private var showCustomCoverPicker: Bool = false
@@ -1150,11 +1149,11 @@ public struct TrackRowView: View {
         }
 
         Button {
-            downloadManager.enqueueDownload(for: track)
+            OfflineDownloadManager.shared.enqueueDownload(for: track)
         } label: {
             Label(
-                downloadManager.isDownloaded(track.id) ? "Downloaded Offline ✓" : "Download Offline",
-                systemImage: downloadManager.isDownloaded(track.id) ? "checkmark.circle.fill" : "arrow.down.circle"
+                OfflineDownloadManager.shared.isDownloaded(track.id) ? "Downloaded Offline ✓" : "Download Offline",
+                systemImage: OfflineDownloadManager.shared.isDownloaded(track.id) ? "checkmark.circle.fill" : "arrow.down.circle"
             )
         }
 

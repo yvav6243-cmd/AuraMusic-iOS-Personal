@@ -767,7 +767,7 @@ private struct YouTubeFullVideoListResponse: Codable {
 
 public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
     public let videoID: String
-    @ObservedObject var playerEngine: UniversalAudioPlayerEngine = .shared
+    let playerEngine: UniversalAudioPlayerEngine = .shared
 
     public init(videoID: String) {
         self.videoID = videoID
@@ -783,21 +783,15 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
         return webView
     }
 
-    public static let safariMobileUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
-
     public static func makeConfiguredWebView(coordinator: Coordinator) -> WKWebView {
         let config = WKWebViewConfiguration()
         config.allowsInlineMediaPlayback = true
         config.mediaTypesRequiringUserActionForPlayback = []
 
-        // 1. Early script at document start: disable MSE so YouTube serves direct poToken-signed Apple HLS/MP4 URLs to <video>, lock unmute & mediaSession
+        // 1. Early script at document start: lock unmuted autoplay, block background visibility pause, and intercept audio stream URLs
         let unmuteLockScriptSource = """
         (function() {
           try {
-            // Force YouTube mobile web player to use native Apple HLS (.m3u8) / direct MP4 instead of blob: ManagedMediaSource
-            try { Object.defineProperty(window, 'ManagedMediaSource', { get: function() { return undefined; }, configurable: true }); } catch(e) {}
-            try { Object.defineProperty(window, 'MediaSource', { get: function() { return undefined; }, configurable: true }); } catch(e) {}
-
             var origMutedDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'muted');
             window._auraOrigMutedDesc = origMutedDesc;
             Object.defineProperty(HTMLMediaElement.prototype, 'muted', {
@@ -1189,10 +1183,16 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
           }
           installMediaSessionHandlers();
 
+          var lastTickPostAt = 0;
+          var lastTickState = -999;
           function postCurrentVideoTick(v, extraFlags) {
             if (!v) return;
             var dur = v.duration || 0;
+            var nowMs = Date.now();
             if (window._auraSoftPaused === true) {
+              if (!extraFlags && lastTickState === 2 && (nowMs - lastTickPostAt) < 400) return;
+              lastTickPostAt = nowMs;
+              lastTickState = 2;
               postMessageToSwift({
                 type: 'tick',
                 currentTime: window._auraSoftPauseTime || 0,
@@ -1210,7 +1210,13 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
             } else if (v.paused) {
               st = (!window._auraUserPaused && (cur <= 0.05 || v.readyState < 3)) ? 3 : 2;
             }
-            var pendingResume = Date.now() < (window._auraPendingUserResumeUntil || 0);
+            // Throttle steady-state IPC messages to ~4-5Hz to eliminate WebKit->MainThread bridge congestion while keeping instant state transitions
+            if (!extraFlags && st === lastTickState && (nowMs - lastTickPostAt) < 190) {
+              return;
+            }
+            lastTickPostAt = nowMs;
+            lastTickState = st;
+            var pendingResume = nowMs < (window._auraPendingUserResumeUntil || 0);
             var payload = {
               type: 'tick',
               currentTime: cur,
@@ -1343,24 +1349,6 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
 
             if (!v.paused && v.currentTime > 0.25) {
               v._auraHasPlayedOnce = true;
-
-              // Once the real song (not an ad) is streaming a direct poToken-signed HTTPS HLS/MP4 URL, hand it off to native iOS AVPlayer!
-              var isAdShowing = !!document.querySelector('.ad-showing, .ytp-ad-player-overlay');
-              var srcUrl = v.currentSrc || v.src || '';
-              if (!isAdShowing &&
-                  srcUrl.indexOf('https://') === 0 &&
-                  srcUrl.indexOf('blob:') !== 0 &&
-                  srcUrl !== window._auraReportedNativeSrc &&
-                  v.readyState >= 2 &&
-                  ((isFinite(v.duration) && v.duration >= 30) || srcUrl.indexOf('manifest') !== -1 || srcUrl.indexOf('m3u8') !== -1)) {
-                window._auraReportedNativeSrc = srcUrl;
-                postMessageToSwift({
-                  type: 'nativeStreamURL',
-                  streamURL: srcUrl,
-                  currentTime: v.currentTime || 0,
-                  duration: (isFinite(v.duration) && v.duration > 0) ? v.duration : 0
-                });
-              }
             }
 
             forceUnmuteAndPlayIfNeeded(v, false);
@@ -1378,7 +1366,7 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
         config.userContentController.add(coordinator, name: "auraYT")
 
         let webView = WKWebView(frame: .zero, configuration: config)
-        webView.customUserAgent = Self.safariMobileUserAgent
+        webView.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"
         webView.scrollView.isScrollEnabled = false
         webView.isOpaque = false
         webView.backgroundColor = .clear
@@ -1415,40 +1403,6 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
             guard let dict = message.body as? [String: Any] else { return }
             if let msgType = dict["type"] as? String {
                 switch msgType {
-                case "nativeStreamURL":
-                    if let streamURLString = dict["streamURL"] as? String,
-                       let streamURL = URL(string: streamURLString),
-                       let vid = loadedVideoID {
-                        let cur = (dict["currentTime"] as? Double) ?? 0
-                        let dur = (dict["duration"] as? Double) ?? 0
-                        let ua = AuthorizedYouTubeIFramePlayerView.safariMobileUserAgent
-                        if let cookieStore = self.webView?.configuration.websiteDataStore.httpCookieStore {
-                            cookieStore.getAllCookies { [weak self] cookies in
-                                Task { @MainActor in
-                                    self?.playerEngine?.attemptSeamlessNativeAVPlayerHandoff(
-                                        streamURL: streamURL,
-                                        cookies: cookies,
-                                        userAgent: ua,
-                                        forVideoID: vid,
-                                        resumeTime: cur,
-                                        duration: dur
-                                    )
-                                }
-                            }
-                        } else {
-                            Task { @MainActor in
-                                self.playerEngine?.attemptSeamlessNativeAVPlayerHandoff(
-                                    streamURL: streamURL,
-                                    cookies: [],
-                                    userAgent: ua,
-                                    forVideoID: vid,
-                                    resumeTime: cur,
-                                    duration: dur
-                                )
-                            }
-                        }
-                    }
-                    return
                 case "audioStream":
                     if let audioURLString = dict["audioURL"] as? String,
                        let audioURL = URL(string: audioURLString),

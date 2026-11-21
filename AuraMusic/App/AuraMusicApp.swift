@@ -3,9 +3,7 @@ import SwiftUI
 
 @main
 public struct AuraMusicApp: App {
-    @StateObject private var persistence = PersistenceController.shared
-    @StateObject private var player = UniversalAudioPlayerEngine.shared
-    @StateObject private var downloadManager = OfflineDownloadManager.shared
+    private let persistence = PersistenceController.shared
 
     public init() {}
 
@@ -39,7 +37,6 @@ public enum AppleMusicRootTab: String, CaseIterable, Identifiable {
 }
 
 public struct RootAppleMusicTabView: View {
-    @ObservedObject var player: UniversalAudioPlayerEngine = .shared
     @State private var selectedTab: AppleMusicRootTab = .home
 
     public init() {}
