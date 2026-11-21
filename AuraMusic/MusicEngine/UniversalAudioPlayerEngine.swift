@@ -82,24 +82,30 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
 
     public func handleYouTubePlayerEvent(currentTime: Double, duration: Double, stateCode: Int) {
         guard activeYouTubeVideoID != nil else { return }
-        if currentTime.isFinite && currentTime >= 0 {
+        if currentTime.isFinite && currentTime >= 0 && abs(currentTime - self.currentTime) >= 0.22 {
             self.currentTime = currentTime
         }
-        if duration.isFinite && duration > 0 {
+        if duration.isFinite && duration > 0 && abs(duration - self.duration) >= 0.5 {
             self.duration = duration
         }
         // YT.PlayerState: -1 unstarted, 0 ended, 1 playing, 2 paused, 3 buffering
         switch stateCode {
         case 1: // PLAYING
-            self.isPlaying = true
-            self.isBuffering = false
-            updateNowPlayingElapsedTime()
+            if !self.isPlaying || self.isBuffering {
+                self.isPlaying = true
+                self.isBuffering = false
+                updateNowPlayingElapsedTime()
+            }
         case 2: // PAUSED
-            self.isPlaying = false
-            self.isBuffering = false
-            updateNowPlayingElapsedTime()
+            if self.isPlaying || self.isBuffering {
+                self.isPlaying = false
+                self.isBuffering = false
+                updateNowPlayingElapsedTime()
+            }
         case 3: // BUFFERING
-            self.isBuffering = true
+            if !self.isBuffering {
+                self.isBuffering = true
+            }
         case 0: // ENDED
             handleTrackFinished()
         default:
@@ -225,23 +231,22 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     }
 
     private func attachPeriodicTimeObserver() {
-        let interval = CMTime(seconds: 0.08, preferredTimescale: 600)
+        let interval = CMTime(seconds: 0.25, preferredTimescale: 600)
         timeObserverToken = primaryPlayer.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
             guard let self else { return }
             Task { @MainActor in
                 guard self.activeYouTubeVideoID == nil else { return }
                 let seconds = time.seconds
-                if seconds.isFinite && seconds >= 0 {
+                if seconds.isFinite && seconds >= 0 && abs(seconds - self.currentTime) >= 0.20 {
                     self.currentTime = seconds
                 }
                 if let item = self.primaryPlayer.currentItem {
                     let itemDuration = item.duration.seconds
-                    if itemDuration.isFinite && itemDuration > 0 {
+                    if itemDuration.isFinite && itemDuration > 0 && abs(itemDuration - self.duration) >= 0.5 {
                         self.duration = itemDuration
                     }
                 }
                 self.checkCrossfadeTrigger()
-                self.updateNowPlayingElapsedTime()
             }
         }
     }
