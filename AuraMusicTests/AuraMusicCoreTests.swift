@@ -497,22 +497,46 @@ final class AuraMusicCoreTests: XCTestCase {
         engine.activeYouTubeVideoID = nil
     }
 
+    private final class TestWKNavigationWaiter: NSObject, WKNavigationDelegate {
+        var continuation: CheckedContinuation<Void, Never>?
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            continuation?.resume()
+            continuation = nil
+        }
+    }
+
     @MainActor
     func testBackgroundSoftPauseAndResumeWebKitJSRuntime() async throws {
         // Test the ACTUAL production WKWebView configuration & injected JS bridge on a live iOS Simulator WebView!
         let playerView = AuthorizedYouTubeIFramePlayerView(videoID: "YkY4X_OaF6o")
         let coordinator = playerView.makeCoordinator()
         let webView = AuthorizedYouTubeIFramePlayerView.makeConfiguredWebView(coordinator: coordinator)
+        let navWaiter = TestWKNavigationWaiter()
+        webView.navigationDelegate = navWaiter
         defer {
+            webView.navigationDelegate = nil
             webView.configuration.userContentController.removeScriptMessageHandler(forName: "auraYT")
         }
 
-        webView.loadHTMLString("<!doctype html><html><body><video id='v' playsinline></video></body></html>", baseURL: URL(string: "https://m.youtube.com/watch?v=YkY4X_OaF6o"))
-        try await Task.sleep(nanoseconds: 600_000_000)
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            navWaiter.continuation = cont
+            webView.loadHTMLString(
+                "<!doctype html><html><head><title>AuraTest</title></head><body><video id='v' playsinline></video></body></html>",
+                baseURL: URL(string: "https://m.youtube.com/watch?v=YkY4X_OaF6o")
+            )
+        }
 
-        // Verify production auraControl bridge installed cleanly
-        let bridgeReady = try await webView.evaluateJavaScript("typeof window.auraControl === 'object' && typeof window.auraControl.pauseInBackground === 'function' && typeof window.auraControl.resume === 'function'") as? Bool
-        XCTAssertEqual(bridgeReady, true, "Production window.auraControl bridge must be installed in WKWebView")
+        // Wait up to 3s for atDocumentEnd bridge script to finalize if needed
+        var bridgeReady = false
+        for _ in 0..<15 {
+            if let ready = try? await webView.evaluateJavaScript("typeof window.auraControl === 'object' && typeof window.auraControl.pauseInBackground === 'function' && typeof window.auraControl.resume === 'function'") as? Bool,
+               ready {
+                bridgeReady = true
+                break
+            }
+            try await Task.sleep(nanoseconds: 200_000_000)
+        }
+        XCTAssertTrue(bridgeReady, "Production window.auraControl bridge must be installed in WKWebView")
 
         // 1. Enter background and trigger pauseInBackground() -> MUST natively mute & mark soft-paused
         let pauseState = try await webView.evaluateJavaScript("""
