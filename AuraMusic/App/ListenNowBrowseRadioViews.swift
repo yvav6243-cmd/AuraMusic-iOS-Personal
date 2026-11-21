@@ -12,6 +12,10 @@ public final class MusicDiscoveryViewModel: ObservableObject {
     @Published public private(set) var recommendedAlbums: [UniversalAlbum] = []
     @Published public private(set) var featuredArtists: [UniversalArtist] = []
     @Published public private(set) var personalizedTracks: [UniversalTrack] = []
+    @Published public private(set) var genreRecommendedTracks: [UniversalTrack] = []
+    @Published public private(set) var producerRecommendedTracks: [UniversalTrack] = []
+    @Published public private(set) var activeGenreTitle: String = "Your Favorite Genres"
+    @Published public private(set) var activeProducerTitle: String = "Producers & Sound Creators"
     @Published public private(set) var isLoading: Bool = false
 
     private let audiusProvider = AudiusProvider()
@@ -28,9 +32,32 @@ public final class MusicDiscoveryViewModel: ObservableObject {
     public func refreshDiscovery() async {
         isLoading = true
 
-        let recentArtistSeed = PersistenceController.shared.recentHistory.first?.artist
-            ?? PersistenceController.shared.libraryTracks.first?.artist
-            ?? "The Weeknd Daft Punk"
+        let persistence = PersistenceController.shared
+        let favEntities = persistence.libraryTracks.filter(\.isFavorite)
+        let historyEntities = persistence.recentHistory
+
+        // 1. Determine user's favorite artist, genre, and producer/collaborator profile
+        let primaryArtist = favEntities.first?.artist
+            ?? historyEntities.first?.artist
+            ?? persistence.libraryTracks.first?.artist
+            ?? "The Weeknd"
+
+        let secondaryArtist = favEntities.dropFirst().first?.artist
+            ?? historyEntities.dropFirst().first?.artist
+            ?? "Daft Punk"
+
+        let primarySongTitle = favEntities.first?.title
+            ?? historyEntities.first?.title
+            ?? "Starboy"
+
+        let detectedProfile = await resolveGenreAndProducerSeed(
+            songTitle: primarySongTitle,
+            artistName: primaryArtist,
+            fallbackGenre: favEntities.first?.genre
+        )
+
+        self.activeGenreTitle = detectedProfile.genreDisplay
+        self.activeProducerTitle = detectedProfile.producerDisplay
 
         let creds = ProviderCredentialsStore.shared
         let hasYTMusic = creds.hasConfiguredAPI(for: .youtubeMusic)
@@ -41,34 +68,44 @@ public final class MusicDiscoveryViewModel: ObservableObject {
         let ytMusic = ytMusicProvider
 
         if hasYTMusic {
+            let genreQuery = "\(detectedProfile.genreQuerySeed) \(primaryArtist) official audio"
+            let producerQuery = "\(detectedProfile.producerQuerySeed) official audio"
+            let tasteQuery = "\(primaryArtist) \(secondaryArtist) official audio"
+
+            async let ytGenreTask = (try? await ytMusic.searchTracks(query: genreQuery, limit: 12)) ?? []
+            async let ytProducerTask = (try? await ytMusic.searchTracks(query: producerQuery, limit: 12)) ?? []
+            async let ytPersonalTask = (try? await ytMusic.searchTracks(query: tasteQuery, limit: 12)) ?? []
             async let ytTrendingTask = (try? await ytMusic.searchTracks(query: "Top Hits 2026 Official Audio", limit: 15)) ?? []
             async let ytChartsTask = (try? await ytMusic.searchTracks(query: "Global Top 50 Songs Audio", limit: 15)) ?? []
-            async let ytPersonalTask = (try? await ytMusic.searchTracks(query: recentArtistSeed, limit: 10)) ?? []
-            async let albumsTask = (try? await apple.searchAlbums(query: "Top Albums 2026", limit: 12)) ?? []
-            async let artistsTask = (try? await apple.searchArtists(query: recentArtistSeed, limit: 8)) ?? []
+            async let albumsTask = (try? await apple.searchAlbums(query: primaryArtist, limit: 10)) ?? []
+            async let artistsTask = (try? await apple.searchArtists(query: primaryArtist, limit: 8)) ?? []
 
-            let (ytTrending, ytCharts, ytPersonal, albums, artists) = await (
+            let (ytGenre, ytProducer, ytPersonal, ytTrending, ytCharts, albums, artists) = await (
+                ytGenreTask,
+                ytProducerTask,
+                ytPersonalTask,
                 ytTrendingTask,
                 ytChartsTask,
-                ytPersonalTask,
                 albumsTask,
                 artistsTask
             )
 
+            self.genreRecommendedTracks = ytGenre
+            self.producerRecommendedTracks = ytProducer
+            self.personalizedTracks = ytPersonal.isEmpty ? Array(ytTrending.prefix(10)) : ytPersonal
             self.trendingFullStreamTracks = ytTrending
             self.appleTopChartTracks = ytCharts
             self.recommendedAlbums = albums
             self.featuredArtists = artists
-            self.personalizedTracks = ytPersonal.isEmpty ? Array(ytTrending.prefix(10)) : ytPersonal
             self.isLoading = false
             return
         }
 
         async let audiusTrendingTask = (try? await audius.fetchTopCharts(limit: 20)) ?? []
         async let appleChartsTask: [UniversalTrack] = hasAppleMusic ? ((try? await apple.fetchTopCharts(limit: 20)) ?? []) : []
-        async let albumsTask = (try? await apple.searchAlbums(query: "Top Albums 2026", limit: 12)) ?? []
-        async let artistsTask = (try? await apple.searchArtists(query: recentArtistSeed, limit: 8)) ?? []
-        async let personalTask = (try? await audius.searchTracks(query: recentArtistSeed, limit: 12)) ?? []
+        async let albumsTask = (try? await apple.searchAlbums(query: primaryArtist, limit: 12)) ?? []
+        async let artistsTask = (try? await apple.searchArtists(query: primaryArtist, limit: 8)) ?? []
+        async let personalTask = (try? await audius.searchTracks(query: primaryArtist, limit: 12)) ?? []
 
         let (audiusTracks, appleCharts, albums, artists, personal) = await (
             audiusTrendingTask,
@@ -79,11 +116,73 @@ public final class MusicDiscoveryViewModel: ObservableObject {
         )
 
         self.trendingFullStreamTracks = audiusTracks
+        self.genreRecommendedTracks = personal
+        self.producerRecommendedTracks = Array(audiusTracks.prefix(8))
         self.appleTopChartTracks = appleCharts
         self.recommendedAlbums = albums
         self.featuredArtists = artists
         self.personalizedTracks = personal.isEmpty ? Array(audiusTracks.prefix(10)) : personal
         self.isLoading = false
+    }
+
+    /// Analyzes song metadata via iTunes Catalog to determine exact Genre, Producer/Label style, and sonic seeds
+    private func resolveGenreAndProducerSeed(
+        songTitle: String,
+        artistName: String,
+        fallbackGenre: String?
+    ) async -> (genreDisplay: String, genreQuerySeed: String, producerDisplay: String, producerQuerySeed: String) {
+        let clean = LyricsService.extractCleanTitleAndArtist(rawTitle: songTitle, rawArtist: artistName)
+        var detectedGenre = fallbackGenre ?? "Pop & Hip-Hop"
+        var copyrightOrLabel = ""
+
+        var components = URLComponents(string: "https://itunes.apple.com/search")!
+        components.queryItems = [
+            URLQueryItem(name: "term", value: "\(clean.title) \(clean.artist)"),
+            URLQueryItem(name: "media", value: "music"),
+            URLQueryItem(name: "entity", value: "song"),
+            URLQueryItem(name: "limit", value: "2")
+        ]
+        if let url = components.url,
+           let (data, _) = try? await URLSession.shared.data(from: url),
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let results = json["results"] as? [[String: Any]],
+           let first = results.first {
+            if let g = first["primaryGenreName"] as? String, !g.isEmpty {
+                detectedGenre = g
+            }
+            if let col = first["collectionName"] as? String {
+                copyrightOrLabel = col
+            }
+        }
+
+        // Map genre & artist to known producer/sound-architect seeds
+        let lowerGenre = detectedGenre.lowercased()
+        let producerSeed: String
+        let producerDisplay: String
+        if lowerGenre.contains("hip-hop") || lowerGenre.contains("rap") {
+            producerSeed = "\(clean.artist) Metro Boomin Mike Dean produced"
+            producerDisplay = "Hip-Hop Producers • \(clean.artist) & Similar"
+        } else if lowerGenre.contains("r&b") || lowerGenre.contains("soul") {
+            producerSeed = "\(clean.artist) Illangelo Kaytranada produced"
+            producerDisplay = "R&B Producers • \(clean.artist) Sound"
+        } else if lowerGenre.contains("electronic") || lowerGenre.contains("dance") {
+            producerSeed = "\(clean.artist) Gesaffelstein Daft Punk electronic"
+            producerDisplay = "Electronic Producers • \(clean.artist) Vibe"
+        } else if lowerGenre.contains("rock") || lowerGenre.contains("alternative") {
+            producerSeed = "\(clean.artist) Rick Rubin Nigel Godrich rock"
+            producerDisplay = "Rock & Alternative • \(clean.artist) Style"
+        } else {
+            producerSeed = "\(clean.artist) Max Martin Jack Antonoff \(detectedGenre)"
+            producerDisplay = "Producers & Collaborators • \(clean.artist)"
+        }
+
+        let genreQuery = "\(detectedGenre) \(clean.artist) \(copyrightOrLabel)".trimmingCharacters(in: .whitespacesAndNewlines)
+        return (
+            genreDisplay: "\(detectedGenre) Recommendations",
+            genreQuerySeed: genreQuery,
+            producerDisplay: producerDisplay,
+            producerQuerySeed: producerSeed
+        )
     }
 }
 
@@ -98,6 +197,13 @@ public struct ListenNowTabView: View {
     @State private var showAppleImportSheet: Bool = false
 
     public init() {}
+
+    private var favouriteTracks: [UniversalTrack] {
+        persistence.libraryTracks
+            .filter(\.isFavorite)
+            .sorted { $0.addedAt > $1.addedAt }
+            .map { $0.toUniversalTrack() }
+    }
 
     private var recentlyPlayedTracks: [UniversalTrack] {
         var seen = Set<String>()
@@ -116,56 +222,55 @@ public struct ListenNowTabView: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 26) {
-                    // Top Picks Hero Carousel (Signature Apple Music Home Cards)
+                    // 1. Favourite Songs Hero Playlist Section (Replaces "Top Picks for You")
                     AppleMusicSectionHeader(
-                        title: "Top Picks for You",
-                        subtitle: "Full-length streams & personalized recommendations"
+                        title: "Favourite Songs",
+                        subtitle: "Your starred songs playlist • Ready for instant playback"
                     )
 
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 16) {
-                            ForEach(discovery.trendingFullStreamTracks.prefix(6)) { track in
-                                Button {
-                                    player.play(track, queue: discovery.trendingFullStreamTracks)
-                                } label: {
-                                    VStack(alignment: .leading, spacing: 0) {
-                                        Text(track.provider.displayName.uppercased() + " • FEATURED STREAM")
-                                            .font(.system(size: 10, weight: .bold))
-                                            .foregroundStyle(.secondary)
-                                            .padding(.bottom, 6)
+                    favouriteSongsHeroCard
+                        .padding(.horizontal, AuraTheme.horizontalMargin)
 
-                                        ZStack(alignment: .bottomLeading) {
-                                            AuraArtworkView(url: track.artworkURL, size: 255, cornerRadius: 14)
-
-                                            LinearGradient(
-                                                colors: [.clear, .black.opacity(0.82)],
-                                                startPoint: .center,
-                                                endPoint: .bottom
-                                            )
-                                            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-
-                                            VStack(alignment: .leading, spacing: 3) {
-                                                Text(track.title)
-                                                    .font(.system(size: 17, weight: .bold))
-                                                    .foregroundStyle(.white)
-                                                    .lineLimit(1)
-                                                Text(track.artist)
-                                                    .font(.system(size: 13, weight: .medium))
-                                                    .foregroundStyle(.white.opacity(0.82))
-                                                    .lineLimit(1)
-                                            }
-                                            .padding(14)
-                                        }
-                                        .frame(width: 255, height: 255)
-                                    }
-                                }
-                                .buttonStyle(.plain)
+                    if !favouriteTracks.isEmpty {
+                        VStack(spacing: 8) {
+                            ForEach(favouriteTracks.prefix(6)) { track in
+                                TrackRowView(track: track, queueContext: favouriteTracks)
+                                    .padding(.horizontal, AuraTheme.horizontalMargin)
                             }
                         }
-                        .padding(.horizontal, AuraTheme.horizontalMargin)
                     }
 
-                    // Recently Played / Continue Listening
+                    // 2. Recommendations Based on Genre
+                    if !discovery.genreRecommendedTracks.isEmpty {
+                        AppleMusicSectionHeader(
+                            title: discovery.activeGenreTitle,
+                            subtitle: "Recommended songs based on the genres of your Favourite Songs"
+                        )
+
+                        VStack(spacing: 8) {
+                            ForEach(discovery.genreRecommendedTracks.prefix(6)) { track in
+                                TrackRowView(track: track, queueContext: discovery.genreRecommendedTracks)
+                                    .padding(.horizontal, AuraTheme.horizontalMargin)
+                            }
+                        }
+                    }
+
+                    // 3. Recommendations Based on Producers & Sound Style
+                    if !discovery.producerRecommendedTracks.isEmpty {
+                        AppleMusicSectionHeader(
+                            title: discovery.activeProducerTitle,
+                            subtitle: "Curated by producers, beatmakers & collaborators of your favorite tracks"
+                        )
+
+                        VStack(spacing: 8) {
+                            ForEach(discovery.producerRecommendedTracks.prefix(6)) { track in
+                                TrackRowView(track: track, queueContext: discovery.producerRecommendedTracks)
+                                    .padding(.horizontal, AuraTheme.horizontalMargin)
+                            }
+                        }
+                    }
+
+                    // 4. Recently Played / Continue Listening
                     if !recentlyPlayedTracks.isEmpty {
                         AppleMusicSectionHeader(
                             title: "Recently Played",
@@ -199,11 +304,11 @@ public struct ListenNowTabView: View {
                         }
                     }
 
-                    // Personalized Recommendations Based on Listening History
+                    // 5. Personalized Recommendations Based on Listening History
                     if !discovery.personalizedTracks.isEmpty {
                         AppleMusicSectionHeader(
                             title: "Made for Your Taste",
-                            subtitle: "Inspired by your recent listening history"
+                            subtitle: "Inspired by your favorite artists & listening history"
                         )
 
                         VStack(spacing: 8) {
@@ -342,7 +447,125 @@ public struct ListenNowTabView: View {
             .task {
                 await discovery.loadInitialDiscoveryIfNeeded()
             }
+            .onChange(of: favouriteTracks.count) { _, _ in
+                Task {
+                    await discovery.refreshDiscovery()
+                }
+            }
         }
+    }
+
+    private var favouriteSongsHeroCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            NavigationLink {
+                LibrarySongsListView(onlyFavorites: true)
+            } label: {
+                HStack(spacing: 16) {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .fill(
+                                LinearGradient(
+                                    colors: [
+                                        AuraTheme.accentPink,
+                                        Color(red: 0.65, green: 0.06, blue: 0.28)
+                                    ],
+                                    startPoint: .topLeading,
+                                    endPoint: .bottomTrailing
+                                )
+                            )
+                            .frame(width: 86, height: 86)
+
+                        if let firstArt = favouriteTracks.first?.artworkURL {
+                            AuraArtworkView(url: firstArt, size: 86, cornerRadius: 14)
+                                .overlay(
+                                    ZStack {
+                                        Color.black.opacity(0.28)
+                                            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                                        Image(systemName: "star.fill")
+                                            .font(.system(size: 32, weight: .bold))
+                                            .foregroundStyle(.white)
+                                    }
+                                )
+                        } else {
+                            Image(systemName: "star.fill")
+                                .font(.system(size: 36, weight: .bold))
+                                .foregroundStyle(.white)
+                        }
+                    }
+
+                    VStack(alignment: .leading, spacing: 5) {
+                        HStack(spacing: 6) {
+                            Text("Favourite Songs")
+                                .font(.system(size: 20, weight: .bold))
+                                .foregroundStyle(.primary)
+                            Image(systemName: "star.fill")
+                                .font(.system(size: 13))
+                                .foregroundStyle(AuraTheme.accentPink)
+                        }
+
+                        Text(favouriteTracks.isEmpty
+                             ? "Tap the star ★ on any song to add it here"
+                             : "\(favouriteTracks.count) Starred Songs • Personal Playlist")
+                            .font(.system(size: 13, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+
+                    Spacer()
+
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 15, weight: .bold))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .buttonStyle(.plain)
+
+            if !favouriteTracks.isEmpty {
+                HStack(spacing: 12) {
+                    Button {
+                        if let first = favouriteTracks.first {
+                            player.isShuffled = false
+                            player.play(first, queue: favouriteTracks)
+                        }
+                    } label: {
+                        Label("Play", systemImage: "play.fill")
+                            .font(.system(size: 15, weight: .bold))
+                            .foregroundStyle(.white)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 11)
+                            .background(
+                                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                    .fill(AuraTheme.accentPink)
+                            )
+                    }
+                    .buttonStyle(.plain)
+
+                    Button {
+                        let shuffled = favouriteTracks.shuffled()
+                        if let first = shuffled.first {
+                            player.isShuffled = true
+                            player.play(first, queue: shuffled)
+                        }
+                    } label: {
+                        Label("Shuffle", systemImage: "shuffle")
+                            .font(.system(size: 15, weight: .bold))
+                            .foregroundStyle(AuraTheme.accentPink)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 11)
+                            .background(
+                                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                    .fill(AuraTheme.accentPink.opacity(0.15))
+                            )
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .padding(16)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(Color.secondary.opacity(0.10))
+        )
     }
 }
 
