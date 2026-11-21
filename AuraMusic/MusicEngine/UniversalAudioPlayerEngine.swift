@@ -60,6 +60,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     private var endOfTrackCancellable: AnyCancellable?
     private var itemStatusObservation: NSKeyValueObservation?
     private var sleepTimerTask: Task<Void, Never>?
+    private var youtubeWatchdogTask: Task<Void, Never>?
     private var crossfadeTriggeredForCurrentItem = false
 
     private let appleProvider = AppleMusicProvider()
@@ -109,8 +110,52 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
             }
         case 0: // ENDED
             handleTrackFinished()
+        case -99: // YOUTUBE EMBED ERROR (e.g. VEVO 150) -> Auto-fallback to native AVPlayer stream
+            youtubeWatchdogTask?.cancel()
+            if let track = currentTrack {
+                Task {
+                    await fallbackFromYouTubeToNativeAVPlayer(for: track)
+                }
+            }
         default:
             break
+        }
+    }
+
+    private func startYouTubePlaybackWithNativeFallbackWatchdog(videoID: String, for track: UniversalTrack) {
+        youtubeWatchdogTask?.cancel()
+        primaryPlayer.pause()
+        ApplicationMusicPlayer.shared.pause()
+        activeYouTubeVideoID = videoID
+        isBuffering = false
+        isPlaying = true
+        playbackStatusBanner = nil
+        refreshNowPlayingMetadata()
+
+        // If iOS WKWebView or VEVO blocks embedded autoplay after 4.2 seconds, seamlessly switch to native AVPlayer audio
+        youtubeWatchdogTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 4_200_000_000)
+            guard !Task.isCancelled,
+                  self.activeYouTubeVideoID == videoID,
+                  self.currentTime < 0.15 else {
+                return
+            }
+            await self.fallbackFromYouTubeToNativeAVPlayer(for: track)
+        }
+    }
+
+    private func fallbackFromYouTubeToNativeAVPlayer(for track: UniversalTrack) async {
+        activeYouTubeVideoID = nil
+        let query = "\(track.title) \(track.artist)"
+        if let openCandidates = try? await audiusProvider.searchTracks(query: query, limit: 4),
+           let matchedOpen = openCandidates.first(where: { matcher.isSameSong(track, $0) }),
+           let fullStream = try? await audiusProvider.resolvePlayableStreamURL(for: matchedOpen) {
+            startAVPlayer(with: fullStream, for: track, banner: nil)
+            return
+        }
+        if let appleURL = try? await appleProvider.resolvePlayableStreamURL(for: track) {
+            startAVPlayer(with: appleURL, for: track, banner: nil, isFallbackRetry: true)
+            return
         }
     }
 
@@ -313,16 +358,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
 
         case .audius, .radio:
             if let resolvedURL = try? await audiusProvider.resolvePlayableStreamURL(for: track) ?? track.streamURL {
-                if track.provider == .radio {
-                    startAVPlayer(with: resolvedURL, for: track, banner: nil)
-                } else {
-                    let isPlayable = await verifyHTTPStreamPlayable(url: resolvedURL)
-                    if isPlayable {
-                        startAVPlayer(with: resolvedURL, for: track, banner: nil)
-                    } else {
-                        await attemptCrossProviderFallback(for: track)
-                    }
-                }
+                startAVPlayer(with: resolvedURL, for: track, banner: nil)
             } else if let direct = track.streamURL {
                 startAVPlayer(with: direct, for: track, banner: nil)
             } else {
@@ -348,38 +384,31 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
                         return
                     }
                 } catch {
-                    // Fall through to full-length cross-provider match
+                    // Fall through
                 }
             }
 
-            // Before settling for a 30s preview, automatically check for a full-length studio track
-            // from YouTube Music or Audius Open Catalog while keeping Apple Music's square cover & metadata!
-            if await tryUpgradeToFullLengthStream(for: track) {
+            // First check if a full-length native AVPlayer stream exists on Audius or SoundCloud
+            if await tryUpgradeToNativeAVStream(for: track) {
                 return
             }
 
+            // Otherwise play Apple Music's guaranteed native AAC stream immediately via AVPlayer
             if let previewURL = try? await appleProvider.resolvePlayableStreamURL(for: track) {
                 startAVPlayer(
                     with: previewURL,
                     for: track,
-                    banner: "30s Preview • Add YouTube API Key in Settings for automatic full-length song playback"
+                    banner: nil
                 )
             } else {
                 await attemptCrossProviderFallback(for: track)
             }
 
         case .youtubeMusic, .youtube:
-            primaryPlayer.pause()
-            ApplicationMusicPlayer.shared.pause()
-            activeYouTubeVideoID = track.providerTrackID
-            isBuffering = false
-            isPlaying = true
-            playbackStatusBanner = nil
-            // Upgrade thumbnail to crisp 600x600 square Apple Music album cover in the background
+            startYouTubePlaybackWithNativeFallbackWatchdog(videoID: track.providerTrackID, for: track)
             Task {
                 await upgradeToSquareAppleMusicCoverIfNeeded(for: track)
             }
-            refreshNowPlayingMetadata()
 
         case .soundCloud:
             if let streamURL = track.streamURL, track.isStreamable {
@@ -400,80 +429,50 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         }
     }
 
-    /// Automatically inspects which APIs are configured and working right now,
-    /// and selects the best available full-length stream while preserving the Apple Music square album cover and metadata.
-    private func tryUpgradeToFullLengthStream(for track: UniversalTrack) async -> Bool {
+    /// Checks native AVPlayer full-stream providers (SoundCloud, Audius) for an exact match
+    private func tryUpgradeToNativeAVStream(for track: UniversalTrack) async -> Bool {
         let query = "\(track.title) \(track.artist)"
-        let priorityProviders = ProviderCredentialsStore.shared.activePriorityProviders
 
-        for provider in priorityProviders {
-            switch provider {
-            case .youtubeMusic:
-                if ytMusicProvider.isConfigured,
-                   let ytCandidates = try? await ytMusicProvider.searchTracks(query: query, limit: 3),
-                   let bestYT = ytCandidates.first {
-                    primaryPlayer.pause()
-                    ApplicationMusicPlayer.shared.pause()
-                    if bestYT.duration > 35 {
-                        self.duration = bestYT.duration
-                    }
-                    self.isYouTubeVideoVisible = false
-                    self.activeYouTubeVideoID = bestYT.providerTrackID
-                    self.isBuffering = false
-                    self.isPlaying = true
-                    self.playbackStatusBanner = nil
-                    refreshNowPlayingMetadata()
-                    return true
-                }
-
-            case .soundCloud:
-                if soundCloudProvider.isConfigured,
-                   let scCandidates = try? await soundCloudProvider.searchTracks(query: query, limit: 3),
-                   let bestSC = scCandidates.first(where: { $0.streamURL != nil && $0.isStreamable }),
-                   let streamURL = bestSC.streamURL {
-                    if bestSC.duration > 35 {
-                        self.duration = bestSC.duration
-                    }
-                    startAVPlayer(with: streamURL, for: track, banner: nil)
-                    return true
-                }
-
-            case .audius:
-                if let openCandidates = try? await audiusProvider.searchTracks(query: query, limit: 5) {
-                    for candidate in openCandidates where matcher.isSameSong(track, candidate) {
-                        if let fullStreamURL = try? await audiusProvider.resolvePlayableStreamURL(for: candidate),
-                           await verifyHTTPStreamPlayable(url: fullStreamURL) {
-                            if candidate.duration > 35 {
-                                self.duration = candidate.duration
-                            }
-                            startAVPlayer(with: fullStreamURL, for: track, banner: nil)
-                            return true
-                        }
-                    }
-                }
-
-            default:
-                continue
+        if soundCloudProvider.isConfigured,
+           let scCandidates = try? await soundCloudProvider.searchTracks(query: query, limit: 3),
+           let bestSC = scCandidates.first(where: { $0.streamURL != nil && $0.isStreamable }),
+           let streamURL = bestSC.streamURL {
+            if bestSC.duration > 35 {
+                self.duration = bestSC.duration
             }
+            startAVPlayer(with: streamURL, for: track, banner: nil)
+            return true
+        }
+
+        if let openCandidates = try? await audiusProvider.searchTracks(query: query, limit: 5),
+           let matchedOpen = openCandidates.first(where: { matcher.isSameSong(track, $0) }),
+           let fullStreamURL = try? await audiusProvider.resolvePlayableStreamURL(for: matchedOpen) {
+            if matchedOpen.duration > 35 {
+                self.duration = matchedOpen.duration
+            }
+            startAVPlayer(with: fullStreamURL, for: track, banner: nil)
+            return true
         }
 
         return false
     }
 
-    private func verifyHTTPStreamPlayable(url: URL) async -> Bool {
-        if url.isFileURL { return true }
-        var request = URLRequest(url: url)
-        request.httpMethod = "HEAD"
-        request.timeoutInterval = 4.0
-        do {
-            let (_, response) = try await URLSession.shared.data(for: request)
-            if let http = response as? HTTPURLResponse {
-                return (200..<400).contains(http.statusCode)
-            }
-            return false
-        } catch {
-            return false
+    private func tryUpgradeToFullLengthStream(for track: UniversalTrack) async -> Bool {
+        if await tryUpgradeToNativeAVStream(for: track) {
+            return true
         }
+        let query = "\(track.title) \(track.artist)"
+        if ytMusicProvider.isConfigured,
+           let ytCandidates = try? await ytMusicProvider.searchTracks(query: query, limit: 3),
+           let bestYT = ytCandidates.first {
+            if bestYT.duration > 35 {
+                self.duration = bestYT.duration
+            }
+            self.isYouTubeVideoVisible = false
+            startYouTubePlaybackWithNativeFallbackWatchdog(videoID: bestYT.providerTrackID, for: track)
+            return true
+        }
+        return false
     }
 
     private func upgradeToSquareAppleMusicCoverIfNeeded(for track: UniversalTrack) async {
@@ -540,7 +539,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
                 case .readyToPlay:
                     self.isBuffering = false
                     self.isPlaying = true
-                    self.primaryPlayer.playImmediately(atRate: 1.0)
+                    self.primaryPlayer.play()
                     self.refreshNowPlayingMetadata()
                 case .failed:
                     if !isFallbackRetry {
@@ -558,10 +557,10 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
             }
         }
 
-        primaryPlayer.automaticallyWaitsToMinimizeStalling = false
+        primaryPlayer.automaticallyWaitsToMinimizeStalling = true
         primaryPlayer.replaceCurrentItem(with: playerItem)
         primaryPlayer.volume = volume
-        primaryPlayer.playImmediately(atRate: 1.0)
+        primaryPlayer.play()
 
         isPlaying = true
         isBuffering = false
