@@ -10,6 +10,7 @@ public struct SyncedLyricLine: Identifiable, Codable, Hashable, Sendable {
     public let index: Int
     public let timestamp: TimeInterval
     public let text: String
+    public let isInstrumental: Bool
     public var translatedText: String?
 
     public init(
@@ -17,17 +18,20 @@ public struct SyncedLyricLine: Identifiable, Codable, Hashable, Sendable {
         index: Int,
         timestamp: TimeInterval,
         text: String,
+        isInstrumental: Bool? = nil,
         translatedText: String? = nil
     ) {
         self.id = id
         self.index = index
         self.timestamp = timestamp
         self.text = text
+        self.isInstrumental = isInstrumental ?? (text == "•••")
         self.translatedText = translatedText
     }
 }
 
 public struct TrackLyricsDocument: Sendable {
+    public let id: UUID
     public let trackTitle: String
     public let artistName: String
     public let isSynchronized: Bool
@@ -36,30 +40,115 @@ public struct TrackLyricsDocument: Sendable {
     public let syncedLines: [SyncedLyricLine]
     public let plainLines: [String]
     public let hasTranslationAvailable: Bool
+
+    public init(
+        id: UUID = UUID(),
+        trackTitle: String,
+        artistName: String,
+        isSynchronized: Bool,
+        detectedLanguageCode: String,
+        detectedLanguageDisplayName: String,
+        syncedLines: [SyncedLyricLine],
+        plainLines: [String],
+        hasTranslationAvailable: Bool
+    ) {
+        self.id = id
+        self.trackTitle = trackTitle
+        self.artistName = artistName
+        self.isSynchronized = isSynchronized
+        self.detectedLanguageCode = detectedLanguageCode
+        self.detectedLanguageDisplayName = detectedLanguageDisplayName
+        self.syncedLines = syncedLines
+        self.plainLines = plainLines
+        self.hasTranslationAvailable = hasTranslationAvailable
+    }
 }
 
-// MARK: - Millisecond-Accurate LRC Parser
+// MARK: - Millisecond-Accurate LRC Parser & Normalization Engine
 
 public enum LRCParser {
-    /// Parses standard and extended LRC timestamps: `[mm:ss.xx]` or `[mm:ss.xxx]` or `[mm:ss]`
-    /// Never invents timestamps for unsynchronized plain text.
-    public static func parseSyncedLRC(_ rawLRC: String) -> [SyncedLyricLine] {
+    private static let minimumPauseDuration: TimeInterval = 2.2
+    private static let minimumIntroDotsDuration: TimeInterval = 3.0
+    private static let collisionWindowSeconds: TimeInterval = 0.50
+    private static let simultaneousLyricWindowSeconds: TimeInterval = 0.05
+
+    private static let instrumentalTokens: Set<String> = [
+        "", "•••", "...", "…", "♪", "♫", "♬", "🎵", "🎶",
+        "instrumental", "(instrumental)", "[instrumental]",
+        "---", "—", "–", "-", "•", "·"
+    ]
+
+    public static func isInstrumentalMarker(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return true }
+        let normalized = trimmed.lowercased()
+        if instrumentalTokens.contains(normalized) { return true }
+        // Lines consisting purely of dots, music notes, dashes, or spaces
+        let allowedInstrumentScalars = CharacterSet(charactersIn: "•·.…♪♫♬🎵🎶—–- \t")
+        return trimmed.unicodeScalars.allSatisfy { allowedInstrumentScalars.contains($0) }
+    }
+
+    /// Parses standard and extended LRC timestamps: `[mm:ss.xx]`, `[mm:ss.xxx]`, or `[mm:ss]`.
+    /// Also handles `[offset:±ms]`, inline Enhanced LRC tags `<mm:ss.xx>`, duplicate/colliding timestamps,
+    /// consecutive/micro pause markers, trailing empty lines, and optional clean intro dots at `t = 0.0`.
+    public static func parseSyncedLRC(_ rawLRC: String, includeIntroDots: Bool = false) -> [SyncedLyricLine] {
         let lines = rawLRC.components(separatedBy: .newlines)
-        let pattern = "\\[(\\d{1,3}):(\\d{2})(?:[\\.:](\\d{1,3}))?\\]"
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else {
+        let timestampPattern = "\\[(\\d{1,3}):(\\d{2})(?:[\\.:](\\d{1,3}))?\\]"
+        let offsetPattern = "\\[offset:\\s*([+-]?\\d+)\\s*\\]"
+        let inlineWordTagPattern = "<\\d{1,3}:\\d{2}(?:[\\.:]\\d{1,3})?>"
+
+        guard let tsRegex = try? NSRegularExpression(pattern: timestampPattern, options: []) else {
             return []
         }
+        let offsetRegex = try? NSRegularExpression(pattern: offsetPattern, options: [.caseInsensitive])
+        let inlineTagRegex = try? NSRegularExpression(pattern: inlineWordTagPattern, options: [])
 
-        var parsedEntries: [(timestamp: TimeInterval, text: String)] = []
+        // 1. Extract optional [offset:±ms] header (positive offset shifts timestamps earlier per LRC spec)
+        var offsetSeconds: TimeInterval = 0
+        if let offsetRegex {
+            for rawLine in lines {
+                let nsRange = NSRange(rawLine.startIndex..<rawLine.endIndex, in: rawLine)
+                if let match = offsetRegex.firstMatch(in: rawLine, options: [], range: nsRange),
+                   let valRange = Range(match.range(at: 1), in: rawLine),
+                   let ms = Double(rawLine[valRange]) {
+                    offsetSeconds = ms / 1000.0
+                    break
+                }
+            }
+        }
+
+        // 2. Parse every timestamped entry safely using UTF-16 -> Swift Range conversion
+        struct RawEntry {
+            let timestamp: TimeInterval
+            let text: String
+            let translation: String?
+            let isInstrumental: Bool
+            let originalOrder: Int
+        }
+
+        var rawEntries: [RawEntry] = []
+        var orderCounter = 0
 
         for rawLine in lines {
             let nsRange = NSRange(rawLine.startIndex..<rawLine.endIndex, in: rawLine)
-            let matches = regex.matches(in: rawLine, options: [], range: nsRange)
-            guard !matches.isEmpty else { continue }
+            let matches = tsRegex.matches(in: rawLine, options: [], range: nsRange)
+            guard !matches.isEmpty,
+                  let lastMatch = matches.last,
+                  let lastSwiftRange = Range(lastMatch.range, in: rawLine) else {
+                continue
+            }
 
-            let lastMatch = matches.last!
-            let contentStartIndex = rawLine.index(rawLine.startIndex, offsetBy: lastMatch.range.upperBound)
-            let lyricContent = String(rawLine[contentStartIndex...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            var lyricContent = String(rawLine[lastSwiftRange.upperBound...])
+            if let inlineTagRegex {
+                let cRange = NSRange(lyricContent.startIndex..<lyricContent.endIndex, in: lyricContent)
+                lyricContent = inlineTagRegex.stringByReplacingMatches(in: lyricContent, range: cRange, withTemplate: "")
+            }
+            lyricContent = lyricContent.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            let parts = lyricContent.components(separatedBy: " // ")
+            let original = (parts.first ?? lyricContent).trimmingCharacters(in: .whitespacesAndNewlines)
+            let translation = parts.count > 1 ? parts[1].trimmingCharacters(in: .whitespacesAndNewlines) : nil
+            let instrumental = isInstrumentalMarker(original)
 
             for match in matches {
                 guard let minRange = Range(match.range(at: 1), in: rawLine),
@@ -82,23 +171,140 @@ public enum LRCParser {
                         }
                     }
                 }
-                let totalSeconds = (minutes * 60.0) + seconds + fraction
-                parsedEntries.append((timestamp: totalSeconds, text: lyricContent))
+                let adjustedTime = max(0, (minutes * 60.0) + seconds + fraction - offsetSeconds)
+                rawEntries.append(
+                    RawEntry(
+                        timestamp: adjustedTime,
+                        text: instrumental ? "•••" : original,
+                        translation: instrumental ? nil : translation,
+                        isInstrumental: instrumental,
+                        originalOrder: orderCounter
+                    )
+                )
+                orderCounter += 1
             }
         }
 
-        let sorted = parsedEntries.sorted { $0.timestamp < $1.timestamp }
-        return sorted.enumerated().map { idx, item in
-            let parts = item.text.components(separatedBy: " // ")
-            let original = (parts.first ?? item.text).trimmingCharacters(in: .whitespacesAndNewlines)
-            let translation = parts.count > 1 ? parts[1].trimmingCharacters(in: .whitespacesAndNewlines) : nil
-            return SyncedLyricLine(
-                index: idx,
-                timestamp: item.timestamp,
-                text: original.isEmpty ? "•••" : original,
-                translatedText: translation
+        guard !rawEntries.isEmpty else { return [] }
+
+        // 3. Stable sort by timestamp; on equal timestamps, place instrumental markers before real lyrics so real lyrics always win
+        let sorted = rawEntries.sorted { lhs, rhs in
+            if abs(lhs.timestamp - rhs.timestamp) > 0.0001 {
+                return lhs.timestamp < rhs.timestamp
+            }
+            if lhs.isInstrumental != rhs.isInstrumental {
+                return lhs.isInstrumental && !rhs.isInstrumental
+            }
+            return lhs.originalOrder < rhs.originalOrder
+        }
+
+        // 4. Separate & clean:
+        //    - Merge simultaneous real lyric lines (within 0.05s) so neither line is skipped/unlit
+        //    - Drop any instrumental marker colliding within 0.50s of a real lyric line
+        //    - Collapse consecutive instrumental markers into one (keeping the earliest timestamp)
+        var cleaned: [RawEntry] = []
+
+        for entry in sorted {
+            if entry.isInstrumental {
+                // Skip if a real lyric already sits right at this timestamp
+                if let prev = cleaned.last, !prev.isInstrumental, abs(entry.timestamp - prev.timestamp) < collisionWindowSeconds {
+                    continue
+                }
+                // Collapse consecutive instrumental markers
+                if let prev = cleaned.last, prev.isInstrumental {
+                    continue
+                }
+                cleaned.append(entry)
+            } else {
+                // If previous entry was an instrumental marker colliding right on/before this real lyric, drop the marker!
+                if let prev = cleaned.last, prev.isInstrumental, abs(entry.timestamp - prev.timestamp) < collisionWindowSeconds {
+                    cleaned.removeLast()
+                }
+                // Merge simultaneous real lyrics (e.g. overlapping lead + backing vocal at exact same timestamp)
+                if let prev = cleaned.last, !prev.isInstrumental, abs(entry.timestamp - prev.timestamp) <= simultaneousLyricWindowSeconds {
+                    if prev.text.caseInsensitiveCompare(entry.text) != .orderedSame {
+                        let mergedText = "\(prev.text)\n\(entry.text)"
+                        let mergedTranslation: String?
+                        if let t1 = prev.translation, let t2 = entry.translation {
+                            mergedTranslation = "\(t1)\n\(t2)"
+                        } else {
+                            mergedTranslation = prev.translation ?? entry.translation
+                        }
+                        cleaned[cleaned.count - 1] = RawEntry(
+                            timestamp: prev.timestamp,
+                            text: mergedText,
+                            translation: mergedTranslation,
+                            isInstrumental: false,
+                            originalOrder: prev.originalOrder
+                        )
+                    }
+                    continue
+                }
+                cleaned.append(entry)
+            }
+        }
+
+        // 5. Drop trailing instrumental markers after the final sung lyric (common end-of-song clear tags in LRCLIB)
+        while let last = cleaned.last, last.isInstrumental, cleaned.contains(where: { !$0.isInstrumental }) {
+            cleaned.removeLast()
+        }
+
+        // 6. Drop short micro-pause instrumental markers (< 2.2s before the next real lyric line)
+        var withoutMicroPauses: [RawEntry] = []
+        for idx in cleaned.indices {
+            let entry = cleaned[idx]
+            if entry.isInstrumental {
+                if idx + 1 < cleaned.count {
+                    let gap = cleaned[idx + 1].timestamp - entry.timestamp
+                    if gap < minimumPauseDuration {
+                        continue
+                    }
+                }
+            }
+            withoutMicroPauses.append(entry)
+        }
+
+        // 7. Handle leading intro dots cleanly so SynchronizedLyricsView never inserts/removes views mid-scroll
+        if includeIntroDots, let firstRealIdx = withoutMicroPauses.firstIndex(where: { !$0.isInstrumental }) {
+            let firstRealTimestamp = withoutMicroPauses[firstRealIdx].timestamp
+            // Remove any raw leading instrumental entries before the first real lyric
+            if firstRealIdx > 0 {
+                withoutMicroPauses.removeFirst(firstRealIdx)
+            }
+            // If the song has a meaningful instrumental intro (>= 3.0s), insert one clean intro "•••" row at t = 0.0
+            if firstRealTimestamp >= minimumIntroDotsDuration {
+                withoutMicroPauses.insert(
+                    RawEntry(
+                        timestamp: 0.0,
+                        text: "•••",
+                        translation: nil,
+                        isInstrumental: true,
+                        originalOrder: -1
+                    ),
+                    at: 0
+                )
+            }
+        }
+
+        // 8. Finalize strictly indexed lines with guaranteed strictly increasing timestamps
+        var result: [SyncedLyricLine] = []
+        result.reserveCapacity(withoutMicroPauses.count)
+        for (idx, item) in withoutMicroPauses.enumerated() {
+            var safeTimestamp = item.timestamp
+            if let prev = result.last, safeTimestamp <= prev.timestamp {
+                safeTimestamp = prev.timestamp + 0.01
+            }
+            result.append(
+                SyncedLyricLine(
+                    index: idx,
+                    timestamp: safeTimestamp,
+                    text: item.text,
+                    isInstrumental: item.isInstrumental,
+                    translatedText: item.translation
+                )
             )
         }
+        return result
     }
 
     public static func detectScriptLanguage(for text: String) -> (code: String, displayName: String) {
@@ -113,6 +319,101 @@ public enum LRCParser {
     }
 }
 
+// MARK: - Deterministic Lyric Synchronization State Machine
+
+public struct LyricRowVisualState: Equatable, Sendable {
+    public let isCurrent: Bool
+    public let isPast: Bool
+    public let litDotsCount: Int
+
+    public init(isCurrent: Bool, isPast: Bool, litDotsCount: Int) {
+        self.isCurrent = isCurrent
+        self.isPast = isPast
+        self.litDotsCount = litDotsCount
+    }
+}
+
+public enum LyricSynchronizationEngine {
+    /// Small visual anticipation lead so lyrics illuminate right as the vocalist begins each line
+    public static let leadTimeSeconds: TimeInterval = 0.25
+
+    /// Deterministically resolves the active line index for any playback time using binary search.
+    /// Guarantees seamless transitions out of intro dots and mid-song pause dots ("•••") onto the exact next sung line.
+    public static func activeLineIndex(at currentTime: TimeInterval, in lines: [SyncedLyricLine]) -> Int? {
+        guard !lines.isEmpty else { return nil }
+        let clampedTime = max(0, currentTime)
+        let effectiveTime = clampedTime + leadTimeSeconds
+
+        if effectiveTime < lines[0].timestamp {
+            // If the first sung line starts almost immediately (<= 1.0s), pre-light it so the start never appears unlit
+            if !lines[0].isInstrumental && lines[0].timestamp <= 1.0 {
+                return 0
+            }
+            return nil
+        }
+
+        var low = 0
+        var high = lines.count - 1
+        var matched = 0
+
+        while low <= high {
+            let mid = low + (high - low) / 2
+            if lines[mid].timestamp <= effectiveTime {
+                matched = mid
+                low = mid + 1
+            } else {
+                high = mid - 1
+            }
+        }
+        return matched
+    }
+
+    /// Computes how many progress dots (0...3) should be lit for an instrumental pause line.
+    /// Uses the EXACT same `effectiveTime` (`currentTime + leadTimeSeconds`) as `activeLineIndex`,
+    /// so all 3 dots finish illuminating smoothly right before the next sung line lights up.
+    public static func litDotsCount(
+        at currentTime: TimeInterval,
+        forLineAt index: Int,
+        in lines: [SyncedLyricLine],
+        trackDuration: TimeInterval
+    ) -> Int {
+        guard index >= 0, index < lines.count, lines[index].isInstrumental else {
+            return 0
+        }
+        let start = lines[index].timestamp
+        let end: TimeInterval = (index + 1 < lines.count)
+            ? lines[index + 1].timestamp
+            : max(trackDuration, start + 6.0)
+        let effectiveTime = max(0, currentTime) + leadTimeSeconds
+        return AppleMusicInstrumentalDotsView.calculateLitDots(
+            currentTime: effectiveTime,
+            startTime: start,
+            endTime: end
+        )
+    }
+
+    /// Computes complete deterministic visual state (`isCurrent`, `isPast`, `litDotsCount`) for any row.
+    public static func rowVisualState(
+        forLineAt lineIndex: Int,
+        activeIndex: Int?,
+        currentTime: TimeInterval,
+        in lines: [SyncedLyricLine],
+        trackDuration: TimeInterval
+    ) -> LyricRowVisualState {
+        let isCurrent = (activeIndex == lineIndex)
+        let isPast: Bool
+        if let activeIndex {
+            isPast = lineIndex < activeIndex
+        } else {
+            isPast = false
+        }
+        let dots = isCurrent
+            ? litDotsCount(at: currentTime, forLineAt: lineIndex, in: lines, trackDuration: trackDuration)
+            : 0
+        return LyricRowVisualState(isCurrent: isCurrent, isPast: isPast, litDotsCount: dots)
+    }
+}
+
 // MARK: - Official LRCLIB Lyrics Client + Multi-Stage Smart Resolver + SwiftData Cache
 
 @MainActor
@@ -124,6 +425,8 @@ public final class LyricsService: ObservableObject {
     @Published public private(set) var errorMessage: String?
 
     private let session: URLSession
+    private var loadedTrackID: String?
+    private var activeRequestID = UUID()
 
     private init(session: URLSession = .shared) {
         self.session = session
@@ -133,24 +436,33 @@ public final class LyricsService: ObservableObject {
     public func activeLyricLineText(at currentTime: TimeInterval) -> String? {
         guard let doc = currentDocument else { return nil }
         if doc.isSynchronized {
-            let t = currentTime + 0.32
-            var currentText: String? = nil
-            for line in doc.syncedLines {
-                if t >= line.timestamp {
-                    if line.text != "•••" && !line.text.isEmpty {
-                        currentText = line.text
+            if let activeIdx = LyricSynchronizationEngine.activeLineIndex(at: currentTime, in: doc.syncedLines) {
+                if !doc.syncedLines[activeIdx].isInstrumental {
+                    return doc.syncedLines[activeIdx].text
+                }
+                // During a pause, preview the most recent sung line or upcoming first sung line
+                for idx in stride(from: activeIdx - 1, through: 0, by: -1) {
+                    if !doc.syncedLines[idx].isInstrumental {
+                        return doc.syncedLines[idx].text
                     }
-                } else {
-                    break
                 }
             }
-            return currentText ?? doc.syncedLines.first(where: { $0.text != "•••" })?.text
+            return doc.syncedLines.first(where: { !$0.isInstrumental })?.text
         } else {
             return doc.plainLines.first(where: { !$0.isEmpty })
         }
     }
 
-    public func loadLyrics(for track: UniversalTrack) async {
+    public func loadLyrics(for track: UniversalTrack, forceReload: Bool = false) async {
+        // Avoid wiping and reloading already-loaded lyrics when re-opening the Lyrics panel for the same track
+        if !forceReload, loadedTrackID == track.id, currentDocument != nil {
+            isLoading = false
+            return
+        }
+
+        let requestID = UUID()
+        activeRequestID = requestID
+
         let (parsedTitle, parsedArtist) = Self.extractCleanTitleAndArtist(rawTitle: track.title, rawArtist: track.artist)
         let cacheKey = "\(parsedArtist.lowercased())::\(parsedTitle.lowercased())"
 
@@ -164,6 +476,7 @@ public final class LyricsService: ObservableObject {
         )
         if let cached = try? context.fetch(descriptor).first,
            !(cached.syncedLRC ?? "").isEmpty {
+            guard activeRequestID == requestID else { return }
             self.currentDocument = buildDocument(
                 title: track.title,
                 artist: track.artist,
@@ -171,6 +484,7 @@ public final class LyricsService: ObservableObject {
                 plainLyrics: cached.plainLyrics,
                 trackDuration: track.duration
             )
+            self.loadedTrackID = track.id
             self.isLoading = false
             return
         }
@@ -230,6 +544,8 @@ public final class LyricsService: ObservableObject {
                 }
             }
 
+            guard activeRequestID == requestID else { return }
+
             if let bestDTO = Self.selectBestOriginalLanguageCandidate(
                 from: allCandidates,
                 referenceText: referenceScriptText,
@@ -249,12 +565,15 @@ public final class LyricsService: ObservableObject {
                     plainLyrics: bestDTO.plainLyrics,
                     trackDuration: track.duration
                 )
+                self.loadedTrackID = track.id
                 self.isLoading = false
                 return
             }
         }
 
+        guard activeRequestID == requestID else { return }
         self.currentDocument = nil
+        self.loadedTrackID = track.id
         self.errorMessage = "No licensed lyrics found for \"\(parsedTitle)\". Tap the magnifying glass to search manually."
         self.isLoading = false
     }
@@ -456,6 +775,7 @@ public final class LyricsService: ObservableObject {
     }
 
     public func applyManualLyricSelection(_ dto: LRCLIBEntryDTO, for track: UniversalTrack) {
+        activeRequestID = UUID()
         let (parsedTitle, parsedArtist) = Self.extractCleanTitleAndArtist(rawTitle: track.title, rawArtist: track.artist)
         let cacheKey = "\(parsedArtist.lowercased())::\(parsedTitle.lowercased())"
         cacheLyrics(
@@ -472,6 +792,7 @@ public final class LyricsService: ObservableObject {
             plainLyrics: dto.plainLyrics,
             trackDuration: track.duration
         )
+        self.loadedTrackID = track.id
         self.errorMessage = nil
     }
 
@@ -548,10 +869,10 @@ public final class LyricsService: ObservableObject {
         trackDuration: TimeInterval = 200
     ) -> TrackLyricsDocument? {
         if let syncedLRC, !syncedLRC.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            let parsedLines = LRCParser.parseSyncedLRC(syncedLRC)
+            let parsedLines = LRCParser.parseSyncedLRC(syncedLRC, includeIntroDots: true)
             if !parsedLines.isEmpty {
-                let fullSample = parsedLines.map(\.text).joined(separator: "\n")
-                let lang = LRCParser.detectScriptLanguage(for: fullSample)
+                let fullSample = parsedLines.filter { !$0.isInstrumental }.map(\.text).joined(separator: "\n")
+                let lang = LRCParser.detectScriptLanguage(for: fullSample.isEmpty ? title : fullSample)
                 return TrackLyricsDocument(
                     trackTitle: title,
                     artistName: artist,
@@ -559,7 +880,7 @@ public final class LyricsService: ObservableObject {
                     detectedLanguageCode: lang.code,
                     detectedLanguageDisplayName: lang.displayName,
                     syncedLines: parsedLines,
-                    plainLines: parsedLines.map(\.text),
+                    plainLines: parsedLines.filter { !$0.isInstrumental }.map(\.text),
                     hasTranslationAvailable: false
                 )
             }
@@ -569,7 +890,7 @@ public final class LyricsService: ObservableObject {
             let rawLines = plainLyrics
                 .components(separatedBy: .newlines)
                 .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-                .filter { !$0.isEmpty }
+                .filter { !$0.isEmpty && !LRCParser.isInstrumentalMarker($0) }
             guard !rawLines.isEmpty else { return nil }
 
             // Automatically distribute timestamps proportionally across the track duration
@@ -579,14 +900,31 @@ public final class LyricsService: ObservableObject {
             let activeSpan = max(totalDur - introOffset - 6.0, Double(rawLines.count) * 2.5)
             let step = activeSpan / Double(max(rawLines.count, 1))
 
-            let autoSyncedLines = rawLines.enumerated().map { idx, text in
+            var autoSyncedLines: [SyncedLyricLine] = []
+            if introOffset >= 3.0 {
+                autoSyncedLines.append(
+                    SyncedLyricLine(
+                        index: 0,
+                        timestamp: 0.0,
+                        text: "•••",
+                        isInstrumental: true,
+                        translatedText: nil
+                    )
+                )
+            }
+
+            for (rawIdx, text) in rawLines.enumerated() {
                 let parts = text.components(separatedBy: " // ")
                 let cleanOriginal = (parts.first ?? text).trimmingCharacters(in: .whitespacesAndNewlines)
-                return SyncedLyricLine(
-                    index: idx,
-                    timestamp: introOffset + (Double(idx) * step),
-                    text: cleanOriginal.isEmpty ? "•••" : cleanOriginal,
-                    translatedText: nil
+                guard !cleanOriginal.isEmpty else { continue }
+                autoSyncedLines.append(
+                    SyncedLyricLine(
+                        index: autoSyncedLines.count,
+                        timestamp: introOffset + (Double(rawIdx) * step),
+                        text: cleanOriginal,
+                        isInstrumental: false,
+                        translatedText: nil
+                    )
                 )
             }
 
@@ -618,7 +956,7 @@ public struct LRCLIBEntryDTO: Codable, Identifiable, Sendable {
     public var syncedLyrics: String?
 }
 
-// MARK: - Apple Music Stationary Instrumental Progress Dots (1/3 -> 1 dot, 2/3 -> 2 dots, 3/3 -> 3 dots)
+// MARK: - Apple Music Stationary Instrumental Progress Dots (0 -> 1 -> 2 -> 3 dots)
 
 public struct AppleMusicInstrumentalDotsView: View, Equatable {
     public let litDotsCount: Int
@@ -634,6 +972,7 @@ public struct AppleMusicInstrumentalDotsView: View, Equatable {
                 Circle()
                     .fill(Color.white.opacity(isLit ? 1.0 : 0.25))
                     .frame(width: 10, height: 10)
+                    .scaleEffect(isLit ? 1.12 : 0.92)
             }
         }
         .padding(.vertical, 6)
@@ -645,12 +984,13 @@ public struct AppleMusicInstrumentalDotsView: View, Equatable {
         let duration = endTime - startTime
         guard duration > 0.2 else { return 3 }
         let elapsed = currentTime - startTime
+        guard elapsed >= 0 else { return 0 }
         let progress = elapsed / duration
-        if progress >= 0.90 {
+        if progress >= 0.85 {
             return 3
-        } else if progress >= 0.66 {
+        } else if progress >= 0.55 {
             return 2
-        } else if progress >= 0.33 {
+        } else if progress >= 0.25 {
             return 1
         } else {
             return 0
@@ -658,40 +998,51 @@ public struct AppleMusicInstrumentalDotsView: View, Equatable {
     }
 }
 
-// MARK: - High-Performance Equatable Lyric Row (Prevents Re-Rendering Inactive Lines)
+// MARK: - Dedicated Lyric & Instrumental Row Views (Guaranteed Crisp Illumination)
 
-private struct EquatableSyncedLyricRowView: View, Equatable {
-    let line: SyncedLyricLine
+private struct SyncedLyricTextRowView: View {
+    let text: String
     let isCurrent: Bool
-    let showTranslationOverlay: Bool
-    let litDotsCount: Int
-
-    static func == (lhs: EquatableSyncedLyricRowView, rhs: EquatableSyncedLyricRowView) -> Bool {
-        lhs.line.id == rhs.line.id &&
-        lhs.isCurrent == rhs.isCurrent &&
-        lhs.showTranslationOverlay == rhs.showTranslationOverlay &&
-        lhs.litDotsCount == rhs.litDotsCount
-    }
+    let isPast: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            if line.text == "•••" {
-                AppleMusicInstrumentalDotsView(litDotsCount: isCurrent ? litDotsCount : 0)
-            } else {
-                Text(line.text)
-                    .font(.system(size: isCurrent ? 29 : 24, weight: .bold))
-                    .foregroundStyle(.white.opacity(isCurrent ? 1.0 : 0.34))
-            }
+        Text(text)
+            .font(.system(size: 25, weight: .bold))
+            .foregroundStyle(.white.opacity(isCurrent ? 1.0 : (isPast ? 0.24 : 0.45)))
+            .scaleEffect(isCurrent ? 1.05 : 0.96, anchor: .leading)
+            .shadow(color: isCurrent ? .white.opacity(0.22) : .clear, radius: 10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.vertical, 8)
+            .padding(.horizontal, 14)
+            .background(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(isCurrent ? Color.white.opacity(0.14) : Color.clear)
+            )
+            .contentShape(Rectangle())
+            .animation(.easeOut(duration: 0.22), value: isCurrent)
+            .animation(.easeOut(duration: 0.22), value: isPast)
+            .animation(.interpolatingSpring(stiffness: 170, damping: 24), value: isCurrent)
+    }
+}
 
-            if showTranslationOverlay, let translated = line.translatedText {
-                Text(translated)
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(.white.opacity(isCurrent ? 0.85 : 0.30))
-            }
+private struct SyncedInstrumentalDotsRowView: View {
+    let isCurrent: Bool
+    let litDotsCount: Int
+
+    var body: some View {
+        HStack {
+            AppleMusicInstrumentalDotsView(litDotsCount: isCurrent ? litDotsCount : 0)
+            Spacer()
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.vertical, 4)
+        .opacity(isCurrent ? 1.0 : 0.28)
+        .padding(.vertical, 6)
+        .padding(.horizontal, 14)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(isCurrent ? Color.white.opacity(0.08) : Color.clear)
+        )
         .contentShape(Rectangle())
+        .animation(.easeOut(duration: 0.22), value: isCurrent)
     }
 }
 
@@ -702,7 +1053,6 @@ public struct SynchronizedLyricsView: View {
     @ObservedObject var lyricsService: LyricsService = .shared
 
     @State private var isUserManualScrolling: Bool = false
-    @State private var highlightedLineIndex: Int? = nil
     @State private var showTranslationOverlay: Bool = false
     @State private var showManualSearchSheet: Bool = false
     @State private var manualSongQuery: String = ""
@@ -712,35 +1062,6 @@ public struct SynchronizedLyricsView: View {
 
     public init(player: UniversalAudioPlayerEngine) {
         self.player = player
-    }
-
-    private func computeActiveLineIndex(at time: TimeInterval, in doc: TrackLyricsDocument) -> Int? {
-        guard doc.isSynchronized else { return nil }
-        let current = time + 0.32
-        var matched: Int? = nil
-        for line in doc.syncedLines {
-            if current >= line.timestamp {
-                matched = line.index
-            } else {
-                break
-            }
-        }
-        return matched
-    }
-
-    private var activeLineIndex: Int? {
-        if let highlightedLineIndex { return highlightedLineIndex }
-        guard let doc = lyricsService.currentDocument else { return nil }
-        return computeActiveLineIndex(at: player.currentTime, in: doc)
-    }
-
-    private var isInIntroBeforeFirstLine: Bool {
-        guard let doc = lyricsService.currentDocument,
-              doc.isSynchronized,
-              let first = doc.syncedLines.first else {
-            return false
-        }
-        return player.currentTime < first.timestamp
     }
 
     public var body: some View {
@@ -874,57 +1195,41 @@ public struct SynchronizedLyricsView: View {
     }
 
     private func synchronizedLyricsScroll(doc: TrackLyricsDocument) -> some View {
-        ScrollViewReader { proxy in
-            ScrollView(.vertical, showsIndicators: false) {
-                LazyVStack(alignment: .leading, spacing: 22) {
-                    Spacer().frame(height: 20)
+        // Single deterministic source of truth directly from playback time — can never get stuck or stale!
+        let currentActiveIndex = LyricSynchronizationEngine.activeLineIndex(
+            at: player.currentTime,
+            in: doc.syncedLines
+        )
 
-                    if isInIntroBeforeFirstLine, let firstLine = doc.syncedLines.first {
-                        let introDots = AppleMusicInstrumentalDotsView.calculateLitDots(
-                            currentTime: player.currentTime,
-                            startTime: 0,
-                            endTime: firstLine.timestamp
-                        )
-                        AppleMusicInstrumentalDotsView(litDotsCount: introDots)
-                            .id(-1)
-                    }
+        return ScrollViewReader { proxy in
+            ScrollView(.vertical, showsIndicators: false) {
+                // Use VStack (not LazyVStack) so every row has exact known geometry and scrollTo never jumps after intro/pause dots
+                VStack(alignment: .leading, spacing: 20) {
+                    Spacer().frame(height: 24)
 
                     ForEach(doc.syncedLines) { line in
-                        let currentIdx = activeLineIndex ?? -1
-                        let isCurrent = (currentIdx == line.index)
-                        let isPast = (line.index < currentIdx)
-                        let nextTimestamp: TimeInterval = (line.index + 1 < doc.syncedLines.count)
-                            ? doc.syncedLines[line.index + 1].timestamp
-                            : max(player.duration, line.timestamp + 6.0)
-                        let dotStage = (isCurrent && line.text == "•••")
-                            ? AppleMusicInstrumentalDotsView.calculateLitDots(
-                                currentTime: player.currentTime,
-                                startTime: line.timestamp,
-                                endTime: nextTimestamp
-                            )
-                            : 0
+                        let visualState = LyricSynchronizationEngine.rowVisualState(
+                            forLineAt: line.index,
+                            activeIndex: currentActiveIndex,
+                            currentTime: player.currentTime,
+                            in: doc.syncedLines,
+                            trackDuration: player.duration
+                        )
 
-                        VStack(alignment: .leading, spacing: 6) {
-                            if line.text == "•••" {
-                                AppleMusicInstrumentalDotsView(litDotsCount: isCurrent ? dotStage : 0)
+                        Group {
+                            if line.isInstrumental {
+                                SyncedInstrumentalDotsRowView(
+                                    isCurrent: visualState.isCurrent,
+                                    litDotsCount: visualState.litDotsCount
+                                )
                             } else {
-                                // Fixed base font size (25pt bold) prevents text line-wrap jumps; GPU scaleEffect creates silky Apple Music zoom
-                                Text(line.text)
-                                    .font(.system(size: 25, weight: .bold))
-                                    .foregroundStyle(.white.opacity(isCurrent ? 1.0 : (isPast ? 0.24 : 0.45)))
-                                    .scaleEffect(isCurrent ? 1.05 : 0.96, anchor: .leading)
-                                    .offset(y: isCurrent ? 0 : (isPast ? -1 : 1))
+                                SyncedLyricTextRowView(
+                                    text: line.text,
+                                    isCurrent: visualState.isCurrent,
+                                    isPast: visualState.isPast
+                                )
                             }
                         }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.vertical, 8)
-                        .padding(.horizontal, 14)
-                        .background(
-                            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                                .fill(isCurrent ? Color.white.opacity(0.12) : Color.clear)
-                        )
-                        .animation(.interpolatingSpring(stiffness: 160, damping: 23), value: isCurrent)
-                        .contentShape(Rectangle())
                         .id(line.index)
                         .onTapGesture {
                             isUserManualScrolling = false
@@ -932,35 +1237,37 @@ public struct SynchronizedLyricsView: View {
                             if !player.isPlaying {
                                 player.resume()
                             }
-                            highlightedLineIndex = line.index
                             withAnimation(.interpolatingSpring(stiffness: 145, damping: 22)) {
                                 proxy.scrollTo(line.index, anchor: UnitPoint(x: 0.5, y: 0.38))
                             }
                         }
                     }
 
-                    Spacer().frame(height: 170)
+                    Spacer().frame(height: 180)
                 }
+                .id(doc.id)
                 .padding(.horizontal, 20)
             }
             .onAppear {
-                if let initial = computeActiveLineIndex(at: player.currentTime, in: doc) {
-                    highlightedLineIndex = initial
-                    proxy.scrollTo(initial, anchor: UnitPoint(x: 0.5, y: 0.38))
+                let target = currentActiveIndex ?? 0
+                if !doc.syncedLines.isEmpty {
+                    proxy.scrollTo(target, anchor: UnitPoint(x: 0.5, y: 0.38))
                 }
             }
-            .onChange(of: player.currentTrack?.id) { _, _ in
-                highlightedLineIndex = nil
+            .onChange(of: doc.id) { _, _ in
+                isUserManualScrolling = false
+                let target = LyricSynchronizationEngine.activeLineIndex(
+                    at: player.currentTime,
+                    in: doc.syncedLines
+                ) ?? 0
+                if !doc.syncedLines.isEmpty {
+                    proxy.scrollTo(target, anchor: UnitPoint(x: 0.5, y: 0.38))
+                }
             }
-            .onReceive(player.$currentTime) { newTime in
-                let nextIdx = computeActiveLineIndex(at: newTime, in: doc)
-                if nextIdx != highlightedLineIndex {
-                    highlightedLineIndex = nextIdx
-                    if let target = nextIdx {
-                        withAnimation(.interpolatingSpring(stiffness: 145, damping: 22)) {
-                            proxy.scrollTo(target, anchor: UnitPoint(x: 0.5, y: 0.38))
-                        }
-                    }
+            .onChange(of: currentActiveIndex) { _, newIdx in
+                guard !isUserManualScrolling, let target = newIdx else { return }
+                withAnimation(.interpolatingSpring(stiffness: 145, damping: 22)) {
+                    proxy.scrollTo(target, anchor: UnitPoint(x: 0.5, y: 0.38))
                 }
             }
         }

@@ -24,14 +24,14 @@ jobs:
 
       - name: Run Unit Tests on iOS Simulator
         run: |
-          SIM_ID=$(xcrun simctl list devices available | grep -m 1 "iPhone 16" | sed -E 's/.*\(([0-9A-F-]+)\).*/\1/')
-          if [ -n "$SIM_ID" ]; then
-            xcodebuild test \
-              -project AuraMusic.xcodeproj \
-              -scheme AuraMusic \
-              -destination "platform=iOS Simulator,id=$SIM_ID" \
-              CODE_SIGNING_ALLOWED=NO
-          fi
+          SIM_ID=$(xcrun simctl list devices available | grep -m 1 "iPhone " | sed -E 's/.*\(([0-9A-F-]+)\).*/\1/')
+          echo "Running AuraMusicTests on simulator ID: $SIM_ID"
+          test -n "$SIM_ID"
+          xcodebuild test \
+            -project AuraMusic.xcodeproj \
+            -scheme AuraMusic \
+            -destination "platform=iOS Simulator,id=$SIM_ID" \
+            CODE_SIGNING_ALLOWED=NO
 
       - name: Build Release iOS App Archive (Unsigned for Windows Sideloadly / AltStore / SideStore)
         run: |

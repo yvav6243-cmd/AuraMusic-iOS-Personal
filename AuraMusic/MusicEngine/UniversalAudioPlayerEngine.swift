@@ -159,7 +159,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         if currentTime.isFinite && currentTime > 0.05 {
             hasReceivedFirstYouTubeProgressTick = true
             lastYouTubeJSTickWallTime = CACurrentMediaTime()
-            if abs(currentTime - self.currentTime) >= 0.12 {
+            if abs(currentTime - self.currentTime) >= 0.08 {
                 self.currentTime = currentTime
             }
         }
@@ -223,11 +223,13 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
                 guard !Task.isCancelled,
                       self.activeYouTubeVideoID != nil,
                       self.isPlaying,
+                      !self.isBuffering,
                       self.hasReceivedFirstYouTubeProgressTick else {
                     continue
                 }
                 let elapsedSinceJSTick = CACurrentMediaTime() - self.lastYouTubeJSTickWallTime
-                if elapsedSinceJSTick >= 0.16 {
+                let isInBackground = UIApplication.shared.applicationState != .active
+                if elapsedSinceJSTick >= 0.16 && (isInBackground || elapsedSinceJSTick <= 0.75) {
                     let maxDur = self.duration > 0 ? self.duration : 240
                     if self.currentTime + 0.15 < maxDur {
                         self.currentTime += 0.15
