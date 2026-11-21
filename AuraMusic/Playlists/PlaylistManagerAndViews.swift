@@ -215,6 +215,7 @@ public struct AppleMusicPlaylistImportSheet: View {
     @State private var urlInput: String = ""
     @State private var isImporting: Bool = false
     @State private var importReport: AppleMusicPlaylistImportReport?
+    @State private var importedYouTubeTrack: UniversalTrack?
     @State private var errorMessage: String?
 
     public init() {}
@@ -228,16 +229,16 @@ public struct AppleMusicPlaylistImportSheet: View {
                             Image(systemName: "link.badge.plus")
                                 .font(.system(size: 20, weight: .bold))
                                 .foregroundStyle(AuraTheme.accentPink)
-                            Text("Import Shared Apple Music Playlist")
+                            Text("Import Song from YouTube URL or Apple Music Playlist")
                                 .font(.headline)
                         }
-                        Text("Paste any Apple Music playlist URL (e.g. https://music.apple.com/us/playlist/example/pl.123456789). AuraMusic detects the storefront and playlist ID, retrieves ordered tracks, cross-matches them across providers, and saves the playlist to your library.")
+                        Text("Paste any YouTube / YouTube Music link (e.g. https://youtu.be/... or https://www.youtube.com/watch?v=...) to get the full song with lyrics and album cover, OR paste an Apple Music playlist URL.")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
                     .padding(.vertical, 4)
 
-                    TextField("https://music.apple.com/us/playlist/...", text: $urlInput)
+                    TextField("https://youtu.be/... or https://music.apple.com/...", text: $urlInput)
                         .keyboardType(.URL)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
@@ -252,8 +253,8 @@ public struct AppleMusicPlaylistImportSheet: View {
 
                         Spacer()
 
-                        Button("Sample Apple Music URL") {
-                            urlInput = "https://music.apple.com/us/playlist/todays-hits/pl.f4d106fed2bd41149aaacabb233eb5eb"
+                        Button("Sample YouTube Song") {
+                            urlInput = "https://www.youtube.com/watch?v=plnfIj7dkJE"
                         }
                         .font(.footnote)
                     }
@@ -270,10 +271,10 @@ public struct AppleMusicPlaylistImportSheet: View {
                             if isImporting {
                                 ProgressView()
                                     .padding(.trailing, 8)
-                                Text("Importing & Matching Tracks…")
+                                Text("Loading Song, Cover & Lyrics…")
                                     .fontWeight(.semibold)
                             } else {
-                                Text("Import Playlist to Library")
+                                Text("Get Song / Import URL")
                                     .fontWeight(.bold)
                             }
                             Spacer()
@@ -288,6 +289,30 @@ public struct AppleMusicPlaylistImportSheet: View {
                         Text(errorMessage)
                             .foregroundStyle(.red)
                             .font(.footnote)
+                    }
+                }
+
+                if let ytTrack = importedYouTubeTrack {
+                    Section("YouTube Song Ready & Playing") {
+                        HStack(spacing: 12) {
+                            AuraArtworkView(url: ytTrack.artworkURL, size: 60, cornerRadius: 10)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(ytTrack.title)
+                                    .font(.headline)
+                                Text(ytTrack.artist)
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                                Text("Saved to Favourite Songs & Library • Full Lyrics Loaded")
+                                    .font(.caption2)
+                                    .foregroundStyle(AuraTheme.accentPink)
+                            }
+                        }
+
+                        Button("Done — Listen Now") {
+                            dismiss()
+                        }
+                        .fontWeight(.bold)
+                        .foregroundStyle(AuraTheme.accentPink)
                     }
                 }
 
@@ -334,8 +359,23 @@ public struct AppleMusicPlaylistImportSheet: View {
         isImporting = true
         errorMessage = nil
         importReport = nil
+        importedYouTubeTrack = nil
+
+        let trimmed = urlInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        if YouTubeMusicProvider.extractYouTubeVideoID(from: trimmed) != nil {
+            if let ytTrack = await YouTubeMusicProvider(providerType: .youtubeMusic).resolveTrackFromYouTubeURL(trimmed) {
+                PersistenceController.shared.upsertTrack(ytTrack, addToLibrary: true, markFavorite: true)
+                UniversalAudioPlayerEngine.shared.play(ytTrack, queue: [ytTrack])
+                importedYouTubeTrack = ytTrack
+            } else {
+                errorMessage = "Could not load the YouTube song from this link."
+            }
+            isImporting = false
+            return
+        }
+
         do {
-            let result = try await PlaylistManager.shared.importAppleMusicPlaylist(from: urlInput)
+            let result = try await PlaylistManager.shared.importAppleMusicPlaylist(from: trimmed)
             importReport = result.report
         } catch {
             errorMessage = error.localizedDescription
