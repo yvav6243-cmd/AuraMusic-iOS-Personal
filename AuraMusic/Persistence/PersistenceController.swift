@@ -398,6 +398,63 @@ public final class PersistenceController: ObservableObject {
         }
     }
 
+    /// Sets a custom user photo as the song's cover artwork, or pass nil to restore the default album cover
+    @discardableResult
+    public func setCustomTrackArtwork(imageData: Data?, for track: UniversalTrack, defaultArtworkURL: URL? = nil) -> URL? {
+        let entity = upsertTrack(track, addToLibrary: true)
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let coversDir = docs.appendingPathComponent("AuraLocalFiles/CustomCovers", isDirectory: true)
+        try? FileManager.default.createDirectory(at: coversDir, withIntermediateDirectories: true)
+
+        let safeID = track.id
+            .replacingOccurrences(of: ":", with: "_")
+            .replacingOccurrences(of: "/", with: "_")
+        let fileURL = coversDir.appendingPathComponent("\(safeID)_custom.jpg")
+
+        if let imageData, let uiImg = UIImage(data: imageData), let jpg = uiImg.jpegData(compressionQuality: 0.88) {
+            // Store original remote URL in customArtworkData if needed so we can restore default cover later
+            if entity.customArtworkData == nil,
+               let currentArt = entity.artworkURLString,
+               !currentArt.hasPrefix("file://") {
+                entity.customArtworkData = Data(currentArt.utf8)
+            }
+            try? jpg.write(to: fileURL, options: .atomic)
+            entity.artworkURLString = fileURL.absoluteString
+            try? context.save()
+            reloadAll()
+            return fileURL
+        } else {
+            // Restore default album cover
+            try? FileManager.default.removeItem(at: fileURL)
+            if let savedOriginalData = entity.customArtworkData,
+               let originalURLString = String(data: savedOriginalData, encoding: .utf8),
+               !originalURLString.isEmpty {
+                entity.artworkURLString = originalURLString
+            } else if let defaultArtworkURL {
+                entity.artworkURLString = defaultArtworkURL.absoluteString
+            }
+            entity.customArtworkData = nil
+            try? context.save()
+            reloadAll()
+            return entity.artworkURLString.flatMap(URL.init(string:))
+        }
+    }
+
+    public func hasCustomArtwork(for trackID: String) -> Bool {
+        guard let entity = libraryTracks.first(where: { $0.trackID == trackID }) else { return false }
+        return (entity.artworkURLString ?? "").hasPrefix("file://") && entity.customArtworkData != nil
+    }
+
+    public func effectiveArtworkURL(for track: UniversalTrack) -> URL? {
+        if let entity = libraryTracks.first(where: { $0.trackID == track.id }),
+           let customStr = entity.artworkURLString,
+           customStr.hasPrefix("file://"),
+           let customURL = URL(string: customStr) {
+            return customURL
+        }
+        return track.artworkURL
+    }
+
     public func isTrackFavorite(_ trackID: String) -> Bool {
         libraryTracks.first(where: { $0.trackID == trackID })?.isFavorite ?? false
     }
