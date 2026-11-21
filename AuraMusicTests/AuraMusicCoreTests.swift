@@ -1734,4 +1734,167 @@ final class AuraMusicCoreTests: XCTestCase {
         XCTAssertEqual(afterAd?["realMuted"] as? Bool, false, "Real song must be unmuted immediately once ad finishes")
         XCTAssertEqual(afterAd?["rate"] as? Double ?? -1, 1.0, accuracy: 0.01, "Real song playback rate must return to 1.0x")
     }
+
+    // MARK: - Expanded Chinese & Russian Multi-Provider Lyrics Tests
+
+    func testChineseAndRussianTitleExtractionWithGuillemetsAndBrackets() {
+        let jayChou = LyricsService.extractCleanTitleAndArtist(
+            rawTitle: "周杰伦《晴天》官方MV",
+            rawArtist: "杰威尔音乐 JVR Music"
+        )
+        XCTAssertEqual(jayChou.title, "晴天")
+        XCTAssertEqual(jayChou.artist, "周杰伦")
+
+        let gem = LyricsService.extractCleanTitleAndArtist(
+            rawTitle: "鄧紫棋《光年之外》【動態歌詞】",
+            rawArtist: "Music Channel"
+        )
+        XCTAssertEqual(gem.title, "光年之外")
+        XCTAssertEqual(gem.artist, "鄧紫棋")
+
+        let kino = LyricsService.extractCleanTitleAndArtist(
+            rawTitle: "Кино - Группа крови (Официальный клип) [HD]",
+            rawArtist: "KINO Official"
+        )
+        XCTAssertEqual(kino.title, "Группа крови")
+        XCTAssertEqual(kino.artist, "Кино")
+
+        let tdd = LyricsService.extractCleanTitleAndArtist(
+            rawTitle: "Три дня дождя — Отпускай (Премьера 2024)",
+            rawArtist: "IZBA"
+        )
+        XCTAssertEqual(tdd.title, "Отпускай")
+        XCTAssertEqual(tdd.artist, "Три дня дождя")
+    }
+
+    func testOriginalLanguageSelectionPreservesChineseHanAndRussianCyrillicAndRejectsInstrumentalPlaceholder() {
+        // 1. Chinese song: must pick Chinese Han synced LRC, reject Pinyin/English translation & reject QQ instrumental placeholder
+        let pinyinCandidate = LRCLIBEntryDTO(
+            id: 1,
+            trackName: "晴天 (Pinyin Romanized)",
+            artistName: "Jay Chou",
+            albumName: "Pinyin",
+            duration: 269,
+            instrumental: false,
+            plainLyrics: nil,
+            syncedLyrics: "[00:29.00]Gu shi de xiao huang hua"
+        )
+        let qqPlaceholder = LRCLIBEntryDTO(
+            id: 2,
+            trackName: "晴天",
+            artistName: "周杰伦",
+            albumName: "QQ Music",
+            duration: 269,
+            instrumental: false,
+            plainLyrics: nil,
+            syncedLyrics: "[00:00.00]纯音乐，请欣赏"
+        )
+        let chineseSynced = LRCLIBEntryDTO(
+            id: 3,
+            trackName: "晴天",
+            artistName: "周杰伦",
+            albumName: "叶惠美",
+            duration: 269,
+            instrumental: false,
+            plainLyrics: nil,
+            syncedLyrics: "[00:29.00]故事的小黄花\n[00:32.50]从出生那年就飘着"
+        )
+
+        let pickedCN = LyricsService.selectBestOriginalLanguageCandidate(
+            from: [pinyinCandidate, qqPlaceholder, chineseSynced],
+            referenceText: "周杰伦 晴天",
+            targetTitle: "晴天",
+            targetArtist: "周杰伦",
+            targetDuration: 269
+        )
+        XCTAssertEqual(pickedCN?.id, 3, "Must select authentic Chinese Han synced LRC over Pinyin or instrumental placeholder")
+
+        // 2. Russian song: must pick Russian Cyrillic synced LRC over English translation
+        let engTranslation = LRCLIBEntryDTO(
+            id: 10,
+            trackName: "Группа крови (English Translation)",
+            artistName: "Kino",
+            albumName: "Translation",
+            duration: 285,
+            instrumental: false,
+            plainLyrics: nil,
+            syncedLyrics: "[00:30.00]Warm place, but the streets wait"
+        )
+        let ruSynced = LRCLIBEntryDTO(
+            id: 11,
+            trackName: "Группа крови",
+            artistName: "Кино",
+            albumName: "YouTube Music Synced",
+            duration: 285,
+            instrumental: false,
+            plainLyrics: nil,
+            syncedLyrics: "[00:30.00]Тёплое место, но улицы ждут\n[00:35.00]Отпечатков наших ног"
+        )
+
+        let pickedRU = LyricsService.selectBestOriginalLanguageCandidate(
+            from: [engTranslation, ruSynced],
+            referenceText: "Кино Группа крови",
+            targetTitle: "Группа крови",
+            targetArtist: "Кино",
+            targetDuration: 285
+        )
+        XCTAssertEqual(pickedRU?.id, 11, "Must select original Russian Cyrillic synced LRC over English translation")
+    }
+
+    func testYouTubeMusicTimedLyricsJSONParserConvertsMillisecondsToSyncedLRC() throws {
+        let sampleJSON = """
+        {
+          "contents": {
+            "elementRenderer": {
+              "timedLyricsModel": {
+                "timedLyricsData": [
+                  { "lyricLine": "♪", "cueRange": { "startTimeMilliseconds": "0", "endTimeMilliseconds": "8870" } },
+                  { "lyricLine": "I got love, I got love", "cueRange": { "startTimeMilliseconds": "8870", "endTimeMilliseconds": "14920" } },
+                  { "lyricLine": "Окутала меня, окутала", "cueRange": { "startTimeMilliseconds": "15100", "endTimeMilliseconds": "19500" } },
+                  { "lyricLine": "Небо в алмазах - лето", "cueRange": { "startTimeMilliseconds": "20450", "endTimeMilliseconds": "24000" } }
+                ]
+              }
+            }
+          }
+        }
+        """
+        let data = try XCTUnwrap(sampleJSON.data(using: .utf8))
+        let dto = try XCTUnwrap(
+            LyricsService.parseYouTubeMusicTimedLyricsJSON(data, title: "I Got Love", artist: "Miyagi", duration: 277)
+        )
+        XCTAssertEqual(dto.albumName, "YouTube Music Synced")
+        let syncedLRC = try XCTUnwrap(dto.syncedLyrics)
+        let parsed = LRCParser.parseSyncedLRC(syncedLRC, includeIntroDots: true)
+        XCTAssertEqual(parsed.count, 4, "Should have intro dots + 3 sung lines")
+        XCTAssertTrue(parsed[0].isInstrumental)
+        XCTAssertEqual(parsed[1].text, "I got love, I got love")
+        XCTAssertEqual(parsed[1].timestamp, 8.87, accuracy: 0.01)
+        XCTAssertEqual(parsed[2].text, "Окутала меня, окутала")
+        XCTAssertEqual(parsed[2].timestamp, 15.10, accuracy: 0.01)
+
+        // Plain-only YouTube Music shelf fallback (no cueRange)
+        let plainJSON = """
+        {
+          "contents": {
+            "timedLyricsData": [
+              { "lyricLine": "故事的小黃花從出生那年就飄著" },
+              { "lyricLine": "童年的盪鞦韆隨記憶一直晃到現在" },
+              { "lyricLine": "吹著前奏望著天空" }
+            ]
+          }
+        }
+        """
+        let plainData = try XCTUnwrap(plainJSON.data(using: .utf8))
+        let plainDTO = try XCTUnwrap(
+            LyricsService.parseYouTubeMusicTimedLyricsJSON(plainData, title: "晴天", artist: "周杰伦", duration: 269)
+        )
+        XCTAssertNil(plainDTO.syncedLyrics)
+        XCTAssertTrue(plainDTO.plainLyrics?.contains("故事的小黃花") == true)
+    }
+
+    func testHTMLEntityDecodingForQQMusicLyrics() {
+        let raw = "[00:10.00]I&apos;m &quot;ready&quot; &amp; here&#58;&#32;now&#10;[00:15.00]Don&#39;t stop"
+        let decoded = LyricsService.decodeLyricsHTMLEntities(raw)
+        XCTAssertEqual(decoded, "[00:10.00]I'm \"ready\" & here: now\n[00:15.00]Don't stop")
+    }
 }

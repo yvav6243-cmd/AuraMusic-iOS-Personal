@@ -489,44 +489,130 @@ public final class LyricsService: ObservableObject {
             return
         }
 
-        // 2. Multi-stage LRCLIB search prioritizing time-synchronized LRC lyrics in the ORIGINAL language
+        // 2. Parallel 6-provider lyrics search prioritizing time-synchronized LRC in the ORIGINAL language:
+        //    Wave 1 (Parallel): YouTube Music InnerTube Timed Lyrics (exact videoId) + LRCLIB + QQ Music + NetEase Cloud Music
+        //    Wave 2 (Fallback if no synced LRC yet): Kugou Music + iTunes CN/RU/US canonical metadata + reversed query + Lyrics.ovh
         let referenceScriptText = "\(track.title) \(track.artist) \(parsedTitle) \(parsedArtist)"
+        let youtubeVideoID: String? = (track.provider == .youtubeMusic || track.provider == .youtube)
+            ? track.providerTrackID
+            : nil
+
         do {
             var allCandidates: [LRCLIBEntryDTO] = []
 
-            if let exact = try? await fetchExactLRCLIB(title: parsedTitle, artist: parsedArtist, album: track.album, duration: track.duration) {
-                allCandidates.append(exact)
-            }
-
-            if let search1 = try? await searchLRCLIB(title: parsedTitle, artist: parsedArtist) {
-                allCandidates.append(contentsOf: search1)
-            }
-
-            // Always also query by clean song title alone (handles YouTube label channels like Gazgolder, VEVO, 1theK, HYBE)
-            if let search2 = try? await searchLRCLIB(title: parsedTitle, artist: "") {
-                allCandidates.append(contentsOf: search2)
-            }
-
-            // Stage 3: If raw title had "A - B", also try reversed (title: parsedArtist, artist: parsedTitle) in case video was titled "Song - Artist"
-            if !allCandidates.contains(where: { !($0.syncedLyrics ?? "").isEmpty }),
-               parsedTitle != parsedArtist,
-               !parsedArtist.isEmpty {
-                if let reversedSearch = try? await searchLRCLIB(title: parsedArtist, artist: parsedTitle) {
-                    allCandidates.append(contentsOf: reversedSearch)
+            // Wave 1: Fire YouTube Music (exact videoId), LRCLIB, QQ Music, and NetEase Cloud Music in parallel!
+            let primaryQuery = "\(parsedTitle) \(parsedArtist)".trimmingCharacters(in: .whitespacesAndNewlines)
+            let wave1Results: [LRCLIBEntryDTO] = await withTaskGroup(of: [LRCLIBEntryDTO].self) { group in
+                if let vid = youtubeVideoID, !vid.isEmpty {
+                    group.addTask {
+                        if let ytDTO = await self.fetchYouTubeMusicOfficialLyrics(
+                            videoID: vid,
+                            fallbackTitle: parsedTitle,
+                            fallbackArtist: parsedArtist,
+                            duration: track.duration
+                        ) {
+                            return [ytDTO]
+                        }
+                        return []
+                    }
                 }
+
+                group.addTask {
+                    var list: [LRCLIBEntryDTO] = []
+                    if let exact = try? await self.fetchExactLRCLIB(title: parsedTitle, artist: parsedArtist, album: track.album, duration: track.duration) {
+                        list.append(exact)
+                    }
+                    if let search1 = try? await self.searchLRCLIB(title: parsedTitle, artist: parsedArtist) {
+                        list.append(contentsOf: search1)
+                    }
+                    if let search2 = try? await self.searchLRCLIB(title: parsedTitle, artist: "") {
+                        list.append(contentsOf: search2)
+                    }
+                    return list
+                }
+
+                group.addTask {
+                    var qqList = await self.fetchQQMusicLyrics(query: primaryQuery, targetDuration: track.duration)
+                    if qqList.isEmpty && !parsedTitle.isEmpty && primaryQuery != parsedTitle {
+                        qqList = await self.fetchQQMusicLyrics(query: parsedTitle, targetDuration: track.duration)
+                    }
+                    return qqList
+                }
+
+                group.addTask {
+                    var neList = await self.fetchNetEaseLyrics(query: primaryQuery, targetDuration: track.duration)
+                    if neList.isEmpty && !parsedTitle.isEmpty && primaryQuery != parsedTitle {
+                        neList = await self.fetchNetEaseLyrics(query: parsedTitle, targetDuration: track.duration)
+                    }
+                    return neList
+                }
+
+                var merged: [LRCLIBEntryDTO] = []
+                for await batch in group {
+                    merged.append(contentsOf: batch)
+                }
+                return merged
+            }
+            allCandidates.append(contentsOf: wave1Results)
+
+            let hasGoodSyncedAlready = Self.selectBestOriginalLanguageCandidate(
+                from: allCandidates,
+                referenceText: referenceScriptText,
+                targetTitle: parsedTitle,
+                targetArtist: parsedArtist,
+                targetDuration: track.duration
+            ).map { !($0.syncedLyrics ?? "").isEmpty } ?? false
+
+            // Wave 2: Smart fallbacks (Kugou Music + localized iTunes CN/RU/US canonical lookup + reversed "Song - Artist" + Lyrics.ovh)
+            if !hasGoodSyncedAlready {
+                let wave2Results: [LRCLIBEntryDTO] = await withTaskGroup(of: [LRCLIBEntryDTO].self) { group in
+                    group.addTask {
+                        await self.fetchKugouLyrics(query: primaryQuery, targetDuration: track.duration)
+                    }
+
+                    if parsedTitle != parsedArtist, !parsedArtist.isEmpty {
+                        group.addTask {
+                            var rev: [LRCLIBEntryDTO] = []
+                            if let reversedSearch = try? await self.searchLRCLIB(title: parsedArtist, artist: parsedTitle) {
+                                rev.append(contentsOf: reversedSearch)
+                            }
+                            let reversedQuery = "\(parsedArtist) \(parsedTitle)"
+                            rev.append(contentsOf: await self.fetchQQMusicLyrics(query: reversedQuery, targetDuration: track.duration))
+                            return rev
+                        }
+                    }
+
+                    group.addTask {
+                        var canonicalHits: [LRCLIBEntryDTO] = []
+                        let countryCode: String
+                        if Self.containsScript(referenceScriptText, pattern: "\\p{Han}") && !Self.containsScript(referenceScriptText, pattern: "[\\p{Hiragana}\\p{Katakana}]") {
+                            countryCode = "cn"
+                        } else if Self.containsScript(referenceScriptText, pattern: "\\p{Cyrillic}") {
+                            countryCode = "ru"
+                        } else {
+                            countryCode = "us"
+                        }
+                        if let canonical = await self.resolveCanonicalMetadataFromCatalog(query: primaryQuery, country: countryCode) {
+                            let canonicalQuery = "\(canonical.title) \(canonical.artist)".trimmingCharacters(in: .whitespacesAndNewlines)
+                            if let s3 = try? await self.searchLRCLIB(title: canonical.title, artist: canonical.artist) {
+                                canonicalHits.append(contentsOf: s3)
+                            }
+                            canonicalHits.append(contentsOf: await self.fetchQQMusicLyrics(query: canonicalQuery, targetDuration: track.duration))
+                            canonicalHits.append(contentsOf: await self.fetchNetEaseLyrics(query: canonicalQuery, targetDuration: track.duration))
+                        }
+                        return canonicalHits
+                    }
+
+                    var merged: [LRCLIBEntryDTO] = []
+                    for await batch in group {
+                        merged.append(contentsOf: batch)
+                    }
+                    return merged
+                }
+                allCandidates.append(contentsOf: wave2Results)
             }
 
-            // Stage 4: Resolve canonical song title & artist via iTunes catalog metadata
-            if let canonical = await resolveCanonicalMetadataFromCatalog(query: "\(parsedTitle) \(parsedArtist)") {
-                if let search3 = try? await searchLRCLIB(title: canonical.title, artist: canonical.artist) {
-                    allCandidates.append(contentsOf: search3)
-                }
-                if let search4 = try? await searchLRCLIB(title: canonical.title, artist: "") {
-                    allCandidates.append(contentsOf: search4)
-                }
-            }
-
-            // Stage 5: Backup public Lyrics.ovh lookup if LRCLIB had no entry
+            // Stage 3: Backup public Lyrics.ovh lookup if all 5 synced catalogs returned nothing
             if allCandidates.isEmpty {
                 if let ovhPlain = await fetchBackupLyricsOvh(artist: parsedArtist, title: parsedTitle) {
                     allCandidates.append(
@@ -549,6 +635,8 @@ public final class LyricsService: ObservableObject {
             if let bestDTO = Self.selectBestOriginalLanguageCandidate(
                 from: allCandidates,
                 referenceText: referenceScriptText,
+                targetTitle: parsedTitle,
+                targetArtist: parsedArtist,
                 targetDuration: track.duration
             ) {
                 cacheLyrics(
@@ -586,26 +674,36 @@ public final class LyricsService: ObservableObject {
             .replacingOccurrences(of: "VEVO", with: "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
-        // 1. Handle Japanese/Asian corner brackets e.g. YOASOBI「アイドル」Official Music Video
-        if let openBracket = workingTitle.firstIndex(of: "「"),
-           let closeBracket = workingTitle.firstIndex(of: "」"),
-           openBracket < closeBracket {
-            let prefixArtist = String(workingTitle[..<openBracket]).trimmingCharacters(in: .whitespacesAndNewlines)
-            let insideTitle = String(workingTitle[workingTitle.index(after: openBracket)..<closeBracket]).trimmingCharacters(in: .whitespacesAndNewlines)
-            if !insideTitle.isEmpty {
-                workingTitle = insideTitle
-                if !prefixArtist.isEmpty {
-                    workingArtist = prefixArtist
+        // 1. Handle Chinese guillemets 《...》 and Japanese corner brackets 「...」 / 『...』
+        //    e.g. 周杰伦《晴天》官方MV, 鄧紫棋《光年之外》【動態歌詞】, YOASOBI「アイドル」Official Music Video
+        let quotePairs: [(Character, Character)] = [("《", "》"), ("「", "」"), ("『", "』")]
+        for (openChar, closeChar) in quotePairs {
+            if let openBracket = workingTitle.firstIndex(of: openChar),
+               let closeBracket = workingTitle.firstIndex(of: closeChar),
+               openBracket < closeBracket {
+                let prefixArtist = String(workingTitle[..<openBracket])
+                    .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "-–—:：")))
+                let insideTitle = String(workingTitle[workingTitle.index(after: openBracket)..<closeBracket])
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !insideTitle.isEmpty {
+                    workingTitle = insideTitle
+                    if !prefixArtist.isEmpty {
+                        workingArtist = prefixArtist
+                    }
+                    break
                 }
             }
         }
 
-        // 2. Strip hashtags, pipes, and parenthetical/bracketed video/audio/remix/slowed noise in both Russian and English FIRST
+        // 2. Strip hashtags, pipes, and parenthetical/bracketed video/audio/remix/slowed noise in Chinese, Russian, and English FIRST
+        let noiseWords = "official|audio|video|lyric|remaster|visualizer|live|hd|4k|mv|slowed|reverb|speed|sped|nightcore|remix|tiktok|bass|ost|prod|клип|видео|аудио|премьера|официальн|текст|музыка|сниппет|полная версия|лирик|минус|лайв|живой|官方|動態歌詞|动态歌词|完整版|高清|纯享|純享|现场|現場|翻唱|歌词|歌詞|高音質|高音质|无损|無損|伴奏|纯音乐|抖音|热歌|動態"
         let bracketPatterns = [
             "#\\S+",
             "\\|.*$",
-            "\\([^)]*(?:official|audio|video|lyric|remaster|visualizer|live|hd|4k|slowed|reverb|speed|sped|nightcore|remix|tiktok|bass|клип|видео|аудио|премьера|официальн|текст|музыка|ost|prod)[^)]*\\)",
-            "\\[[^\\]]*(?:official|audio|video|lyric|remaster|visualizer|live|hd|4k|slowed|reverb|speed|sped|nightcore|remix|tiktok|bass|клип|видео|аудио|премьера|официальн|текст|музыка|ost|prod)[^\\]]*\\]"
+            "\\([^)]*(?:\(noiseWords))[^)]*\\)",
+            "\\[[^\\]]*(?:\(noiseWords))[^\\]]*\\]",
+            "【[^】]*(?:\(noiseWords))[^】]*】",
+            "（[^）]*(?:\(noiseWords))[^）]*）"
         ]
         for pattern in bracketPatterns {
             if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
@@ -665,18 +763,33 @@ public final class LyricsService: ObservableObject {
         return (finalTitle.isEmpty ? rawTitle : finalTitle, finalArtist.isEmpty ? rawArtist : finalArtist)
     }
 
-    /// Selects the best lyric entry while strictly preserving the song's original language and rejecting English translations/romanizations
-    nonisolated private static func selectBestOriginalLanguageCandidate(
+    /// Selects the best lyric entry while strictly preserving the song's original language (including Chinese, Russian, Japanese, Korean)
+    /// and prioritizing synchronized LRC + exact title/artist/duration matches.
+    nonisolated public static func selectBestOriginalLanguageCandidate(
         from candidates: [LRCLIBEntryDTO],
         referenceText: String,
+        targetTitle: String = "",
+        targetArtist: String = "",
         targetDuration: TimeInterval
     ) -> LRCLIBEntryDTO? {
-        let valid = candidates.filter { !($0.syncedLyrics ?? "").isEmpty || !($0.plainLyrics ?? "").isEmpty }
+        let valid = candidates.filter { item in
+            let sample = (item.syncedLyrics ?? item.plainLyrics ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !sample.isEmpty else { return false }
+            // Filter out QQ/NetEase "pure instrumental, please enjoy" placeholders when real lyrics may exist
+            if sample.count < 80 && (sample.contains("纯音乐，请欣赏") || sample.contains("此歌曲为没有填词的纯音乐")) {
+                return false
+            }
+            return true
+        }
         guard !valid.isEmpty else { return nil }
 
         let expectsCyrillic = containsScript(referenceText, pattern: "\\p{Cyrillic}")
         let expectsJapanese = containsScript(referenceText, pattern: "[\\p{Hiragana}\\p{Katakana}]")
         let expectsKorean = containsScript(referenceText, pattern: "\\p{Hangul}")
+        let expectsChinese = !expectsJapanese && containsScript(referenceText, pattern: "\\p{Han}")
+
+        let normTargetTitle = targetTitle.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        let normTargetArtist = targetArtist.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
 
         let scored = valid.map { item -> (dto: LRCLIBEntryDTO, score: Int) in
             let textSample = (item.syncedLyrics ?? item.plainLyrics ?? "")
@@ -685,25 +798,50 @@ public final class LyricsService: ObservableObject {
 
             // Strongly prefer time-synchronized LRC lyrics
             if !(item.syncedLyrics ?? "").isEmpty {
-                score += 100
+                score += 120
+                // Exact YouTube Music videoId timed lyrics match bonus
+                if item.albumName == "YouTube Music Synced" {
+                    score += 55
+                }
             }
 
             // Penalize any entry marked as a translation or romanization
-            if metaSample.range(of: "translation|translated|romanized|romaji|перевод|english ver", options: .regularExpression) != nil {
+            if metaSample.range(of: "translation|translated|romanized|romaji|pinyin|перевод|english ver", options: [.regularExpression, .caseInsensitive]) != nil {
                 score -= 250
             }
 
-            // Enforce original script preservation
+            // Enforce original script preservation (Russian/Cyrillic, Chinese/Han, Japanese, Korean)
             let hasCyrillic = containsScript(textSample, pattern: "\\p{Cyrillic}")
             let hasJapanese = containsScript(textSample, pattern: "[\\p{Hiragana}\\p{Katakana}]")
             let hasKorean = containsScript(textSample, pattern: "\\p{Hangul}")
+            let hasHan = containsScript(textSample, pattern: "\\p{Han}")
 
             if expectsCyrillic {
-                score += hasCyrillic ? 150 : -120
+                score += hasCyrillic ? 160 : -130
             } else if expectsJapanese {
-                score += hasJapanese ? 150 : -150
+                score += hasJapanese ? 160 : -150
             } else if expectsKorean {
-                score += hasKorean ? 150 : -150
+                score += hasKorean ? 160 : -150
+            } else if expectsChinese {
+                score += hasHan ? 160 : -140
+            }
+
+            // Title & artist relevance scoring so title-only fallbacks don't match wrong songs
+            let itemTitle = item.trackName.lowercased()
+            let itemArtist = item.artistName.lowercased()
+            if !normTargetTitle.isEmpty {
+                if itemTitle == normTargetTitle {
+                    score += 45
+                } else if itemTitle.contains(normTargetTitle) || normTargetTitle.contains(itemTitle) {
+                    score += 25
+                } else {
+                    score -= 35
+                }
+            }
+            if !normTargetArtist.isEmpty && !normTargetArtist.contains("youtube") && !normTargetArtist.contains("music") {
+                if itemArtist == normTargetArtist || itemArtist.contains(normTargetArtist) || normTargetArtist.contains(itemArtist) {
+                    score += 35
+                }
             }
 
             // Duration proximity bonus
@@ -732,6 +870,397 @@ public final class LyricsService: ObservableObject {
         return regex.firstMatch(in: text, range: range) != nil
     }
 
+    nonisolated public static func decodeLyricsHTMLEntities(_ text: String) -> String {
+        text.replacingOccurrences(of: "&apos;", with: "'")
+            .replacingOccurrences(of: "&#39;", with: "'")
+            .replacingOccurrences(of: "&quot;", with: "\"")
+            .replacingOccurrences(of: "&amp;", with: "&")
+            .replacingOccurrences(of: "&#58;", with: ":")
+            .replacingOccurrences(of: "&#32;", with: " ")
+            .replacingOccurrences(of: "&#10;", with: "\n")
+            .replacingOccurrences(of: "&#13;", with: "")
+    }
+
+    // MARK: - Provider 1: YouTube Music Official InnerTube Timed Lyrics (Exact videoId -> Russian, Chinese, Global!)
+
+    nonisolated public static func parseYouTubeMusicTimedLyricsJSON(
+        _ data: Data,
+        title: String,
+        artist: String,
+        duration: TimeInterval
+    ) -> LRCLIBEntryDTO? {
+        guard let root = try? JSONSerialization.jsonObject(with: data) else { return nil }
+
+        // 1. Search recursively for `timedLyricsData` array (ANDROID_MUSIC timed/plain lyrics)
+        if let timedEntries = findNestedArray(named: "timedLyricsData", in: root), !timedEntries.isEmpty {
+            var syncedLines: [String] = []
+            var plainLines: [String] = []
+            var hasTimestamps = false
+
+            for item in timedEntries {
+                guard let dict = item as? [String: Any],
+                      let rawLine = dict["lyricLine"] as? String else { continue }
+                let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !line.isEmpty {
+                    plainLines.append(line)
+                }
+                if let cue = dict["cueRange"] as? [String: Any],
+                   let startStr = cue["startTimeMilliseconds"] as? String,
+                   let startMs = Double(startStr) {
+                    hasTimestamps = true
+                    let totalSec = max(0, startMs / 1000.0)
+                    let mins = Int(totalSec) / 60
+                    let secs = totalSec - Double(mins * 60)
+                    let ts = String(format: "[%02d:%06.3f]", mins, secs)
+                    syncedLines.append("\(ts)\(line)")
+                }
+            }
+
+            if hasTimestamps && syncedLines.count >= 3 {
+                return LRCLIBEntryDTO(
+                    id: abs("\(title)\(artist)yt".hashValue) % 800_000 + 200_000,
+                    trackName: title,
+                    artistName: artist,
+                    albumName: "YouTube Music Synced",
+                    duration: duration,
+                    instrumental: false,
+                    plainLyrics: plainLines.joined(separator: "\n"),
+                    syncedLyrics: syncedLines.joined(separator: "\n")
+                )
+            } else if plainLines.count >= 3 {
+                return LRCLIBEntryDTO(
+                    id: abs("\(title)\(artist)ytp".hashValue) % 800_000 + 200_000,
+                    trackName: title,
+                    artistName: artist,
+                    albumName: "YouTube Music",
+                    duration: duration,
+                    instrumental: false,
+                    plainLyrics: plainLines.joined(separator: "\n"),
+                    syncedLyrics: nil
+                )
+            }
+        }
+
+        // 2. Fallback: WEB_REMIX `musicDescriptionShelfRenderer.description.runs`
+        if let shelf = findNestedDict(named: "musicDescriptionShelfRenderer", in: root),
+           let desc = shelf["description"] as? [String: Any],
+           let runs = desc["runs"] as? [[String: Any]] {
+            let plain = runs.compactMap { $0["text"] as? String }.joined().trimmingCharacters(in: .whitespacesAndNewlines)
+            if plain.count >= 20 {
+                return LRCLIBEntryDTO(
+                    id: abs("\(title)\(artist)ytw".hashValue) % 800_000 + 200_000,
+                    trackName: title,
+                    artistName: artist,
+                    albumName: "YouTube Music",
+                    duration: duration,
+                    instrumental: false,
+                    plainLyrics: plain,
+                    syncedLyrics: nil
+                )
+            }
+        }
+        return nil
+    }
+
+    nonisolated private static func findNestedArray(named key: String, in node: Any) -> [Any]? {
+        if let dict = node as? [String: Any] {
+            if let arr = dict[key] as? [Any] { return arr }
+            for value in dict.values {
+                if let found = findNestedArray(named: key, in: value) { return found }
+            }
+        } else if let arr = node as? [Any] {
+            for item in arr {
+                if let found = findNestedArray(named: key, in: item) { return found }
+            }
+        }
+        return nil
+    }
+
+    nonisolated private static func findNestedDict(named key: String, in node: Any) -> [String: Any]? {
+        if let dict = node as? [String: Any] {
+            if let target = dict[key] as? [String: Any] { return target }
+            for value in dict.values {
+                if let found = findNestedDict(named: key, in: value) { return found }
+            }
+        } else if let arr = node as? [Any] {
+            for item in arr {
+                if let found = findNestedDict(named: key, in: item) { return found }
+            }
+        }
+        return nil
+    }
+
+    private func fetchYouTubeMusicOfficialLyrics(
+        videoID: String,
+        fallbackTitle: String,
+        fallbackArtist: String,
+        duration: TimeInterval
+    ) async -> LRCLIBEntryDTO? {
+        guard let nextURL = URL(string: "https://music.youtube.com/youtubei/v1/next?prettyPrint=false"),
+              let browseURL = URL(string: "https://music.youtube.com/youtubei/v1/browse?prettyPrint=false") else {
+            return nil
+        }
+
+        let contextObj: [String: Any] = [
+            "client": [
+                "clientName": "ANDROID_MUSIC",
+                "clientVersion": "7.11.50",
+                "androidSdkVersion": 34,
+                "hl": "ru",
+                "gl": "RU"
+            ]
+        ]
+
+        var nextReq = URLRequest(url: nextURL)
+        nextReq.httpMethod = "POST"
+        nextReq.timeoutInterval = 6
+        nextReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        nextReq.setValue("com.google.android.apps.youtube.music/7.11.50 (Linux; U; Android 14)", forHTTPHeaderField: "User-Agent")
+        nextReq.httpBody = try? JSONSerialization.data(withJSONObject: ["context": contextObj, "videoId": videoID])
+
+        guard let (nextData, nextResp) = try? await session.data(for: nextReq),
+              let httpNext = nextResp as? HTTPURLResponse, (200..<300).contains(httpNext.statusCode),
+              let nextStr = String(data: nextData, encoding: .utf8),
+              let browseRegex = try? NSRegularExpression(pattern: "\"browseId\"\\s*:\\s*\"(MPLYt_[^\"]+)\""),
+              let match = browseRegex.firstMatch(in: nextStr, range: NSRange(nextStr.startIndex..<nextStr.endIndex, in: nextStr)),
+              let idRange = Range(match.range(at: 1), in: nextStr) else {
+            return nil
+        }
+
+        let browseID = String(nextStr[idRange])
+        var browseReq = URLRequest(url: browseURL)
+        browseReq.httpMethod = "POST"
+        browseReq.timeoutInterval = 6
+        browseReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        browseReq.setValue("com.google.android.apps.youtube.music/7.11.50 (Linux; U; Android 14)", forHTTPHeaderField: "User-Agent")
+        browseReq.httpBody = try? JSONSerialization.data(withJSONObject: ["context": contextObj, "browseId": browseID])
+
+        guard let (browseData, browseResp) = try? await session.data(for: browseReq),
+              let httpBrowse = browseResp as? HTTPURLResponse, (200..<300).contains(httpBrowse.statusCode) else {
+            return nil
+        }
+        return Self.parseYouTubeMusicTimedLyricsJSON(
+            browseData,
+            title: fallbackTitle,
+            artist: fallbackArtist,
+            duration: duration
+        )
+    }
+
+    // MARK: - Provider 2: QQ Music Synced LRC (Massive Chinese Mandopop/Cantopop + Russian Catalog!)
+
+    private func fetchQQMusicLyrics(query: String, targetDuration: TimeInterval) async -> [LRCLIBEntryDTO] {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              var searchComp = URLComponents(string: "https://c.y.qq.com/soso/fcgi-bin/client_search_cp") else {
+            return []
+        }
+        searchComp.queryItems = [
+            URLQueryItem(name: "w", value: trimmed),
+            URLQueryItem(name: "format", value: "json"),
+            URLQueryItem(name: "n", value: "3")
+        ]
+        guard let searchURL = searchComp.url else { return [] }
+        var searchReq = URLRequest(url: searchURL)
+        searchReq.timeoutInterval = 6
+        searchReq.setValue("https://y.qq.com/", forHTTPHeaderField: "Referer")
+        searchReq.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)", forHTTPHeaderField: "User-Agent")
+
+        guard let (sData, sResp) = try? await session.data(for: searchReq),
+              let sHttp = sResp as? HTTPURLResponse, (200..<300).contains(sHttp.statusCode),
+              let sJson = try? JSONSerialization.jsonObject(with: sData) as? [String: Any],
+              let dataDict = sJson["data"] as? [String: Any],
+              let songDict = dataDict["song"] as? [String: Any],
+              let list = songDict["list"] as? [[String: Any]], !list.isEmpty else {
+            return []
+        }
+
+        var results: [LRCLIBEntryDTO] = []
+        for song in list.prefix(3) {
+            guard let mid = song["songmid"] as? String, !mid.isEmpty else { continue }
+            let songName = Self.decodeLyricsHTMLEntities((song["songname"] as? String) ?? trimmed)
+            let singers = (song["singer"] as? [[String: Any]])?.compactMap { $0["name"] as? String }.joined(separator: ", ") ?? ""
+            let albumName = Self.decodeLyricsHTMLEntities((song["albumname"] as? String) ?? "QQ Music")
+            let interval = (song["interval"] as? Double) ?? Double((song["interval"] as? Int) ?? 0)
+
+            var lrcComp = URLComponents(string: "https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg")!
+            lrcComp.queryItems = [
+                URLQueryItem(name: "songmid", value: mid),
+                URLQueryItem(name: "format", value: "json"),
+                URLQueryItem(name: "nobase64", value: "1")
+            ]
+            guard let lrcURL = lrcComp.url else { continue }
+            var lrcReq = URLRequest(url: lrcURL)
+            lrcReq.timeoutInterval = 5
+            lrcReq.setValue("https://y.qq.com/", forHTTPHeaderField: "Referer")
+            lrcReq.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)", forHTTPHeaderField: "User-Agent")
+
+            guard let (lData, lResp) = try? await session.data(for: lrcReq),
+                  let lHttp = lResp as? HTTPURLResponse, (200..<300).contains(lHttp.statusCode),
+                  let lJson = try? JSONSerialization.jsonObject(with: lData) as? [String: Any],
+                  let rawLyric = lJson["lyric"] as? String, !rawLyric.isEmpty else {
+                continue
+            }
+            let decodedLRC = Self.decodeLyricsHTMLEntities(rawLyric)
+            let isSynced = decodedLRC.range(of: "\\[\\d{1,3}:\\d{2}", options: .regularExpression) != nil
+            results.append(
+                LRCLIBEntryDTO(
+                    id: abs("qq_\(mid)".hashValue) % 800_000 + 1_100_000,
+                    trackName: songName,
+                    artistName: singers,
+                    albumName: albumName.isEmpty ? "QQ Music" : albumName,
+                    duration: interval > 10 ? interval : targetDuration,
+                    instrumental: false,
+                    plainLyrics: isSynced ? nil : decodedLRC,
+                    syncedLyrics: isSynced ? decodedLRC : nil
+                )
+            )
+        }
+        return results
+    }
+
+    // MARK: - Provider 3: NetEase Cloud Music Synced LRC (Huge Chinese, Douyin, J-Pop, K-Pop & Russian Catalog!)
+
+    private func fetchNetEaseLyrics(query: String, targetDuration: TimeInterval) async -> [LRCLIBEntryDTO] {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let searchURL = URL(string: "https://music.163.com/api/cloudsearch/pc") else {
+            return []
+        }
+
+        var searchReq = URLRequest(url: searchURL)
+        searchReq.httpMethod = "POST"
+        searchReq.timeoutInterval = 6
+        searchReq.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        searchReq.setValue("https://music.163.com/", forHTTPHeaderField: "Referer")
+        searchReq.setValue("appver=2.0.2;", forHTTPHeaderField: "Cookie")
+        searchReq.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)", forHTTPHeaderField: "User-Agent")
+
+        let formAllowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._~"))
+        let encoded = trimmed.addingPercentEncoding(withAllowedCharacters: formAllowed) ?? trimmed
+        searchReq.httpBody = "s=\(encoded)&type=1&limit=3&offset=0".data(using: .utf8)
+
+        guard let (sData, sResp) = try? await session.data(for: searchReq),
+              let sHttp = sResp as? HTTPURLResponse, (200..<300).contains(sHttp.statusCode),
+              let sJson = try? JSONSerialization.jsonObject(with: sData) as? [String: Any],
+              let resultDict = sJson["result"] as? [String: Any],
+              let songs = resultDict["songs"] as? [[String: Any]], !songs.isEmpty else {
+            return []
+        }
+
+        var results: [LRCLIBEntryDTO] = []
+        for song in songs.prefix(3) {
+            guard let songID = song["id"] as? Int else { continue }
+            let songName = (song["name"] as? String) ?? trimmed
+            let artists = (song["ar"] as? [[String: Any]])?.compactMap { $0["name"] as? String }.joined(separator: ", ") ?? ""
+            let albumName = ((song["al"] as? [String: Any])?["name"] as? String) ?? "NetEase Music"
+            let dtMs = (song["dt"] as? Double) ?? Double((song["dt"] as? Int) ?? 0)
+            let songDur = dtMs > 10_000 ? (dtMs / 1000.0) : targetDuration
+
+            guard let lrcURL = URL(string: "https://music.163.com/api/song/lyric?id=\(songID)&lv=1&kv=1&tv=-1") else {
+                continue
+            }
+            var lrcReq = URLRequest(url: lrcURL)
+            lrcReq.timeoutInterval = 5
+            lrcReq.setValue("https://music.163.com/", forHTTPHeaderField: "Referer")
+            lrcReq.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)", forHTTPHeaderField: "User-Agent")
+
+            guard let (lData, lResp) = try? await session.data(for: lrcReq),
+                  let lHttp = lResp as? HTTPURLResponse, (200..<300).contains(lHttp.statusCode),
+                  let lJson = try? JSONSerialization.jsonObject(with: lData) as? [String: Any],
+                  let lrcDict = lJson["lrc"] as? [String: Any],
+                  let rawLyric = lrcDict["lyric"] as? String,
+                  !rawLyric.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                continue
+            }
+            let isSynced = rawLyric.range(of: "\\[\\d{1,3}:\\d{2}", options: .regularExpression) != nil
+            results.append(
+                LRCLIBEntryDTO(
+                    id: abs("ne_\(songID)".hashValue) % 800_000 + 2_100_000,
+                    trackName: songName,
+                    artistName: artists,
+                    albumName: albumName,
+                    duration: songDur,
+                    instrumental: false,
+                    plainLyrics: isSynced ? nil : rawLyric,
+                    syncedLyrics: isSynced ? rawLyric : nil
+                )
+            )
+        }
+        return results
+    }
+
+    // MARK: - Provider 4: Kugou Music Synced LRC (Douyin / Viral Chinese & Indie Backup)
+
+    private func fetchKugouLyrics(query: String, targetDuration: TimeInterval) async -> [LRCLIBEntryDTO] {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              var searchComp = URLComponents(string: "https://lyrics.kugou.com/search") else {
+            return []
+        }
+        searchComp.queryItems = [
+            URLQueryItem(name: "ver", value: "1"),
+            URLQueryItem(name: "man", value: "yes"),
+            URLQueryItem(name: "client", value: "pc"),
+            URLQueryItem(name: "keyword", value: trimmed)
+        ]
+        guard let searchURL = searchComp.url else { return [] }
+        var searchReq = URLRequest(url: searchURL)
+        searchReq.timeoutInterval = 5
+        searchReq.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)", forHTTPHeaderField: "User-Agent")
+
+        guard let (sData, sResp) = try? await session.data(for: searchReq),
+              let sHttp = sResp as? HTTPURLResponse, (200..<300).contains(sHttp.statusCode),
+              let sJson = try? JSONSerialization.jsonObject(with: sData) as? [String: Any],
+              let candidates = sJson["candidates"] as? [[String: Any]],
+              let best = candidates.first,
+              let cid = best["id"] as? String,
+              let accessKey = best["accesskey"] as? String else {
+            return []
+        }
+
+        var dlComp = URLComponents(string: "https://lyrics.kugou.com/download")!
+        dlComp.queryItems = [
+            URLQueryItem(name: "ver", value: "1"),
+            URLQueryItem(name: "client", value: "pc"),
+            URLQueryItem(name: "id", value: cid),
+            URLQueryItem(name: "accesskey", value: accessKey),
+            URLQueryItem(name: "fmt", value: "lrc"),
+            URLQueryItem(name: "charset", value: "utf8")
+        ]
+        guard let dlURL = dlComp.url else { return [] }
+        var dlReq = URLRequest(url: dlURL)
+        dlReq.timeoutInterval = 5
+
+        guard let (lData, lResp) = try? await session.data(for: dlReq),
+              let lHttp = lResp as? HTTPURLResponse, (200..<300).contains(lHttp.statusCode),
+              let lJson = try? JSONSerialization.jsonObject(with: lData) as? [String: Any],
+              let base64 = lJson["content"] as? String,
+              let decodedData = Data(base64Encoded: base64),
+              let lrcText = String(data: decodedData, encoding: .utf8),
+              !lrcText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return []
+        }
+
+        let songName = (best["song"] as? String) ?? trimmed
+        let singer = (best["singer"] as? String) ?? ""
+        let durMs = (best["duration"] as? Double) ?? Double((best["duration"] as? Int) ?? 0)
+        let isSynced = lrcText.range(of: "\\[\\d{1,3}:\\d{2}", options: .regularExpression) != nil
+
+        return [
+            LRCLIBEntryDTO(
+                id: abs("kg_\(cid)".hashValue) % 800_000 + 3_100_000,
+                trackName: songName,
+                artistName: singer,
+                albumName: "Kugou Music",
+                duration: durMs > 10_000 ? (durMs / 1000.0) : targetDuration,
+                instrumental: false,
+                plainLyrics: isSynced ? nil : lrcText,
+                syncedLyrics: isSynced ? lrcText : nil
+            )
+        ]
+    }
+
     private func fetchBackupLyricsOvh(artist: String, title: String) async -> String? {
         guard !artist.isEmpty && !title.isEmpty else { return nil }
         let encArtist = artist.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? artist
@@ -750,10 +1279,11 @@ public final class LyricsService: ObservableObject {
         return lyrics
     }
 
-    private func resolveCanonicalMetadataFromCatalog(query: String) async -> (title: String, artist: String)? {
+    private func resolveCanonicalMetadataFromCatalog(query: String, country: String = "us") async -> (title: String, artist: String)? {
         var components = URLComponents(string: "https://itunes.apple.com/search")!
         components.queryItems = [
             URLQueryItem(name: "term", value: query),
+            URLQueryItem(name: "country", value: country),
             URLQueryItem(name: "media", value: "music"),
             URLQueryItem(name: "entity", value: "song"),
             URLQueryItem(name: "limit", value: "1")
@@ -771,7 +1301,29 @@ public final class LyricsService: ObservableObject {
     }
 
     public func manualLyricsSearch(songTitle: String, artistName: String) async throws -> [LRCLIBEntryDTO] {
-        try await searchLRCLIB(title: songTitle, artist: artistName)
+        let combinedQuery = "\(songTitle) \(artistName)".trimmingCharacters(in: .whitespacesAndNewlines)
+        return await withTaskGroup(of: [LRCLIBEntryDTO].self) { group in
+            group.addTask {
+                (try? await self.searchLRCLIB(title: songTitle, artist: artistName)) ?? []
+            }
+            group.addTask {
+                await self.fetchQQMusicLyrics(query: combinedQuery, targetDuration: 210)
+            }
+            group.addTask {
+                await self.fetchNetEaseLyrics(query: combinedQuery, targetDuration: 210)
+            }
+            var all: [LRCLIBEntryDTO] = []
+            for await batch in group {
+                all.append(contentsOf: batch)
+            }
+            // Show synchronized LRC results first!
+            return all.sorted { lhs, rhs in
+                let lSynced = !(lhs.syncedLyrics ?? "").isEmpty
+                let rSynced = !(rhs.syncedLyrics ?? "").isEmpty
+                if lSynced != rSynced { return lSynced }
+                return lhs.trackName < rhs.trackName
+            }
+        }
     }
 
     public func applyManualLyricSelection(_ dto: LRCLIBEntryDTO, for track: UniversalTrack) {
