@@ -1111,12 +1111,13 @@ public struct TrackRowView: View {
             Label("Add to a Playlist…", systemImage: "text.badge.plus")
         }
 
-        if track.provider.supportsLegalOfflineDownload && track.isDownloadPermitted {
-            Button {
-                downloadManager.enqueueDownload(for: track)
-            } label: {
-                Label("Download Offline", systemImage: "arrow.down.circle")
-            }
+        Button {
+            downloadManager.enqueueDownload(for: track)
+        } label: {
+            Label(
+                downloadManager.isDownloaded(track.id) ? "Downloaded Offline ✓" : "Download Offline",
+                systemImage: downloadManager.isDownloaded(track.id) ? "checkmark.circle.fill" : "arrow.down.circle"
+            )
         }
 
         if let deepLink = track.externalDeepLink {
