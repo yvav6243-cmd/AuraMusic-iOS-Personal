@@ -67,6 +67,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     private var backgroundProtectTask: Task<Void, Never>?
     private var delayedKeepAliveStopTask: Task<Void, Never>?
     private var isUserPaused: Bool = false
+    private var lastUserPauseWallTime: TimeInterval = 0
     private var lastYouTubeJSTickWallTime: TimeInterval = 0
     private var hasReceivedFirstYouTubeProgressTick: Bool = false
     private var fallbackYouTubeVideoIDs: [String] = []
@@ -178,13 +179,13 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         // YT.PlayerState: -1 unstarted, 0 ended, 1 playing, 2 paused, 3 buffering
         switch stateCode {
         case 1: // PLAYING
-            if self.isUserPaused && !userResumed {
-                // Reject stale/stray play ticks while user explicitly paused; reinforce pause in WebKit
-                evaluateYouTubeJS("if(window.auraControl){window.auraControl.pause();}")
-                youtubeWebView?.pauseAllMediaPlayback(completionHandler: nil)
+            let elapsedSinceUserPause = CACurrentMediaTime() - lastUserPauseWallTime
+            if self.isUserPaused && !userResumed && elapsedSinceUserPause < 0.55 {
+                // Ignore stale in-flight play ticks that were queued right before pause()
                 return
             }
-            if userResumed {
+            if self.isUserPaused {
+                // Genuine resume from Lock Screen, Control Center, Dynamic Island, or AirPods
                 self.isUserPaused = false
                 self.delayedKeepAliveStopTask?.cancel()
                 self.setBackgroundKeepAliveActive(true)
@@ -192,16 +193,17 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
             if !self.isPlaying || self.isBuffering {
                 self.isPlaying = true
                 self.isBuffering = false
-                updateNowPlayingElapsedTime()
+                refreshNowPlayingMetadata()
             }
         case 2: // PAUSED
             if userPaused {
                 self.backgroundProtectTask?.cancel()
                 self.isUserPaused = true
+                self.lastUserPauseWallTime = CACurrentMediaTime()
                 self.isPlaying = false
                 self.isBuffering = false
                 self.refreshNowPlayingMetadata()
-                self.scheduleDelayedKeepAliveStop()
+                self.scheduleIdleKeepAliveTimeout()
                 return
             }
             // Ignore transient initial paused state before playback has started so UI doesn't flicker or abort autoplay
@@ -230,10 +232,12 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         }
     }
 
-    private func scheduleDelayedKeepAliveStop() {
+    /// Keeps the zero-amplitude silent keep-alive warm for 15 minutes while paused in background so iOS doesn't freeze WKWebView
+    /// and Lock Screen / Control Center / AirPods Play resumes the track instantaneously.
+    private func scheduleIdleKeepAliveTimeout() {
         delayedKeepAliveStopTask?.cancel()
         delayedKeepAliveStopTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 200_000_000)
+            try? await Task.sleep(nanoseconds: 900_000_000_000) // 15 minutes idle timeout
             guard !Task.isCancelled, !self.isPlaying else { return }
             self.setBackgroundKeepAliveActive(false)
         }
@@ -779,6 +783,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         backgroundProtectTask?.cancel()
         delayedKeepAliveStopTask?.cancel()
         isUserPaused = true
+        lastUserPauseWallTime = CACurrentMediaTime()
         isPlaying = false
         isBuffering = false
 
@@ -789,7 +794,9 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         if activeYouTubeVideoID != nil {
             evaluateYouTubeJS("if(window.auraControl){window.auraControl.pause();}")
             youtubeWebView?.pauseAllMediaPlayback(completionHandler: nil)
-            scheduleDelayedKeepAliveStop()
+            // Keep WebContent warm via zero-PCM silent audio for up to 15 min so Lock Screen Play resumes instantly
+            setBackgroundKeepAliveActive(true)
+            scheduleIdleKeepAliveTimeout()
         } else {
             setBackgroundKeepAliveActive(false)
         }
@@ -797,7 +804,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     }
 
     public func resume() {
-        guard currentTrack != nil else { return }
+        guard currentTrack != nil || activeYouTubeVideoID != nil else { return }
         delayedKeepAliveStopTask?.cancel()
         isUserPaused = false
         if !(backgroundKeepAliveAudioPlayer?.isPlaying ?? false) {

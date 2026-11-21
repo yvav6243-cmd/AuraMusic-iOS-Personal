@@ -955,6 +955,8 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
             play: function() {
               window._auraUserPaused = false;
               window._auraAllowPause = false;
+              window._auraPendingUserResumeUntil = Date.now() + 2000;
+              try { if (navigator.mediaSession) navigator.mediaSession.playbackState = 'playing'; } catch(e) {}
               var v = document.querySelector('video');
               if (v) {
                 forceUnmuteAndPlayIfNeeded(v, true);
@@ -964,6 +966,8 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
               window._auraUserPaused = true;
               window._auraAllowPause = true;
               window._auraBgProtectUntil = 0;
+              window._auraPendingUserResumeUntil = 0;
+              try { if (navigator.mediaSession) navigator.mediaSession.playbackState = 'paused'; } catch(e) {}
               var v = document.querySelector('video');
               if (v) {
                 try {
@@ -979,21 +983,30 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
                   currentTime: v.currentTime || 0,
                   duration: (isFinite(v.duration) && v.duration > 0) ? v.duration : 0,
                   state: 2,
-                  userPaused: true
+                  userPaused: true,
+                  userResumed: false
                 });
               }
             },
             resume: function() {
+              var wasPaused = (window._auraUserPaused === true);
               window._auraUserPaused = false;
               window._auraAllowPause = false;
+              window._auraPendingUserResumeUntil = Date.now() + 2000;
+              try { if (navigator.mediaSession) navigator.mediaSession.playbackState = 'playing'; } catch(e) {}
               var v = document.querySelector('video');
               if (v) {
-                forceUnmuteAndPlayIfNeeded(v, false);
+                forceUnmuteAndPlayIfNeeded(v, wasPaused);
+                if (v.paused && !v.ended) {
+                  var mp = document.getElementById('movie_player');
+                  if (mp && mp.playVideo) { try { mp.playVideo(); } catch(e) {} }
+                  try { v.play().catch(function(){}); } catch(e) {}
+                }
               }
             },
             enterBackgroundProtect: function(ms) {
               if (window._auraUserPaused === true) return;
-              window._auraBgProtectUntil = Date.now() + (ms || 1800);
+              window._auraBgProtectUntil = Date.now() + (ms || 900);
               var v = document.querySelector('video');
               if (v && v.paused && !v.ended) {
                 forceUnmuteAndPlayIfNeeded(v, false);
@@ -1028,8 +1041,10 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
                 postMessageToSwift({ type: 'remotePause' });
               });
               navigator.mediaSession.setActionHandler('play', function() {
-                window.auraControl.resume();
+                // Notify Swift BEFORE resuming so Swift immediately clears isUserPaused and keeps background audio session active
+                window._auraPendingUserResumeUntil = Date.now() + 2500;
                 postMessageToSwift({ type: 'remotePlay' });
+                window.auraControl.resume();
               });
               navigator.mediaSession.setActionHandler('nexttrack', function() {
                 postMessageToSwift({ type: 'remoteNext' });
@@ -1051,12 +1066,14 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
             } else if (v.paused) {
               st = (!window._auraUserPaused && (cur <= 0.05 || v.readyState < 3)) ? 3 : 2;
             }
+            var pendingResume = Date.now() < (window._auraPendingUserResumeUntil || 0);
             var payload = {
               type: 'tick',
               currentTime: cur,
               duration: (isFinite(dur) && dur > 0) ? dur : 0,
               state: st,
-              userPaused: window._auraUserPaused === true
+              userPaused: window._auraUserPaused === true,
+              userResumed: pendingResume && st === 1
             };
             if (extraFlags) {
               if (extraFlags.userPaused !== undefined) payload.userPaused = extraFlags.userPaused;
@@ -1103,15 +1120,19 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
                 var wasUserPaused = (window._auraUserPaused === true);
                 window._auraUserPaused = false;
                 window._auraAllowPause = false;
+                try { if (navigator.mediaSession) navigator.mediaSession.playbackState = 'playing'; } catch(e) {}
                 if (wasUserPaused) {
+                  window._auraPendingUserResumeUntil = Date.now() + 2500;
+                  postMessageToSwift({ type: 'remotePlay' });
                   postCurrentVideoTick(v, { userPaused: false, userResumed: true });
                 }
               });
               v.addEventListener('playing', function() {
-                var wasUserPaused = (window._auraUserPaused === true);
+                var wasUserPaused = (window._auraUserPaused === true) || (Date.now() < (window._auraPendingUserResumeUntil || 0));
                 v._auraHasPlayedOnce = true;
                 window._auraUserPaused = false;
                 window._auraAllowPause = false;
+                try { if (navigator.mediaSession) navigator.mediaSession.playbackState = 'playing'; } catch(e) {}
                 postCurrentVideoTick(v, { userPaused: false, userResumed: wasUserPaused });
               });
               v.addEventListener('pause', function() {
@@ -1129,9 +1150,11 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
                   // Genuine pause triggered from Lock Screen, Control Center, AirPods, or user tap — honor it and stay paused!
                   window._auraUserPaused = true;
                   window._auraAllowPause = true;
+                  window._auraPendingUserResumeUntil = 0;
+                  try { if (navigator.mediaSession) navigator.mediaSession.playbackState = 'paused'; } catch(e) {}
                   var mp = document.getElementById('movie_player');
                   if (mp && mp.pauseVideo) { try { mp.pauseVideo(); } catch(e) {} }
-                  postCurrentVideoTick(v, { userPaused: true });
+                  postCurrentVideoTick(v, { userPaused: true, userResumed: false });
                 } else {
                   postCurrentVideoTick(v);
                 }

@@ -389,7 +389,7 @@ final class AuraMusicCoreTests: XCTestCase {
     }
 
     @MainActor
-    func testBackgroundPauseRejectsStalePlayTicksAndAllowsExplicitResume() {
+    func testBackgroundPauseRejectsStalePlayTicksAndAllowsExplicitResume() async throws {
         let engine = UniversalAudioPlayerEngine.shared
         engine.activeYouTubeVideoID = "YkY4X_OaF6o"
 
@@ -397,24 +397,32 @@ final class AuraMusicCoreTests: XCTestCase {
         engine.handleYouTubePlayerEvent(currentTime: 25.0, duration: 277.0, stateCode: 1, userPaused: false, userResumed: true)
         XCTAssertTrue(engine.isPlaying)
 
-        // Simulate user tapping Pause from Lock Screen / Control Center / Background
+        // 1. User taps Pause from Lock Screen / Control Center / Background
         engine.handleYouTubePlayerEvent(currentTime: 25.2, duration: 277.0, stateCode: 2, userPaused: true, userResumed: false)
         XCTAssertFalse(engine.isPlaying, "Background/Lock Screen pause must immediately set isPlaying = false")
 
-        // Simulate a stale in-flight JS play tick arriving right after pause -> must NOT unpause!
+        // 2. Stale in-flight JS play tick arriving immediately (< 0.55s) after pause -> must NOT unpause!
         engine.handleYouTubePlayerEvent(currentTime: 25.3, duration: 277.0, stateCode: 1, userPaused: false, userResumed: false)
-        XCTAssertFalse(engine.isPlaying, "Stale play tick while user-paused must NEVER resume playback")
+        XCTAssertFalse(engine.isPlaying, "Immediate stale play tick while user-paused must NEVER resume playback")
 
-        // Simulate explicit Play tap from Lock Screen / Control Center (userResumed: true) -> must resume cleanly!
+        // 3. Explicit Play tap from Lock Screen / Control Center (userResumed: true) -> must resume immediately!
         engine.handleYouTubePlayerEvent(currentTime: 25.4, duration: 277.0, stateCode: 1, userPaused: false, userResumed: true)
         XCTAssertTrue(engine.isPlaying, "Explicit Lock Screen / Control Center Play must resume playback")
 
-        // Direct pause() call must also hold paused state against stale ticks
+        // 4. Direct pause() followed by native WebKit Lock Screen Play after 0.65s -> MUST resume even without userResumed flag!
         engine.pause()
         XCTAssertFalse(engine.isPlaying)
-        engine.handleYouTubePlayerEvent(currentTime: 25.5, duration: 277.0, stateCode: 1, userPaused: false, userResumed: false)
-        XCTAssertFalse(engine.isPlaying, "Direct pause() must remain paused when stale play ticks arrive")
+        try await Task.sleep(nanoseconds: 650_000_000)
+        engine.handleYouTubePlayerEvent(currentTime: 26.0, duration: 277.0, stateCode: 1, userPaused: false, userResumed: false)
+        XCTAssertTrue(engine.isPlaying, "Lock Screen Play after >0.6s pause must always resume playback cleanly")
 
+        // 5. Repeat pause -> direct resume() cycle
+        engine.pause()
+        XCTAssertFalse(engine.isPlaying)
+        engine.resume()
+        XCTAssertTrue(engine.isPlaying, "resume() must always re-enable playback in background")
+
+        engine.pause()
         engine.activeYouTubeVideoID = nil
     }
 }
