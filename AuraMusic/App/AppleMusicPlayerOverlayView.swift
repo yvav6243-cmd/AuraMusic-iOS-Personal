@@ -1,4 +1,5 @@
 import Foundation
+import PhotosUI
 import SwiftUI
 
 // MARK: - Persistent Mini-Player & Expanded Full-Screen Player Container
@@ -15,6 +16,8 @@ public struct AppleMusicPlayerOverlayView: View {
     @State private var scrubTimeValue: Double = 0
     @State private var showAddToPlaylistSheet: Bool = false
     @State private var showShareSheet: Bool = false
+    @State private var showCustomCoverPicker: Bool = false
+    @State private var selectedCoverPhotoItem: PhotosPickerItem?
 
     public init() {}
 
@@ -210,6 +213,20 @@ public struct AppleMusicPlayerOverlayView: View {
         .sheet(isPresented: $showShareSheet) {
             SystemShareSheet(activityItems: ["\(track.title) — \(track.artist) [\(track.provider.displayName)]"])
         }
+        .photosPicker(isPresented: $showCustomCoverPicker, selection: $selectedCoverPhotoItem, matching: .images)
+        .onChange(of: selectedCoverPhotoItem) { _, newItem in
+            guard let newItem else { return }
+            Task {
+                if let data = try? await newItem.loadTransferable(type: Data.self) {
+                    let newURL = persistence.setCustomTrackArtwork(
+                        imageData: data,
+                        for: track,
+                        defaultArtworkURL: track.artworkURL
+                    )
+                    player.applyUpdatedArtworkURL(newURL, forTrackID: track.id)
+                }
+            }
+        }
     }
 
     // MARK: - Center Artwork / Pure Apple Music Square Cover Section
@@ -371,6 +388,23 @@ public struct AppleMusicPlayerOverlayView: View {
             }
 
             Menu {
+                Button {
+                    showCustomCoverPicker = true
+                } label: {
+                    Label("Change Song Cover (Photos)…", systemImage: "photo.badge.plus")
+                }
+
+                if persistence.hasCustomArtwork(for: track.id) {
+                    Button {
+                        let restoredURL = persistence.setCustomTrackArtwork(imageData: nil, for: track)
+                        player.applyUpdatedArtworkURL(restoredURL, forTrackID: track.id)
+                    } label: {
+                        Label("Reset to Default Album Cover", systemImage: "arrow.counterclockwise")
+                    }
+                }
+
+                Divider()
+
                 Button {
                     persistence.upsertTrack(track, addToLibrary: true)
                 } label: {
