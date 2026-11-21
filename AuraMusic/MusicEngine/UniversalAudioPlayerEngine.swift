@@ -61,6 +61,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     private var itemStatusObservation: NSKeyValueObservation?
     private var sleepTimerTask: Task<Void, Never>?
     private var youtubeWatchdogTask: Task<Void, Never>?
+    private var fallbackYouTubeVideoIDs: [String] = []
     private var crossfadeTriggeredForCurrentItem = false
 
     private let appleProvider = AppleMusicProvider()
@@ -110,6 +111,11 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
             }
         case 0: // ENDED
             handleTrackFinished()
+        case -99: // Video restricted/error -> switch to next available audio candidate for this song
+            if !fallbackYouTubeVideoIDs.isEmpty {
+                let nextID = fallbackYouTubeVideoIDs.removeFirst()
+                activeYouTubeVideoID = nextID
+            }
         default:
             break
         }
@@ -119,11 +125,25 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         youtubeWatchdogTask?.cancel()
         primaryPlayer.pause()
         ApplicationMusicPlayer.shared.pause()
+        fallbackYouTubeVideoIDs = []
         activeYouTubeVideoID = videoID
         isBuffering = false
         isPlaying = true
         playbackStatusBanner = nil
         refreshNowPlayingMetadata()
+
+        // Pre-fetch backup audio videoIDs so if a clip is age/region restricted, we seamlessly switch to an alternate audio upload
+        Task {
+            let query = "\(track.title) \(track.artist) audio"
+            if let candidates = try? await ytMusicProvider.searchTracks(query: query, limit: 5) {
+                let backups = candidates.map(\.providerTrackID).filter { $0 != videoID }
+                await MainActor.run {
+                    if self.currentTrack?.id == track.id {
+                        self.fallbackYouTubeVideoIDs = backups
+                    }
+                }
+            }
+        }
     }
 
     private func evaluateYouTubeJS(_ script: String) {
