@@ -313,8 +313,8 @@ public final class PersistenceController: ObservableObject {
     private func seedDefaultSmartPlaylistsIfNeeded() {
         guard playlists.isEmpty else { return }
         let favoritesSmart = PersistedPlaylistEntity(
-            name: "Favorite Songs",
-            playlistDescription: "Automatically collects every song you mark as Favorite across all providers.",
+            name: "Favourite Songs",
+            playlistDescription: "Automatically collects every song you mark with a star (Favourite) across all providers.",
             isFavorite: true,
             isSmartPlaylist: true
         )
