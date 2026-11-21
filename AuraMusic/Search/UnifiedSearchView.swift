@@ -69,6 +69,14 @@ public final class UnifiedSearchViewModel: ObservableObject {
             }
             .map { $0.toUniversalTrack() }
 
+        let creds = ProviderCredentialsStore.shared
+        let useAppleTracks = creds.hasConfiguredAPI(for: .appleMusic)
+        let useAudiusTracks = creds.hasConfiguredAPI(for: .audius)
+        let useYTMusic = creds.hasConfiguredAPI(for: .youtubeMusic)
+        let useYTVideo = creds.hasConfiguredAPI(for: .youtube)
+        let useSpotify = creds.hasConfiguredAPI(for: .spotify)
+        let useSoundCloud = creds.hasConfiguredAPI(for: .soundCloud)
+
         let apple = appleProvider
         let audius = audiusProvider
         let ytMusic = ytMusicProvider
@@ -76,12 +84,12 @@ public final class UnifiedSearchViewModel: ObservableObject {
         let spotify = spotifyProvider
         let soundCloud = soundCloudProvider
 
-        async let appleTracksTask = (try? await apple.searchTracks(query: trimmed, limit: 20)) ?? []
-        async let audiusTracksTask = (try? await audius.searchTracks(query: trimmed, limit: 20)) ?? []
-        async let ytMusicTracksTask = (try? await ytMusic.searchTracks(query: trimmed, limit: 12)) ?? []
-        async let ytVideoTracksTask = (try? await ytVideo.searchTracks(query: trimmed, limit: 8)) ?? []
-        async let spotifyTracksTask = (try? await spotify.searchTracks(query: trimmed, limit: 15)) ?? []
-        async let soundCloudTracksTask = (try? await soundCloud.searchTracks(query: trimmed, limit: 15)) ?? []
+        async let appleTracksTask: [UniversalTrack] = useAppleTracks ? ((try? await apple.searchTracks(query: trimmed, limit: 20)) ?? []) : []
+        async let audiusTracksTask: [UniversalTrack] = useAudiusTracks ? ((try? await audius.searchTracks(query: trimmed, limit: 20)) ?? []) : []
+        async let ytMusicTracksTask: [UniversalTrack] = useYTMusic ? ((try? await ytMusic.searchTracks(query: trimmed, limit: 15)) ?? []) : []
+        async let ytVideoTracksTask: [UniversalTrack] = useYTVideo ? ((try? await ytVideo.searchTracks(query: trimmed, limit: 8)) ?? []) : []
+        async let spotifyTracksTask: [UniversalTrack] = useSpotify ? ((try? await spotify.searchTracks(query: trimmed, limit: 15)) ?? []) : []
+        async let soundCloudTracksTask: [UniversalTrack] = useSoundCloud ? ((try? await soundCloud.searchTracks(query: trimmed, limit: 15)) ?? []) : []
         async let albumsTask = (try? await apple.searchAlbums(query: trimmed, limit: 14)) ?? []
         async let artistsTask = (try? await apple.searchArtists(query: trimmed, limit: 10)) ?? []
         async let lyricsTask = (try? await LyricsService.shared.manualLyricsSearch(songTitle: trimmed, artistName: "")) ?? []
@@ -110,14 +118,14 @@ public final class UnifiedSearchViewModel: ObservableObject {
 
         guard !Task.isCancelled else { return }
 
-        // Combine all real results across providers (Local + Audius Full Stream + Apple Music + YouTube Music + YouTube + Spotify + SoundCloud)
+        // Only show songs from providers whose API is actually configured
         var combinedTracks: [UniversalTrack] = []
         combinedTracks.append(contentsOf: localMatches)
-        combinedTracks.append(contentsOf: audiusTracks)
-        combinedTracks.append(contentsOf: appleTracks)
-        combinedTracks.append(contentsOf: spotifyTracks)
-        combinedTracks.append(contentsOf: soundCloudTracks)
         combinedTracks.append(contentsOf: ytMusicTracks)
+        combinedTracks.append(contentsOf: appleTracks)
+        combinedTracks.append(contentsOf: soundCloudTracks)
+        combinedTracks.append(contentsOf: spotifyTracks)
+        combinedTracks.append(contentsOf: audiusTracks)
         combinedTracks.append(contentsOf: ytVideoTracks)
 
         self.groupedTrackResults = matcher.groupMatchingTracks(combinedTracks)
@@ -347,7 +355,7 @@ public struct UnifiedSearchView: View {
                     }
                     .buttonStyle(.plain)
 
-                    ForEach([MusicProviderType.audius, .appleMusic, .youtubeMusic, .youtube, .spotify, .soundCloud, .localFile]) { provider in
+                    ForEach(ProviderCredentialsStore.shared.configuredCatalogProviders) { provider in
                         Button {
                             viewModel.selectedProviderFilter = (viewModel.selectedProviderFilter == provider) ? nil : provider
                         } label: {
