@@ -338,13 +338,14 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         }
     }
 
-    private func prepareSilentBackgroundKeepAlivePlayer() {
-        // Synthesize a tiny valid 1-second 8kHz 16-bit mono silent WAV in memory so iOS keeps the app's audio process awake in background
-        let sampleRate: UInt32 = 8000
-        let numSamples: UInt32 = 8000
+    /// Synthesizes a 2-second 44.1kHz 16-bit mono WAV with ultra-quiet (-90 dBFS, ±1 LSB) sub-audible dither.
+    /// Non-zero energy prevents iOS 17/18 mediaserverd from detecting pure digital silence and dropping our background audio assertion!
+    internal static func buildSubAudibleKeepAliveWAVData() -> Data {
+        let sampleRate: UInt32 = 44100
+        let numSamples: UInt32 = 44100 * 2
         let dataSize: UInt32 = numSamples * 2
         let fileSize: UInt32 = 36 + dataSize
-        var wavData = Data()
+        var wavData = Data(capacity: Int(44 + dataSize))
         wavData.append(contentsOf: [0x52, 0x49, 0x46, 0x46]) // "RIFF"
         withUnsafeBytes(of: fileSize.littleEndian) { wavData.append(contentsOf: $0) }
         wavData.append(contentsOf: [0x57, 0x41, 0x56, 0x45]) // "WAVE"
@@ -358,11 +359,24 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         withUnsafeBytes(of: UInt16(16).littleEndian) { wavData.append(contentsOf: $0) }
         wavData.append(contentsOf: [0x64, 0x61, 0x74, 0x61]) // "data"
         withUnsafeBytes(of: dataSize.littleEndian) { wavData.append(contentsOf: $0) }
-        wavData.append(Data(count: Int(dataSize)))
 
+        var pcm = Data(count: Int(dataSize))
+        pcm.withUnsafeMutableBytes { rawBuffer in
+            let samples = rawBuffer.bindMemory(to: Int16.self)
+            for i in 0..<samples.count {
+                // ±1 LSB at ~18 Hz (-90 dBFS): 100% inaudible to humans, keeps iOS hardware audio graph alive indefinitely
+                samples[i] = ((i / 1225) & 1 == 0) ? Int16(1).littleEndian : Int16(-1).littleEndian
+            }
+        }
+        wavData.append(pcm)
+        return wavData
+    }
+
+    private func prepareSilentBackgroundKeepAlivePlayer() {
+        let wavData = Self.buildSubAudibleKeepAliveWAVData()
         if let silentPlayer = try? AVAudioPlayer(data: wavData) {
             silentPlayer.numberOfLoops = -1
-            silentPlayer.volume = 0.005
+            silentPlayer.volume = 0.01
             silentPlayer.prepareToPlay()
             self.backgroundKeepAliveAudioPlayer = silentPlayer
         }
@@ -510,23 +524,43 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
 
     private func activateBackgroundTransitionProtection() {
         if activeYouTubeVideoID != nil {
-            evaluateYouTubeJS("if(window.auraControl){window.auraControl.enterBackground(1200);}")
+            evaluateYouTubeJS("if(window.auraControl){window.auraControl.enterBackground(8000);}")
         }
         guard self.isPlaying && !self.isUserPaused else { return }
         backgroundProtectTask?.cancel()
         delayedKeepAliveStopTask?.cancel()
-        setBackgroundKeepAliveActive(true)
         if activeYouTubeVideoID != nil {
-            backgroundProtectTask = Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 250_000_000)
-                guard !Task.isCancelled,
-                      self.isPlaying,
-                      !self.isUserPaused,
-                      self.activeYouTubeVideoID != nil else {
-                    return
-                }
-                self.evaluateYouTubeJS("if(window.auraControl && !window._auraUserPaused && !window._auraSoftPaused){window.auraControl.resume();}")
+            setBackgroundKeepAliveActive(true, mixWithWebKit: true)
+        } else {
+            configureAudioSession(mixWithWebKit: false)
+        }
+
+        // Continuous background watchdog: immediately recovers if iOS WebKit suspends <video> on transition or mid-song
+        backgroundProtectTask = Task { @MainActor in
+            let initialDelaysNs: [UInt64] = [200_000_000, 500_000_000, 1_100_000_000]
+            for delay in initialDelaysNs {
+                try? await Task.sleep(nanoseconds: delay)
+                guard !Task.isCancelled, self.isPlaying, !self.isUserPaused else { return }
+                self.enforceBackgroundPlaybackAlive()
             }
+            while !Task.isCancelled && self.isPlaying && !self.isUserPaused {
+                try? await Task.sleep(nanoseconds: 4_000_000_000)
+                guard !Task.isCancelled, self.isPlaying, !self.isUserPaused else { return }
+                self.enforceBackgroundPlaybackAlive()
+            }
+        }
+    }
+
+    private func enforceBackgroundPlaybackAlive() {
+        guard isPlaying, !isUserPaused else { return }
+        if activeYouTubeVideoID != nil {
+            if !(backgroundKeepAliveAudioPlayer?.isPlaying ?? false) {
+                setBackgroundKeepAliveActive(true, mixWithWebKit: true)
+            }
+            evaluateYouTubeJS("if(window.auraControl && !window._auraUserPaused && !window._auraSoftPaused){window.auraControl.keepAliveInBackground();}")
+        } else if primaryPlayer.currentItem != nil && primaryPlayer.timeControlStatus == .paused {
+            configureAudioSession(mixWithWebKit: false)
+            primaryPlayer.play()
         }
     }
 
@@ -636,9 +670,9 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         ) { [weak self] _ in
             guard let self else { return }
             Task { @MainActor in
-                if self.activeYouTubeVideoID != nil {
-                    self.evaluateYouTubeJS("window._auraAppInBackground = true;")
-                }
+                // Arm background protection IMMEDIATELY on willResignActive (BEFORE didEnterBackground)
+                // so iOS WebKit cannot pause <video> during the transition gap!
+                self.activateBackgroundTransitionProtection()
             }
         }
         NotificationCenter.default.addObserver(
@@ -658,6 +692,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         ) { [weak self] _ in
             guard let self else { return }
             Task { @MainActor in
+                self.backgroundProtectTask?.cancel()
                 if self.activeYouTubeVideoID != nil {
                     self.evaluateYouTubeJS("if(window.auraControl){window.auraControl.enterForeground();}")
                 }
@@ -670,8 +705,28 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         ) { [weak self] _ in
             guard let self else { return }
             Task { @MainActor in
+                self.backgroundProtectTask?.cancel()
                 if self.activeYouTubeVideoID != nil {
                     self.evaluateYouTubeJS("if(window.auraControl){window.auraControl.enterForeground();}")
+                }
+            }
+        }
+        NotificationCenter.default.addObserver(
+            forName: AVAudioSession.mediaServicesWereResetNotification,
+            object: AVAudioSession.sharedInstance(),
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in
+                self.prepareSilentBackgroundKeepAlivePlayer()
+                if self.isPlaying && !self.isUserPaused {
+                    if self.activeYouTubeVideoID != nil {
+                        self.setBackgroundKeepAliveActive(true, mixWithWebKit: true)
+                        self.evaluateYouTubeJS("if(window.auraControl){window.auraControl.keepAliveInBackground();}")
+                    } else {
+                        self.configureAudioSession(mixWithWebKit: false)
+                        self.primaryPlayer.play()
+                    }
                 }
             }
         }
@@ -756,6 +811,13 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
             Task { @MainActor in self.togglePlayPause() }
             return .success
         }
+
+        // Explicitly disable skip ±5s/±15s and seek-step commands so Lock Screen ALWAYS displays
+        // Previous Track (⏮) and Next Track (⏭) instead of 5-second skip buttons!
+        commandCenter.skipBackwardCommand.isEnabled = false
+        commandCenter.skipForwardCommand.isEnabled = false
+        commandCenter.seekBackwardCommand.isEnabled = false
+        commandCenter.seekForwardCommand.isEnabled = false
 
         commandCenter.nextTrackCommand.isEnabled = true
         commandCenter.nextTrackCommand.addTarget { [weak self] _ in
@@ -845,7 +907,12 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         lastUserResumeWallTime = 0
         playPauseCooldownGate.reset()
         playbackStatusBanner = nil
-        activeYouTubeVideoID = nil
+        // Preserve existing WKWebView when switching between online YouTube tracks so background Next/Prev
+        // reuses the live WebContent process (destroying WKWebView in background kills background playback on iOS!).
+        let hasOfflineFile = (track.localFileRelativePath ?? OfflineDownloadManager.shared.completedLocalRelativePath(for: track.id)) != nil
+        if (track.provider != .youtubeMusic && track.provider != .youtube) || hasOfflineFile {
+            activeYouTubeVideoID = nil
+        }
         // Default to pure Apple Music square-artwork audio view; only show video automatically if user explicitly tapped a raw YouTube video
         isYouTubeVideoVisible = (track.provider == .youtube)
         crossfadeTriggeredForCurrentItem = false
@@ -1407,6 +1474,20 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
 
         center.nowPlayingInfo = info
         center.playbackState = isPlaying ? .playing : .paused
+
+        // Sync title, artist, album, and cover into WebKit navigator.mediaSession too so Lock Screen shows AuraMusic's track metadata + ⏮/⏭
+        if activeYouTubeVideoID != nil {
+            let metaPayload: [String: String] = [
+                "title": track.title,
+                "artist": track.artist,
+                "album": track.album,
+                "artwork": track.artworkURL?.absoluteString ?? ""
+            ]
+            if let jsonData = try? JSONSerialization.data(withJSONObject: metaPayload),
+               let jsonString = String(data: jsonData, encoding: .utf8) {
+                evaluateYouTubeJS("if(window.auraControl && window.auraControl.setMetadata){window.auraControl.setMetadata(\(jsonString));}")
+            }
+        }
 
         if let artworkURL = track.artworkURL {
             let targetTrackID = track.id

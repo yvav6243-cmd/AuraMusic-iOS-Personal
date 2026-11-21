@@ -1274,4 +1274,174 @@ final class AuraMusicCoreTests: XCTestCase {
         XCTAssertEqual(resumed?["realMuted"] as? Bool, false)
         XCTAssertEqual(resumed?["rate"] as? Double ?? -1, 1.0, accuracy: 0.01)
     }
+
+    // MARK: - Background Persistence & Lock Screen Previous/Next (No ±5s Skip) Tests
+
+    @MainActor
+    func testLockScreenDisablesSkip5SecondsCommandsAndEnablesPreviousNextTrackCommands() {
+        _ = UniversalAudioPlayerEngine.shared
+        let commands = MPRemoteCommandCenter.shared()
+
+        XCTAssertFalse(commands.skipBackwardCommand.isEnabled, "skipBackwardCommand (±5s/15s) MUST be disabled so Lock Screen shows ⏮ Previous Track")
+        XCTAssertFalse(commands.skipForwardCommand.isEnabled, "skipForwardCommand (±5s/15s) MUST be disabled so Lock Screen shows ⏭ Next Track")
+        XCTAssertFalse(commands.seekBackwardCommand.isEnabled, "seekBackwardCommand MUST be disabled so Lock Screen shows ⏮ Previous Track")
+        XCTAssertFalse(commands.seekForwardCommand.isEnabled, "seekForwardCommand MUST be disabled so Lock Screen shows ⏭ Next Track")
+
+        XCTAssertTrue(commands.previousTrackCommand.isEnabled, "previousTrackCommand (⏮) MUST be enabled on Lock Screen")
+        XCTAssertTrue(commands.nextTrackCommand.isEnabled, "nextTrackCommand (⏭) MUST be enabled on Lock Screen")
+    }
+
+    @MainActor
+    func testBackgroundKeepAliveWAVIsValidAndContainsNonZeroSubAudibleDither() throws {
+        let wav = UniversalAudioPlayerEngine.buildSubAudibleKeepAliveWAVData()
+        XCTAssertEqual(wav.count, 44 + 44100 * 2 * 2, "WAV must be 2 seconds of 44.1kHz 16-bit mono PCM")
+        XCTAssertEqual(String(data: wav.subdata(in: 0..<4), encoding: .ascii), "RIFF")
+        XCTAssertEqual(String(data: wav.subdata(in: 8..<12), encoding: .ascii), "WAVE")
+
+        // Verify PCM payload is NOT all-zero digital silence (so iOS 17/18 mediaserverd never drops background audio assertion)
+        let pcmSlice = wav.subdata(in: 44..<wav.count)
+        let hasNonZeroEnergy = pcmSlice.contains { $0 != 0 }
+        XCTAssertTrue(hasNonZeroEnergy, "Keep-alive WAV MUST contain sub-audible non-zero dither instead of all-zero bytes")
+
+        // Verify AVAudioPlayer parses and prepares it cleanly
+        let player = try AVAudioPlayer(data: wav)
+        XCTAssertGreaterThan(player.duration, 1.9)
+    }
+
+    @MainActor
+    func testSwitchingBetweenYouTubeTracksPreservesLiveWebViewWithoutNilTeardown() {
+        let engine = UniversalAudioPlayerEngine.shared
+        let trackA = UniversalTrack(
+            provider: .youtubeMusic,
+            providerTrackID: "BG_NEXT_VID_A",
+            title: "Track A",
+            artist: "Artist A",
+            album: "Album",
+            duration: 210.0,
+            isStreamable: true
+        )
+        let trackB = UniversalTrack(
+            provider: .youtubeMusic,
+            providerTrackID: "BG_NEXT_VID_B",
+            title: "Track B",
+            artist: "Artist B",
+            album: "Album",
+            duration: 195.0,
+            isStreamable: true
+        )
+
+        engine.play(trackA, queue: [trackA, trackB])
+        engine.activeYouTubeVideoID = trackA.providerTrackID
+        XCTAssertEqual(engine.upNextQueue.count, 1)
+
+        // Tap Next Track (⏭): MUST NOT nil out activeYouTubeVideoID (which would destroy WKWebView in background!)
+        engine.skipToNext()
+        XCTAssertEqual(engine.currentTrack?.id, trackB.id)
+        XCTAssertTrue(engine.isPlaying)
+        XCTAssertNotNil(engine.activeYouTubeVideoID, "Switching between YouTube tracks MUST preserve live WKWebView in background")
+
+        // Tap Previous Track (⏮) when currentTime <= 3.5s: switches cleanly back to Track A without tearing down WKWebView
+        engine.currentTime = 1.0
+        engine.skipToPrevious()
+        XCTAssertEqual(engine.currentTrack?.id, trackA.id)
+        XCTAssertTrue(engine.isPlaying)
+        XCTAssertNotNil(engine.activeYouTubeVideoID)
+
+        engine.pause()
+        engine.activeYouTubeVideoID = nil
+    }
+
+    @MainActor
+    func testWebKitBlocksYouTubeSeekBackwardSeekForwardAndResistsBackgroundPauseSuspension() async throws {
+        let playerView = AuthorizedYouTubeIFramePlayerView(videoID: "YkY4X_OaF6o")
+        let coordinator = playerView.makeCoordinator()
+        let webView = AuthorizedYouTubeIFramePlayerView.makeConfiguredWebView(coordinator: coordinator)
+        let navWaiter = TestWKNavigationWaiter()
+        webView.navigationDelegate = navWaiter
+        defer {
+            webView.navigationDelegate = nil
+            webView.configuration.userContentController.removeScriptMessageHandler(forName: "auraYT")
+        }
+
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            navWaiter.continuation = cont
+            webView.loadHTMLString(
+                "<!doctype html><html><head><title>BgControlsTest</title></head><body><div id='movie_player'></div><video id='v' playsinline></video></body></html>",
+                baseURL: URL(string: "https://m.youtube.com/watch?v=YkY4X_OaF6o")
+            )
+        }
+
+        var ready = false
+        for _ in 0..<15 {
+            if let ok = try? await webView.evaluateJavaScript("typeof window.auraControl === 'object' && document.querySelector('video') && document.querySelector('video')._auraListenersAttached === true") as? Bool,
+               ok {
+                ready = true
+                break
+            }
+            try await Task.sleep(nanoseconds: 200_000_000)
+        }
+        XCTAssertTrue(ready)
+
+        // 1. Simulate YouTube JS attempting to register ±5s seekbackward / seekforward -> MUST be blocked!
+        let seekBlockResult = try await webView.evaluateJavaScript("""
+        (function() {
+          window._auraBlockedSeekActions = 0;
+          if (navigator.mediaSession && navigator.mediaSession.setActionHandler) {
+            navigator.mediaSession.setActionHandler('seekbackward', function() {});
+            navigator.mediaSession.setActionHandler('seekforward', function() {});
+          }
+          return {
+            hasMediaSession: !!(navigator.mediaSession && navigator.mediaSession.setActionHandler),
+            blockedSeekCount: window._auraBlockedSeekActions || 0,
+            trackControlsRegistered: window._auraRegisteredTrackControls === true
+          };
+        })()
+        """) as? [String: Any]
+        if (seekBlockResult?["hasMediaSession"] as? Bool) == true {
+            XCTAssertGreaterThanOrEqual(seekBlockResult?["blockedSeekCount"] as? Int ?? 0, 2, "YouTube seekbackward/seekforward (±5s) handlers MUST be blocked")
+            XCTAssertEqual(seekBlockResult?["trackControlsRegistered"] as? Bool, true)
+        }
+
+        // 2. Enter background, expire _auraBgProtectUntil (simulating 10+ seconds in background), then dispatch unsolicited iOS suspension pause!
+        // MUST NOT flip _auraUserPaused = true or turn off background music!
+        let bgSurviveResult = try await webView.evaluateJavaScript("""
+        (function() {
+          var v = document.querySelector('video');
+          v._auraHasPlayedOnce = true;
+          window.auraControl.enterBackground(8000);
+          window._auraBgProtectUntil = 0;
+          window._auraStartupProtectUntil = 0;
+          v.dispatchEvent(new Event('pause'));
+          return {
+            inBg: window._auraAppInBackground === true,
+            userPaused: window._auraUserPaused === true,
+            softPaused: window._auraSoftPaused === true
+          };
+        })()
+        """) as? [String: Any]
+        XCTAssertEqual(bgSurviveResult?["inBg"] as? Bool, true)
+        XCTAssertEqual(bgSurviveResult?["userPaused"] as? Bool, false, "Unsolicited background pause from iOS WebKit MUST NEVER turn off music")
+        XCTAssertEqual(bgSurviveResult?["softPaused"] as? Bool, false)
+
+        // 3. Test in-place background track switch via window.auraControl.loadVideo(nextID)
+        let inPlaceSwitch = try await webView.evaluateJavaScript("""
+        (function() {
+          window._loadedById = null;
+          var mp = document.getElementById('movie_player');
+          mp.loadVideoById = function(id) { window._loadedById = id; };
+          window.auraControl.pauseInBackground();
+          var switched = window.auraControl.loadVideo('NEXT_TRACK_999');
+          return {
+            switched: switched === true,
+            loadedId: window._loadedById,
+            userPaused: window._auraUserPaused === true,
+            softPaused: window._auraSoftPaused === true
+          };
+        })()
+        """) as? [String: Any]
+        XCTAssertEqual(inPlaceSwitch?["switched"] as? Bool, true, "loadVideo must switch tracks in-place via movie_player.loadVideoById")
+        XCTAssertEqual(inPlaceSwitch?["loadedId"] as? String, "NEXT_TRACK_999")
+        XCTAssertEqual(inPlaceSwitch?["userPaused"] as? Bool, false)
+        XCTAssertEqual(inPlaceSwitch?["softPaused"] as? Bool, false)
+    }
 }

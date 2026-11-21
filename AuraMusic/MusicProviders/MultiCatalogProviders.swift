@@ -812,11 +812,26 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
             });
 
             // Protect AuraMusic's Lock Screen / Control Center mediaSession handlers so YouTube's JS cannot overwrite them
+            // AND block YouTube from registering seekbackward/seekforward (±5s skip), which replaces ⏮/⏭ on iOS Lock Screen!
             if (navigator.mediaSession && typeof navigator.mediaSession.setActionHandler === 'function') {
               var origSetActionHandler = navigator.mediaSession.setActionHandler.bind(navigator.mediaSession);
               window._auraSetMediaActionHandler = origSetActionHandler;
+              window._auraBlockedSeekActions = 0;
+              var protectedActions = {
+                play: true,
+                pause: true,
+                nexttrack: true,
+                previoustrack: true,
+                seekbackward: true,
+                seekforward: true,
+                skipad: true
+              };
               navigator.mediaSession.setActionHandler = function(action, handler) {
-                if (action === 'play' || action === 'pause' || action === 'nexttrack' || action === 'previoustrack') {
+                if (protectedActions[action]) {
+                  if (action === 'seekbackward' || action === 'seekforward') {
+                    window._auraBlockedSeekActions = (window._auraBlockedSeekActions || 0) + 1;
+                    try { origSetActionHandler(action, null); } catch(e) {}
+                  }
                   return;
                 }
                 return origSetActionHandler(action, handler);
@@ -842,10 +857,11 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
                 // Keep <video> alive & muted during background soft-pause so iOS WebKit never revokes background audio permission
                 return;
               }
+              var inBgActive = (window._auraAppInBackground === true);
               var inStartupProtect = Date.now() < (window._auraStartupProtectUntil || 0);
               var inBgProtect = Date.now() < (window._auraBgProtectUntil || 0);
               var inResumeProtect = Date.now() < (window._auraPendingUserResumeUntil || 0);
-              if ((!inStartupProtect && !inBgProtect && !inResumeProtect) || window._auraAllowPause === true || window._auraUserPaused === true || this.ended) {
+              if ((!inBgActive && !inStartupProtect && !inBgProtect && !inResumeProtect) || window._auraAllowPause === true || window._auraUserPaused === true || this.ended) {
                 return origPause.apply(this, arguments);
               }
               var self = this;
@@ -1138,11 +1154,71 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
             enterBackground: function(ms) {
               window._auraAppInBackground = true;
               if (window._auraUserPaused === true || window._auraSoftPaused === true) return;
-              window._auraBgProtectUntil = Date.now() + (ms || 1200);
+              window._auraBgProtectUntil = Date.now() + (ms || 8000);
               var v = document.querySelector('video');
               if (v && v.paused && !v.ended) {
                 forceUnmuteAndPlayIfNeeded(v, false);
               }
+              installMediaSessionHandlers();
+            },
+            keepAliveInBackground: function() {
+              window._auraAppInBackground = true;
+              if (window._auraUserPaused === true || window._auraSoftPaused === true) return;
+              installMediaSessionHandlers();
+              var v = document.querySelector('video');
+              if (v && !v.ended) {
+                applyNativeMute(v, false);
+                if (v.paused) {
+                  var mp = document.getElementById('movie_player');
+                  if (mp && mp.playVideo) { try { mp.playVideo(); } catch(e) {} }
+                  try { v.play().catch(function(){}); } catch(e) {}
+                }
+              }
+            },
+            loadVideo: function(videoId) {
+              try {
+                var mp = document.getElementById('movie_player');
+                if (mp && typeof mp.loadVideoById === 'function') {
+                  window._auraSoftPaused = false;
+                  window._auraUserPaused = false;
+                  window._auraAllowPause = false;
+                  window._auraStartupProtectUntil = Date.now() + 4500;
+                  window._auraPendingUserResumeUntil = Date.now() + 3000;
+                  window._lastReportedAudioUrl = null;
+                  window._lastReportedAudioIsMp4 = false;
+                  lastTickState = -999;
+                  mp.loadVideoById(videoId);
+                  var v = document.querySelector('video');
+                  if (v) {
+                    v._auraHasPlayedOnce = false;
+                    v._auraStartAttempts = 0;
+                    v.playbackRate = 1.0;
+                    applyNativeMute(v, false);
+                    try { v.play().catch(function(){}); } catch(e) {}
+                  }
+                  installMediaSessionHandlers();
+                  return true;
+                }
+              } catch(e) {}
+              return false;
+            },
+            setMetadata: function(meta) {
+              try {
+                if (!meta) return;
+                window._auraCurrentMediaMetadata = meta;
+                if (navigator.mediaSession && typeof MediaMetadata === 'function') {
+                  var art = [];
+                  if (meta.artwork && meta.artwork.length > 0) {
+                    art.push({ src: meta.artwork, sizes: '512x512', type: 'image/jpeg' });
+                  }
+                  navigator.mediaSession.metadata = new MediaMetadata({
+                    title: meta.title || '',
+                    artist: meta.artist || '',
+                    album: meta.album || '',
+                    artwork: art
+                  });
+                }
+              } catch(e) {}
             },
             enterForeground: function() {
               window._auraAppInBackground = false;
@@ -1194,6 +1270,12 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
               var register = window._auraSetMediaActionHandler
                 || (navigator.mediaSession && navigator.mediaSession.setActionHandler ? navigator.mediaSession.setActionHandler.bind(navigator.mediaSession) : null);
               if (!register) return;
+              // Explicitly clear seekbackward / seekforward (±5s skip) so iOS Lock Screen shows ⏮ Previous & ⏭ Next!
+              try { register('seekbackward', null); } catch(e) {}
+              try { register('seekforward', null); } catch(e) {}
+              try { register('skipad', null); } catch(e) {}
+              window._auraRegisteredTrackControls = true;
+
               register('pause', function() {
                 window._auraBgProtectUntil = 0;
                 if (window._auraAppInBackground === true) {
@@ -1214,6 +1296,9 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
               register('previoustrack', function() {
                 postMessageToSwift({ type: 'remotePrev' });
               });
+              if (window._auraCurrentMediaMetadata && window.auraControl && window.auraControl.setMetadata) {
+                window.auraControl.setMetadata(window._auraCurrentMediaMetadata);
+              }
             } catch(e) {}
           }
           installMediaSessionHandlers();
@@ -1339,29 +1424,25 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
                   try { v.play().catch(function(){}); } catch(e) {}
                   return;
                 }
+                var inBgActive = (window._auraAppInBackground === true);
                 var inStartupProtect = Date.now() < (window._auraStartupProtectUntil || 0);
                 var inBgProtect = Date.now() < (window._auraBgProtectUntil || 0);
                 var inResumeProtect = Date.now() < (window._auraPendingUserResumeUntil || 0);
-                if ((inStartupProtect || inBgProtect || inResumeProtect) && !window._auraUserPaused && !window._auraAllowPause) {
+                // While app is in background, the user cannot tap the hidden 8x8 <video>; any unsolicited pause
+                // without _auraUserPaused/_auraAllowPause is iOS WebKit trying to suspend background audio -> keep playing!
+                if ((inBgActive || inStartupProtect || inBgProtect || inResumeProtect) && !window._auraUserPaused && !window._auraAllowPause) {
                   forceUnmuteAndPlayIfNeeded(v, false);
+                  try { v.play().catch(function(){}); } catch(e) {}
                   return;
                 }
                 if (v._auraHasPlayedOnce && v.currentTime > 0.25) {
-                  if (window._auraAppInBackground === true) {
-                    // Convert native background pause into soft-pause if possible, or mark user paused cleanly
-                    window._auraUserPaused = true;
-                    window._auraAllowPause = true;
-                    try { if (navigator.mediaSession) navigator.mediaSession.playbackState = 'paused'; } catch(e) {}
-                    postCurrentVideoTick(v, { userPaused: true, userResumed: false });
-                  } else {
-                    window._auraUserPaused = true;
-                    window._auraAllowPause = true;
-                    window._auraPendingUserResumeUntil = 0;
-                    try { if (navigator.mediaSession) navigator.mediaSession.playbackState = 'paused'; } catch(e) {}
-                    var mp = document.getElementById('movie_player');
-                    if (mp && mp.pauseVideo) { try { mp.pauseVideo(); } catch(e) {} }
-                    postCurrentVideoTick(v, { userPaused: true, userResumed: false });
-                  }
+                  window._auraUserPaused = true;
+                  window._auraAllowPause = true;
+                  window._auraPendingUserResumeUntil = 0;
+                  try { if (navigator.mediaSession) navigator.mediaSession.playbackState = 'paused'; } catch(e) {}
+                  var mp = document.getElementById('movie_player');
+                  if (mp && mp.pauseVideo) { try { mp.pauseVideo(); } catch(e) {} }
+                  postCurrentVideoTick(v, { userPaused: true, userResumed: false });
                 } else {
                   postCurrentVideoTick(v);
                 }
@@ -1426,9 +1507,22 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
         guard !safeVideoID.isEmpty else { return }
 
         if context.coordinator.loadedVideoID != safeVideoID {
+            let hadLoadedPage = (context.coordinator.loadedVideoID != nil)
             context.coordinator.loadedVideoID = safeVideoID
             playerEngine.registerYouTubeWebView(webView)
-            if let watchURL = URL(string: "https://m.youtube.com/watch?v=\(safeVideoID)") {
+            if hadLoadedPage {
+                // Switch tracks in-place via movie_player.loadVideoById so Next/Prev in background reuses
+                // the already-authorized <video> element without losing iOS background playback permission!
+                let switchScript = "(function(){ if(window.auraControl && window.auraControl.loadVideo){ return window.auraControl.loadVideo('\(safeVideoID)'); } return false; })()"
+                webView.evaluateJavaScript(switchScript) { result, _ in
+                    let switchedInPlace = (result as? Bool) == true
+                    if !switchedInPlace, let watchURL = URL(string: "https://m.youtube.com/watch?v=\(safeVideoID)") {
+                        var request = URLRequest(url: watchURL)
+                        request.setValue("https://m.youtube.com/", forHTTPHeaderField: "Referer")
+                        webView.load(request)
+                    }
+                }
+            } else if let watchURL = URL(string: "https://m.youtube.com/watch?v=\(safeVideoID)") {
                 var request = URLRequest(url: watchURL)
                 request.setValue("https://m.youtube.com/", forHTTPHeaderField: "Referer")
                 webView.load(request)
