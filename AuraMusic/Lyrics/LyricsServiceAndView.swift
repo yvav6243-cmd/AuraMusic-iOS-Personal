@@ -193,13 +193,40 @@ public final class LyricsService: ObservableObject {
                 allCandidates.append(contentsOf: search2)
             }
 
-            // Stage 3: Resolve canonical song title & artist via iTunes catalog metadata
+            // Stage 3: If raw title had "A - B", also try reversed (title: parsedArtist, artist: parsedTitle) in case video was titled "Song - Artist"
+            if !allCandidates.contains(where: { !($0.syncedLyrics ?? "").isEmpty }),
+               parsedTitle != parsedArtist,
+               !parsedArtist.isEmpty {
+                if let reversedSearch = try? await searchLRCLIB(title: parsedArtist, artist: parsedTitle) {
+                    allCandidates.append(contentsOf: reversedSearch)
+                }
+            }
+
+            // Stage 4: Resolve canonical song title & artist via iTunes catalog metadata
             if let canonical = await resolveCanonicalMetadataFromCatalog(query: "\(parsedTitle) \(parsedArtist)") {
                 if let search3 = try? await searchLRCLIB(title: canonical.title, artist: canonical.artist) {
                     allCandidates.append(contentsOf: search3)
                 }
                 if let search4 = try? await searchLRCLIB(title: canonical.title, artist: "") {
                     allCandidates.append(contentsOf: search4)
+                }
+            }
+
+            // Stage 5: Backup public Lyrics.ovh lookup if LRCLIB had no entry
+            if allCandidates.isEmpty {
+                if let ovhPlain = await fetchBackupLyricsOvh(artist: parsedArtist, title: parsedTitle) {
+                    allCandidates.append(
+                        LRCLIBEntryDTO(
+                            id: 999999,
+                            trackName: parsedTitle,
+                            artistName: parsedArtist,
+                            albumName: track.album,
+                            duration: track.duration,
+                            instrumental: false,
+                            plainLyrics: ovhPlain,
+                            syncedLyrics: nil
+                        )
+                    )
                 }
             }
 
@@ -254,10 +281,12 @@ public final class LyricsService: ObservableObject {
             }
         }
 
-        // 2. Strip parenthetical & bracketed video/audio noise in both Russian and English FIRST
+        // 2. Strip hashtags, pipes, and parenthetical/bracketed video/audio/remix/slowed noise in both Russian and English FIRST
         let bracketPatterns = [
-            "\\([^)]*(?:official|audio|video|lyric|remaster|visualizer|live|hd|4k|клип|видео|аудио|премьера|официальн|текст|музыка|ost|prod)[^)]*\\)",
-            "\\[[^\\]]*(?:official|audio|video|lyric|remaster|visualizer|live|hd|4k|клип|видео|аудио|премьера|официальн|текст|музыка|ost|prod)[^\\]]*\\]"
+            "#\\S+",
+            "\\|.*$",
+            "\\([^)]*(?:official|audio|video|lyric|remaster|visualizer|live|hd|4k|slowed|reverb|speed|sped|nightcore|remix|tiktok|bass|клип|видео|аудио|премьера|официальн|текст|музыка|ost|prod)[^)]*\\)",
+            "\\[[^\\]]*(?:official|audio|video|lyric|remaster|visualizer|live|hd|4k|slowed|reverb|speed|sped|nightcore|remix|tiktok|bass|клип|видео|аудио|премьера|официальн|текст|музыка|ost|prod)[^\\]]*\\]"
         ]
         for pattern in bracketPatterns {
             if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
@@ -281,12 +310,12 @@ public final class LyricsService: ObservableObject {
             }
         }
 
-        // 4. Now strip trailing feat./ft./prod. from both title and artist
+        // 4. Now strip trailing feat./ft./prod./slowed/reverb from both title and artist
         let featPatterns = [
             "\\([^)]*(?:feat\\.?|ft\\.?|prod\\.?)[^)]*\\)",
             "\\[[^\\]]*(?:feat\\.?|ft\\.?|prod\\.?)[^\\]]*\\]",
             "(?i)\\b(?:feat\\.?|ft\\.?|prod\\.?)\\s+.+$",
-            "(?i)\\b(?:official\\s+music\\s+video|official\\s+video|official\\s+audio|lyric\\s+video|премьера\\s+клипа|официальный\\s+клип).*$"
+            "(?i)\\b(?:official\\s+music\\s+video|official\\s+video|official\\s+audio|lyric\\s+video|slowed\\s*\\+?\\s*reverb|slowed|speed\\s+up|sped\\s+up|премьера\\s+клипа|официальный\\s+клип).*$"
         ]
         for pattern in featPatterns {
             if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
@@ -382,6 +411,24 @@ public final class LyricsService: ObservableObject {
         }
         let range = NSRange(text.startIndex..<text.endIndex, in: text)
         return regex.firstMatch(in: text, range: range) != nil
+    }
+
+    private func fetchBackupLyricsOvh(artist: String, title: String) async -> String? {
+        guard !artist.isEmpty && !title.isEmpty else { return nil }
+        let encArtist = artist.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? artist
+        let encTitle = title.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? title
+        guard let url = URL(string: "https://api.lyrics.ovh/v1/\(encArtist)/\(encTitle)") else { return nil }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 5
+        guard let (data, response) = try? await session.data(for: request),
+              let http = response as? HTTPURLResponse,
+              http.statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let lyrics = json["lyrics"] as? String,
+              !lyrics.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+        return lyrics
     }
 
     private func resolveCanonicalMetadataFromCatalog(query: String) async -> (title: String, artist: String)? {
@@ -861,19 +908,22 @@ public struct SynchronizedLyricsView: View {
                             if line.text == "•••" {
                                 AppleMusicInstrumentalDotsView(litDotsCount: isCurrent ? dotStage : 0)
                             } else {
+                                // Fixed base font size (25pt bold) prevents text line-wrap jumps; GPU scaleEffect creates silky Apple Music zoom
                                 Text(line.text)
-                                    .font(.system(size: isCurrent ? 30 : 23, weight: .bold))
-                                    .foregroundStyle(.white.opacity(isCurrent ? 1.0 : (isPast ? 0.25 : 0.44)))
-                                    .scaleEffect(isCurrent ? 1.02 : 1.0, anchor: .leading)
+                                    .font(.system(size: 25, weight: .bold))
+                                    .foregroundStyle(.white.opacity(isCurrent ? 1.0 : (isPast ? 0.24 : 0.45)))
+                                    .scaleEffect(isCurrent ? 1.05 : 0.96, anchor: .leading)
+                                    .offset(y: isCurrent ? 0 : (isPast ? -1 : 1))
                             }
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.vertical, 7)
-                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .padding(.horizontal, 14)
                         .background(
-                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            RoundedRectangle(cornerRadius: 14, style: .continuous)
                                 .fill(isCurrent ? Color.white.opacity(0.12) : Color.clear)
                         )
+                        .animation(.interpolatingSpring(stiffness: 160, damping: 23), value: isCurrent)
                         .contentShape(Rectangle())
                         .id(line.index)
                         .onTapGesture {
@@ -883,20 +933,20 @@ public struct SynchronizedLyricsView: View {
                                 player.resume()
                             }
                             highlightedLineIndex = line.index
-                            withAnimation(.spring(response: 0.36, dampingFraction: 0.84)) {
-                                proxy.scrollTo(line.index, anchor: .center)
+                            withAnimation(.interpolatingSpring(stiffness: 145, damping: 22)) {
+                                proxy.scrollTo(line.index, anchor: UnitPoint(x: 0.5, y: 0.38))
                             }
                         }
                     }
 
-                    Spacer().frame(height: 150)
+                    Spacer().frame(height: 170)
                 }
                 .padding(.horizontal, 20)
             }
             .onAppear {
                 if let initial = computeActiveLineIndex(at: player.currentTime, in: doc) {
                     highlightedLineIndex = initial
-                    proxy.scrollTo(initial, anchor: .center)
+                    proxy.scrollTo(initial, anchor: UnitPoint(x: 0.5, y: 0.38))
                 }
             }
             .onChange(of: player.currentTrack?.id) { _, _ in
@@ -907,8 +957,8 @@ public struct SynchronizedLyricsView: View {
                 if nextIdx != highlightedLineIndex {
                     highlightedLineIndex = nextIdx
                     if let target = nextIdx {
-                        withAnimation(.spring(response: 0.38, dampingFraction: 0.84)) {
-                            proxy.scrollTo(target, anchor: .center)
+                        withAnimation(.interpolatingSpring(stiffness: 145, damping: 22)) {
+                            proxy.scrollTo(target, anchor: UnitPoint(x: 0.5, y: 0.38))
                         }
                     }
                 }
