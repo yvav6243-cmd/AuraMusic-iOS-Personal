@@ -58,6 +58,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     private weak var youtubeWebView: WKWebView?
     private var timeObserverToken: Any?
     private var endOfTrackCancellable: AnyCancellable?
+    private var itemStatusObservation: NSKeyValueObservation?
     private var sleepTimerTask: Task<Void, Never>?
     private var crossfadeTriggeredForCurrentItem = false
 
@@ -312,9 +313,15 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
 
         case .audius, .radio:
             if let resolvedURL = try? await audiusProvider.resolvePlayableStreamURL(for: track) ?? track.streamURL {
-                startAVPlayer(with: resolvedURL, for: track, banner: nil)
+                if track.provider == .radio || (await verifyHTTPStreamPlayable(url: resolvedURL)) {
+                    startAVPlayer(with: resolvedURL, for: track, banner: nil)
+                } else {
+                    await attemptCrossProviderFallback(for: track)
+                }
             } else if let direct = track.streamURL {
                 startAVPlayer(with: direct, for: track, banner: nil)
+            } else {
+                await attemptCrossProviderFallback(for: track)
             }
 
         case .appleMusic:
@@ -427,14 +434,17 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
                 }
 
             case .audius:
-                if let openCandidates = try? await audiusProvider.searchTracks(query: query, limit: 4),
-                   let matchedOpen = openCandidates.first(where: { matcher.isSameSong(track, $0) }) ?? openCandidates.first,
-                   let fullStreamURL = try? await audiusProvider.resolvePlayableStreamURL(for: matchedOpen) {
-                    if matchedOpen.duration > 35 {
-                        self.duration = matchedOpen.duration
+                if let openCandidates = try? await audiusProvider.searchTracks(query: query, limit: 5) {
+                    for candidate in openCandidates where matcher.isSameSong(track, candidate) {
+                        if let fullStreamURL = try? await audiusProvider.resolvePlayableStreamURL(for: candidate),
+                           await verifyHTTPStreamPlayable(url: fullStreamURL) {
+                            if candidate.duration > 35 {
+                                self.duration = candidate.duration
+                            }
+                            startAVPlayer(with: fullStreamURL, for: track, banner: nil)
+                            return true
+                        }
                     }
-                    startAVPlayer(with: fullStreamURL, for: track, banner: nil)
-                    return true
                 }
 
             default:
@@ -443,6 +453,22 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         }
 
         return false
+    }
+
+    private func verifyHTTPStreamPlayable(url: URL) async -> Bool {
+        if url.isFileURL { return true }
+        var request = URLRequest(url: url)
+        request.httpMethod = "HEAD"
+        request.timeoutInterval = 4.0
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            if let http = response as? HTTPURLResponse {
+                return (200..<400).contains(http.statusCode)
+            }
+            return false
+        } catch {
+            return false
+        }
     }
 
     private func upgradeToSquareAppleMusicCoverIfNeeded(for track: UniversalTrack) async {
@@ -482,7 +508,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         playbackStatusBanner = "Direct stream restricted by \(track.provider.displayName)."
     }
 
-    private func startAVPlayer(with url: URL, for track: UniversalTrack, banner: String?) {
+    private func startAVPlayer(with url: URL, for track: UniversalTrack, banner: String?, isFallbackRetry: Bool = false) {
         ApplicationMusicPlayer.shared.pause()
         activeYouTubeVideoID = nil
         playbackStatusBanner = banner
@@ -501,9 +527,36 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
             self.handleTrackFinished()
         }
 
+        itemStatusObservation?.invalidate()
+        itemStatusObservation = playerItem.observe(\.status, options: [.new]) { [weak self] item, _ in
+            guard let self else { return }
+            Task { @MainActor in
+                switch item.status {
+                case .readyToPlay:
+                    self.isBuffering = false
+                    self.isPlaying = true
+                    self.primaryPlayer.playImmediately(atRate: 1.0)
+                    self.refreshNowPlayingMetadata()
+                case .failed:
+                    if !isFallbackRetry {
+                        if let appleFallback = try? await self.appleProvider.resolvePlayableStreamURL(for: track),
+                           appleFallback != url {
+                            self.startAVPlayer(with: appleFallback, for: track, banner: nil, isFallbackRetry: true)
+                            return
+                        }
+                    }
+                    self.isBuffering = false
+                    self.isPlaying = false
+                default:
+                    break
+                }
+            }
+        }
+
+        primaryPlayer.automaticallyWaitsToMinimizeStalling = false
         primaryPlayer.replaceCurrentItem(with: playerItem)
         primaryPlayer.volume = volume
-        primaryPlayer.play()
+        primaryPlayer.playImmediately(atRate: 1.0)
 
         isPlaying = true
         isBuffering = false
