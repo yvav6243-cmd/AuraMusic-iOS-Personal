@@ -133,7 +133,7 @@ public final class LyricsService: ObservableObject {
     public func activeLyricLineText(at currentTime: TimeInterval) -> String? {
         guard let doc = currentDocument else { return nil }
         if doc.isSynchronized {
-            let t = currentTime + 0.15
+            let t = currentTime + 0.32
             var currentText: String? = nil
             for line in doc.syncedLines {
                 if t >= line.timestamp {
@@ -669,7 +669,7 @@ public struct SynchronizedLyricsView: View {
 
     private func computeActiveLineIndex(at time: TimeInterval, in doc: TrackLyricsDocument) -> Int? {
         guard doc.isSynchronized else { return nil }
-        let current = time + 0.18
+        let current = time + 0.32
         var matched: Int? = nil
         for line in doc.syncedLines {
             if current >= line.timestamp {
@@ -843,7 +843,9 @@ public struct SynchronizedLyricsView: View {
                     }
 
                     ForEach(doc.syncedLines) { line in
-                        let isCurrent = (activeLineIndex == line.index)
+                        let currentIdx = activeLineIndex ?? -1
+                        let isCurrent = (currentIdx == line.index)
+                        let isPast = (line.index < currentIdx)
                         let nextTimestamp: TimeInterval = (line.index + 1 < doc.syncedLines.count)
                             ? doc.syncedLines[line.index + 1].timestamp
                             : max(player.duration, line.timestamp + 6.0)
@@ -861,21 +863,16 @@ public struct SynchronizedLyricsView: View {
                             } else {
                                 Text(line.text)
                                     .font(.system(size: isCurrent ? 30 : 23, weight: .bold))
-                                    .foregroundStyle(.white.opacity(isCurrent ? 1.0 : 0.30))
-                            }
-
-                            if showTranslationOverlay, let translated = line.translatedText {
-                                Text(translated)
-                                    .font(.system(size: 15, weight: .semibold))
-                                    .foregroundStyle(.white.opacity(isCurrent ? 0.88 : 0.28))
+                                    .foregroundStyle(.white.opacity(isCurrent ? 1.0 : (isPast ? 0.25 : 0.44)))
+                                    .scaleEffect(isCurrent ? 1.02 : 1.0, anchor: .leading)
                             }
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.vertical, 6)
-                        .padding(.horizontal, 10)
+                        .padding(.vertical, 7)
+                        .padding(.horizontal, 12)
                         .background(
                             RoundedRectangle(cornerRadius: 12, style: .continuous)
-                                .fill(isCurrent ? Color.white.opacity(0.10) : Color.clear)
+                                .fill(isCurrent ? Color.white.opacity(0.12) : Color.clear)
                         )
                         .contentShape(Rectangle())
                         .id(line.index)
@@ -886,7 +883,7 @@ public struct SynchronizedLyricsView: View {
                                 player.resume()
                             }
                             highlightedLineIndex = line.index
-                            withAnimation(.easeInOut(duration: 0.3)) {
+                            withAnimation(.spring(response: 0.36, dampingFraction: 0.84)) {
                                 proxy.scrollTo(line.index, anchor: .center)
                             }
                         }
@@ -902,12 +899,15 @@ public struct SynchronizedLyricsView: View {
                     proxy.scrollTo(initial, anchor: .center)
                 }
             }
+            .onChange(of: player.currentTrack?.id) { _, _ in
+                highlightedLineIndex = nil
+            }
             .onReceive(player.$currentTime) { newTime in
                 let nextIdx = computeActiveLineIndex(at: newTime, in: doc)
                 if nextIdx != highlightedLineIndex {
                     highlightedLineIndex = nextIdx
                     if let target = nextIdx {
-                        withAnimation(.easeInOut(duration: 0.35)) {
+                        withAnimation(.spring(response: 0.38, dampingFraction: 0.84)) {
                             proxy.scrollTo(target, anchor: .center)
                         }
                     }
