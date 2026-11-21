@@ -228,7 +228,7 @@ public final class YouTubeMusicProvider: MusicProviderProtocol, @unchecked Senda
                 duration: exactDuration,
                 externalDeepLink: URL(string: deepLinkScheme),
                 isStreamable: true,
-                isDownloadPermitted: false,
+                isDownloadPermitted: true,
                 audioQualityBadge: isTopicOrAudio ? "STUDIO AUDIO" : (providerType == .youtubeMusic ? "YT MUSIC" : "VIDEO")
             )
         }
@@ -454,7 +454,7 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
         config.allowsInlineMediaPlayback = true
         config.mediaTypesRequiringUserActionForPlayback = []
 
-        // 1. Early script at document start: lock HTMLMediaElement.prototype.muted = false so YouTube cannot mute autoplay
+        // 1. Early script at document start: lock unmuted autoplay, block background visibility pause, and intercept audio stream URLs
         let unmuteLockScriptSource = """
         (function() {
           try {
@@ -466,6 +466,63 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
               get: function() { return false; },
               set: function(v) {}
             });
+            Object.defineProperty(document, 'hidden', { get: function() { return false; }, configurable: true });
+            Object.defineProperty(document, 'webkitHidden', { get: function() { return false; }, configurable: true });
+            Object.defineProperty(document, 'visibilityState', { get: function() { return 'visible'; }, configurable: true });
+            Object.defineProperty(document, 'webkitVisibilityState', { get: function() { return 'visible'; }, configurable: true });
+            document.hasFocus = function() { return true; };
+
+            var bgEvents = ['visibilitychange', 'webkitvisibilitychange', 'pagehide', 'blur', 'mozvisibilitychange'];
+            bgEvents.forEach(function(evt) {
+              window.addEventListener(evt, function(e) { e.stopImmediatePropagation(); e.stopPropagation(); }, true);
+              document.addEventListener(evt, function(e) { e.stopImmediatePropagation(); e.stopPropagation(); }, true);
+            });
+
+            var origPause = HTMLMediaElement.prototype.pause;
+            HTMLMediaElement.prototype.pause = function() {
+              if (window._auraAllowPause === true || this.ended) {
+                return origPause.apply(this, arguments);
+              }
+              var self = this;
+              setTimeout(function() {
+                if (!window._auraUserPaused) { try { self.play(); } catch(e) {} }
+              }, 25);
+            };
+
+            function reportCapturedAudioURL(rawUrl) {
+              if (!rawUrl || typeof rawUrl !== 'string') return;
+              if (rawUrl.indexOf('googlevideo.com/videoplayback') !== -1 &&
+                  (rawUrl.indexOf('mime=audio') !== -1 || rawUrl.indexOf('mime%3Daudio') !== -1)) {
+                var clean = rawUrl.replace(/&range=[^&]+/g, '').replace(/&rn=[^&]+/g, '').replace(/&rbuf=[^&]+/g, '');
+                if (window._lastReportedAudioUrl !== clean && window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.auraYT) {
+                  window._lastReportedAudioUrl = clean;
+                  window.webkit.messageHandlers.auraYT.postMessage({
+                    type: 'audioStream',
+                    audioURL: clean,
+                    currentTime: 0,
+                    duration: 0,
+                    state: 1
+                  });
+                }
+              }
+            }
+
+            var origFetch = window.fetch;
+            if (origFetch) {
+              window.fetch = function(input, init) {
+                try {
+                  var u = (typeof input === 'string') ? input : (input && input.url ? input.url : '');
+                  reportCapturedAudioURL(u);
+                } catch(e) {}
+                return origFetch.apply(this, arguments);
+              };
+            }
+
+            var origXHROpen = XMLHttpRequest.prototype.open;
+            XMLHttpRequest.prototype.open = function(method, url) {
+              try { reportCapturedAudioURL(url); } catch(e) {}
+              return origXHROpen.apply(this, arguments);
+            };
           } catch(e) {}
         })();
         """
@@ -532,13 +589,16 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
             },
             pause: function() {
               window._auraUserPaused = true;
+              window._auraAllowPause = true;
               var v = document.querySelector('video');
               if (v) v.pause();
               var mp = document.getElementById('movie_player');
               if (mp && mp.pauseVideo) { try { mp.pauseVideo(); } catch(e) {} }
+              setTimeout(function() { window._auraAllowPause = false; }, 100);
             },
             resume: function() {
               window._auraUserPaused = false;
+              window._auraAllowPause = false;
               var v = document.querySelector('video');
               if (v) {
                 forceUnmuteAndPlay(v);
@@ -669,6 +729,16 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
 
         public func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
             guard let dict = message.body as? [String: Any] else { return }
+            if let msgType = dict["type"] as? String,
+               msgType == "audioStream",
+               let audioURLString = dict["audioURL"] as? String,
+               let audioURL = URL(string: audioURLString),
+               let vid = loadedVideoID {
+                Task { @MainActor in
+                    self.playerEngine?.recordCapturedYouTubeAudioStreamURL(audioURL, forVideoID: vid)
+                }
+                return
+            }
             let cur = (dict["currentTime"] as? Double) ?? 0
             let dur = (dict["duration"] as? Double) ?? 0
             let st = (dict["state"] as? Int) ?? -1
