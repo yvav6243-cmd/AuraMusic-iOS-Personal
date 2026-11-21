@@ -239,17 +239,21 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         delayedKeepAliveStopTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 900_000_000_000) // 15 minutes idle timeout
             guard !Task.isCancelled, !self.isPlaying else { return }
+            self.evaluateYouTubeJS("if(window.auraControl){window.auraControl.enterForeground();}")
+            self.youtubeWebView?.pauseAllMediaPlayback(completionHandler: nil)
             self.setBackgroundKeepAliveActive(false)
         }
     }
 
     private func activateBackgroundTransitionProtection() {
+        if activeYouTubeVideoID != nil {
+            evaluateYouTubeJS("if(window.auraControl){window.auraControl.enterBackground(1200);}")
+        }
         guard self.isPlaying && !self.isUserPaused else { return }
         backgroundProtectTask?.cancel()
         delayedKeepAliveStopTask?.cancel()
         setBackgroundKeepAliveActive(true)
         if activeYouTubeVideoID != nil {
-            evaluateYouTubeJS("if(window.auraControl){window.auraControl.enterBackgroundProtect(900);}")
             backgroundProtectTask = Task { @MainActor in
                 try? await Task.sleep(nanoseconds: 250_000_000)
                 guard !Task.isCancelled,
@@ -258,7 +262,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
                       self.activeYouTubeVideoID != nil else {
                     return
                 }
-                self.evaluateYouTubeJS("if(window.auraControl && !window._auraUserPaused){window.auraControl.resume();}")
+                self.evaluateYouTubeJS("if(window.auraControl && !window._auraUserPaused && !window._auraSoftPaused){window.auraControl.resume();}")
             }
         }
     }
@@ -345,6 +349,18 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
             guard let self else { return }
             Task { @MainActor in
                 self.activateBackgroundTransitionProtection()
+            }
+        }
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in
+                if self.activeYouTubeVideoID != nil {
+                    self.evaluateYouTubeJS("if(window.auraControl){window.auraControl.enterForeground();}")
+                }
             }
         }
         NotificationCenter.default.addObserver(
@@ -792,11 +808,18 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         ApplicationMusicPlayer.shared.pause()
 
         if activeYouTubeVideoID != nil {
-            evaluateYouTubeJS("if(window.auraControl){window.auraControl.pause();}")
-            youtubeWebView?.pauseAllMediaPlayback(completionHandler: nil)
-            // Keep WebContent warm via zero-PCM silent audio for up to 15 min so Lock Screen Play resumes instantly
-            setBackgroundKeepAliveActive(true)
-            scheduleIdleKeepAliveTimeout()
+            let isInBackground = UIApplication.shared.applicationState != .active
+            if isInBackground {
+                // Soft-pause in background: silences audio & freezes progress WITHOUT calling pauseAllMediaPlayback(),
+                // preventing iOS WebKit from blocking video.play() when the user taps Play on the Lock Screen / Control Center!
+                evaluateYouTubeJS("if(window.auraControl){window.auraControl.pauseInBackground();}")
+                setBackgroundKeepAliveActive(true)
+                scheduleIdleKeepAliveTimeout()
+            } else {
+                evaluateYouTubeJS("if(window.auraControl){window.auraControl.pause();}")
+                youtubeWebView?.pauseAllMediaPlayback(completionHandler: nil)
+                setBackgroundKeepAliveActive(false)
+            }
         } else {
             setBackgroundKeepAliveActive(false)
         }
