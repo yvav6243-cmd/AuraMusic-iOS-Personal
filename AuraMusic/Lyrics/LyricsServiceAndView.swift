@@ -89,7 +89,6 @@ public enum LRCParser {
 
         let sorted = parsedEntries.sorted { $0.timestamp < $1.timestamp }
         return sorted.enumerated().map { idx, item in
-            // Support inline dual-language LRC rows separated by " / " or " | " without replacing original script
             let parts = item.text.components(separatedBy: " // ")
             let original = parts.first ?? item.text
             let translation = parts.count > 1 ? parts[1] : nil
@@ -114,7 +113,7 @@ public enum LRCParser {
     }
 }
 
-// MARK: - Official LRCLIB Lyrics Client + SwiftData Cache
+// MARK: - Official LRCLIB Lyrics Client + Multi-Stage Smart Resolver + SwiftData Cache
 
 @MainActor
 public final class LyricsService: ObservableObject {
@@ -130,9 +129,30 @@ public final class LyricsService: ObservableObject {
         self.session = session
     }
 
+    /// Returns the currently active synchronized lyric line for live preview on the Apple Music player card
+    public func activeLyricLineText(at currentTime: TimeInterval) -> String? {
+        guard let doc = currentDocument else { return nil }
+        if doc.isSynchronized {
+            let t = currentTime + 0.15
+            var currentText: String? = nil
+            for line in doc.syncedLines {
+                if t >= line.timestamp {
+                    if line.text != "•••" && !line.text.isEmpty {
+                        currentText = line.text
+                    }
+                } else {
+                    break
+                }
+            }
+            return currentText ?? doc.syncedLines.first(where: { $0.text != "•••" })?.text
+        } else {
+            return doc.plainLines.first(where: { !$0.isEmpty })
+        }
+    }
+
     public func loadLyrics(for track: UniversalTrack) async {
-        let cleanTitle = TrackMatchingEngine.normalizeTitle(track.title)
-        let cacheKey = "\(track.artist.lowercased())::\(track.title.lowercased())"
+        let (parsedTitle, parsedArtist) = Self.extractCleanTitleAndArtist(rawTitle: track.title, rawArtist: track.artist)
+        let cacheKey = "\(parsedArtist.lowercased())::\(parsedTitle.lowercased())"
 
         isLoading = true
         errorMessage = nil
@@ -153,15 +173,26 @@ public final class LyricsService: ObservableObject {
             return
         }
 
-        // 2. Query LRCLIB Exact Match API (`https://lrclib.net/api/get`)
+        // 2. Multi-stage LRCLIB search prioritizing time-synchronized LRC lyrics
         do {
-            var resolvedDTO = try await fetchExactLRCLIB(track: track)
-            if resolvedDTO == nil {
-                resolvedDTO = try await searchLRCLIB(title: track.title, artist: track.artist).first
+            var resolvedDTO = try await fetchExactLRCLIB(title: parsedTitle, artist: parsedArtist, album: track.album, duration: track.duration)
+
+            if resolvedDTO == nil || resolvedDTO?.syncedLyrics == nil {
+                let candidates1 = try await searchLRCLIB(title: parsedTitle, artist: parsedArtist)
+                if let bestSynced = candidates1.first(where: { !($0.syncedLyrics ?? "").isEmpty }) {
+                    resolvedDTO = bestSynced
+                } else if resolvedDTO == nil {
+                    resolvedDTO = candidates1.first(where: { !($0.plainLyrics ?? "").isEmpty })
+                }
             }
+
             if resolvedDTO == nil {
-                resolvedDTO = try await searchLRCLIB(title: cleanTitle, artist: track.artist).first
+                // Fallback: search by cleaned song title alone if artist channel name differed
+                let candidates2 = try await searchLRCLIB(title: parsedTitle, artist: "")
+                resolvedDTO = candidates2.first(where: { !($0.syncedLyrics ?? "").isEmpty })
+                    ?? candidates2.first(where: { !($0.plainLyrics ?? "").isEmpty })
             }
+
             if let dto = resolvedDTO {
                 cacheLyrics(
                     cacheKey: cacheKey,
@@ -180,12 +211,56 @@ public final class LyricsService: ObservableObject {
                 return
             }
         } catch {
-            // Try fallback search
+            // Fall through
         }
 
         self.currentDocument = nil
-        self.errorMessage = "No licensed lyrics found for \"\(track.title)\" by \(track.artist). Tap Search Lyrics to query manually."
+        self.errorMessage = "No licensed lyrics found for \"\(parsedTitle)\". Tap the magnifying glass to search manually."
         self.isLoading = false
+    }
+
+    /// Splits composite titles like "The Weeknd - Starboy (Official Audio) ft. Daft Punk" into ("Starboy", "The Weeknd")
+    public static func extractCleanTitleAndArtist(rawTitle: String, rawArtist: String) -> (title: String, artist: String) {
+        var workingTitle = rawTitle
+        var workingArtist = rawArtist
+            .replacingOccurrences(of: " - Topic", with: "")
+            .replacingOccurrences(of: "VEVO", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Strip parenthetical & bracketed noise
+        let noisePatterns = [
+            "\\([^)]*(?:official|audio|video|lyric|remaster|visualizer|feat\\.|ft\\.|live|hd|4k)[^)]*\\)",
+            "\\[[^\\]]*(?:official|audio|video|lyric|remaster|visualizer|feat\\.|ft\\.|live|hd|4k)[^\\]]*\\]",
+            "(?i)\\b(?:feat\\.?|ft\\.?)\\s+.+$"
+        ]
+        for pattern in noisePatterns {
+            if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
+                let range = NSRange(workingTitle.startIndex..<workingTitle.endIndex, in: workingTitle)
+                workingTitle = regex.stringByReplacingMatches(in: workingTitle, range: range, withTemplate: "")
+            }
+        }
+
+        // If title contains "Artist - Song", separate them
+        let separators = [" - ", " – ", " — "]
+        for sep in separators {
+            if workingTitle.contains(sep) {
+                let parts = workingTitle.components(separatedBy: sep)
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty }
+                if parts.count >= 2 {
+                    workingArtist = parts[0]
+                    workingTitle = parts[1]
+                    break
+                }
+            }
+        }
+
+        if let artistComma = workingArtist.components(separatedBy: ",").first {
+            workingArtist = artistComma.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        let finalTitle = workingTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (finalTitle.isEmpty ? rawTitle : finalTitle, workingArtist.isEmpty ? rawArtist : workingArtist)
     }
 
     public func manualLyricsSearch(songTitle: String, artistName: String) async throws -> [LRCLIBEntryDTO] {
@@ -193,7 +268,8 @@ public final class LyricsService: ObservableObject {
     }
 
     public func applyManualLyricSelection(_ dto: LRCLIBEntryDTO, for track: UniversalTrack) {
-        let cacheKey = "\(track.artist.lowercased())::\(track.title.lowercased())"
+        let (parsedTitle, parsedArtist) = Self.extractCleanTitleAndArtist(rawTitle: track.title, rawArtist: track.artist)
+        let cacheKey = "\(parsedArtist.lowercased())::\(parsedTitle.lowercased())"
         cacheLyrics(
             cacheKey: cacheKey,
             title: track.title,
@@ -210,22 +286,22 @@ public final class LyricsService: ObservableObject {
         self.errorMessage = nil
     }
 
-    private func fetchExactLRCLIB(track: UniversalTrack) async throws -> LRCLIBEntryDTO? {
+    private func fetchExactLRCLIB(title: String, artist: String, album: String, duration: TimeInterval) async throws -> LRCLIBEntryDTO? {
         var components = URLComponents(string: "https://lrclib.net/api/get")!
         var items = [
-            URLQueryItem(name: "track_name", value: track.title),
-            URLQueryItem(name: "artist_name", value: track.artist)
+            URLQueryItem(name: "track_name", value: title),
+            URLQueryItem(name: "artist_name", value: artist)
         ]
-        if !track.album.isEmpty && track.album != "Single" {
-            items.append(URLQueryItem(name: "album_name", value: track.album))
+        if !album.isEmpty && album != "Single" && !album.contains("YouTube") && !album.contains("Audius") {
+            items.append(URLQueryItem(name: "album_name", value: album))
         }
-        if track.duration > 10 {
-            items.append(URLQueryItem(name: "duration", value: String(Int(track.duration.rounded()))))
+        if duration > 20 {
+            items.append(URLQueryItem(name: "duration", value: String(Int(duration.rounded()))))
         }
         components.queryItems = items
         guard let url = components.url else { return nil }
         var request = URLRequest(url: url)
-        request.setValue("AuraMusic iOS/1.0 (https://auramusic.local)", forHTTPHeaderField: "User-Agent")
+        request.setValue("AuraMusic iOS/1.1 (https://auramusic.local)", forHTTPHeaderField: "User-Agent")
 
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
@@ -240,7 +316,7 @@ public final class LyricsService: ObservableObject {
         components.queryItems = [URLQueryItem(name: "q", value: query)]
         guard let url = components.url else { return [] }
         var request = URLRequest(url: url)
-        request.setValue("AuraMusic iOS/1.0 (https://auramusic.local)", forHTTPHeaderField: "User-Agent")
+        request.setValue("AuraMusic iOS/1.1 (https://auramusic.local)", forHTTPHeaderField: "User-Agent")
 
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
@@ -327,6 +403,36 @@ public struct LRCLIBEntryDTO: Codable, Identifiable, Sendable {
     public var syncedLyrics: String?
 }
 
+// MARK: - Apple Music Sing / Karaoke Animated Instrumental Waiting Dots
+
+public struct AppleMusicInstrumentalDotsView: View {
+    public let isActive: Bool
+    @State private var pulse: Bool = false
+
+    public init(isActive: Bool) {
+        self.isActive = isActive
+    }
+
+    public var body: some View {
+        HStack(spacing: 8) {
+            ForEach(0..<3, id: \.self) { index in
+                Circle()
+                    .fill(Color.white.opacity(isActive ? 0.95 : 0.35))
+                    .frame(width: 11, height: 11)
+                    .scaleEffect(pulse && isActive ? 1.25 : 0.85)
+                    .animation(
+                        isActive
+                            ? .easeInOut(duration: 0.55).repeatForever(autoreverses: true).delay(Double(index) * 0.18)
+                            : .default,
+                        value: pulse
+                    )
+            }
+        }
+        .padding(.vertical, 6)
+        .onAppear { pulse = true }
+    }
+}
+
 // MARK: - Apple Music Full-Screen Synchronized Lyrics View
 
 public struct SynchronizedLyricsView: View {
@@ -349,7 +455,7 @@ public struct SynchronizedLyricsView: View {
         guard let doc = lyricsService.currentDocument, doc.isSynchronized else {
             return nil
         }
-        let current = player.currentTime + 0.12
+        let current = player.currentTime + 0.15
         var matched: Int? = nil
         for line in doc.syncedLines {
             if current >= line.timestamp {
@@ -361,6 +467,15 @@ public struct SynchronizedLyricsView: View {
         return matched
     }
 
+    private var isInIntroBeforeFirstLine: Bool {
+        guard let doc = lyricsService.currentDocument,
+              doc.isSynchronized,
+              let first = doc.syncedLines.first else {
+            return false
+        }
+        return player.currentTime < first.timestamp
+    }
+
     public var body: some View {
         VStack(spacing: 0) {
             lyricsHeaderBar
@@ -370,7 +485,7 @@ public struct SynchronizedLyricsView: View {
                 ProgressView()
                     .tint(.white)
                     .scaleEffect(1.2)
-                Text("Loading Original Script Lyrics…")
+                Text("Loading Apple Music Synchronized Lyrics…")
                     .font(.system(size: 14, weight: .medium))
                     .foregroundStyle(.white.opacity(0.75))
                     .padding(.top, 12)
@@ -394,8 +509,12 @@ public struct SynchronizedLyricsView: View {
                         .padding(.horizontal, 32)
 
                     Button {
-                        manualSongQuery = player.currentTrack?.title ?? ""
-                        manualArtistQuery = player.currentTrack?.artist ?? ""
+                        let cleaned = LyricsService.extractCleanTitleAndArtist(
+                            rawTitle: player.currentTrack?.title ?? "",
+                            rawArtist: player.currentTrack?.artist ?? ""
+                        )
+                        manualSongQuery = cleaned.title
+                        manualArtistQuery = cleaned.artist
                         showManualSearchSheet = true
                     } label: {
                         Label("Search Lyrics by Song & Artist", systemImage: "magnifyingglass")
@@ -425,15 +544,15 @@ public struct SynchronizedLyricsView: View {
                 HStack(spacing: 6) {
                     Image(systemName: doc.isSynchronized ? "waveform" : "text.alignleft")
                         .font(.system(size: 11, weight: .bold))
-                    Text(doc.isSynchronized ? "TIME-SYNCED" : "PLAIN LYRICS")
+                    Text(doc.isSynchronized ? "APPLE MUSIC SING SYNC" : "LYRICS")
                         .font(.system(size: 10, weight: .bold, design: .rounded))
                     Text("• \(doc.detectedLanguageDisplayName.uppercased())")
                         .font(.system(size: 10, weight: .bold, design: .rounded))
                 }
-                .foregroundStyle(.white.opacity(0.9))
+                .foregroundStyle(.white.opacity(0.92))
                 .padding(.horizontal, 10)
                 .padding(.vertical, 5)
-                .background(Capsule().fill(.white.opacity(0.16)))
+                .background(Capsule().fill(.white.opacity(0.18)))
 
                 if doc.hasTranslationAvailable {
                     Button {
@@ -468,8 +587,12 @@ public struct SynchronizedLyricsView: View {
             }
 
             Button {
-                manualSongQuery = player.currentTrack?.title ?? ""
-                manualArtistQuery = player.currentTrack?.artist ?? ""
+                let cleaned = LyricsService.extractCleanTitleAndArtist(
+                    rawTitle: player.currentTrack?.title ?? "",
+                    rawArtist: player.currentTrack?.artist ?? ""
+                )
+                manualSongQuery = cleaned.title
+                manualArtistQuery = cleaned.artist
                 showManualSearchSheet = true
             } label: {
                 Image(systemName: "magnifyingglass")
@@ -486,23 +609,33 @@ public struct SynchronizedLyricsView: View {
     private func synchronizedLyricsScroll(doc: TrackLyricsDocument) -> some View {
         ScrollViewReader { proxy in
             ScrollView(.vertical, showsIndicators: false) {
-                LazyVStack(alignment: .leading, spacing: 24) {
-                    Spacer().frame(height: 36)
+                LazyVStack(alignment: .leading, spacing: 26) {
+                    Spacer().frame(height: 24)
+
+                    if isInIntroBeforeFirstLine {
+                        AppleMusicInstrumentalDotsView(isActive: player.isPlaying)
+                            .id(-1)
+                    }
 
                     ForEach(doc.syncedLines) { line in
                         let isCurrent = (activeLineIndex == line.index)
                         let distance = abs((activeLineIndex ?? 0) - line.index)
 
                         VStack(alignment: .leading, spacing: 6) {
-                            Text(line.text)
-                                .font(.system(size: isCurrent ? 29 : 24, weight: .bold))
-                                .foregroundStyle(.white.opacity(isCurrent ? 1.0 : 0.36))
-                                .scaleEffect(isCurrent ? 1.02 : 0.97, anchor: .leading)
-                                .blur(radius: isUserManualScrolling || isCurrent ? 0 : min(CGFloat(distance) * 0.45, 1.8))
+                            if line.text == "•••" {
+                                AppleMusicInstrumentalDotsView(isActive: isCurrent && player.isPlaying)
+                            } else {
+                                Text(line.text)
+                                    .font(.system(size: isCurrent ? 31 : 25, weight: .heavy))
+                                    .foregroundStyle(.white.opacity(isCurrent ? 1.0 : 0.34))
+                                    .shadow(color: isCurrent ? .white.opacity(0.32) : .clear, radius: 10, x: 0, y: 0)
+                                    .scaleEffect(isCurrent ? 1.03 : 0.96, anchor: .leading)
+                                    .blur(radius: isUserManualScrolling || isCurrent ? 0 : min(CGFloat(distance) * 0.5, 2.0))
+                            }
 
                             if showTranslationOverlay, let translated = line.translatedText {
                                 Text(translated)
-                                    .font(.system(size: 15, weight: .medium))
+                                    .font(.system(size: 15, weight: .semibold))
                                     .foregroundStyle(.white.opacity(isCurrent ? 0.85 : 0.30))
                             }
                         }
@@ -533,7 +666,7 @@ public struct SynchronizedLyricsView: View {
             )
             .onChange(of: activeLineIndex) { _, newIndex in
                 guard !isUserManualScrolling, let newIndex else { return }
-                withAnimation(.spring(response: 0.48, dampingFraction: 0.85)) {
+                withAnimation(.spring(response: 0.45, dampingFraction: 0.84)) {
                     proxy.scrollTo(newIndex, anchor: .center)
                 }
             }
@@ -555,7 +688,7 @@ public struct SynchronizedLyricsView: View {
 
                 ForEach(Array(doc.plainLines.enumerated()), id: \.offset) { _, line in
                     Text(line.isEmpty ? " " : line)
-                        .font(.system(size: 21, weight: .semibold))
+                        .font(.system(size: 22, weight: .bold))
                         .foregroundStyle(.white.opacity(0.92))
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
