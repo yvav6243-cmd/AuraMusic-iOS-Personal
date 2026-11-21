@@ -20,12 +20,11 @@ public struct AppleMusicPlayerOverlayView: View {
 
     public var body: some View {
         ZStack(alignment: .bottom) {
-            // Single persistent YouTube Music engine instance — 100% invisible offscreen audio engine
+            // Single persistent YouTube Music engine instance — kept inside screen bounds so iOS WebKit never throttles timers, 100% invisible
             if let videoID = player.activeYouTubeVideoID {
                 AuthorizedYouTubeIFramePlayerView(videoID: videoID)
-                    .frame(width: 1, height: 1)
-                    .opacity(0.001)
-                    .offset(x: -2000, y: -2000)
+                    .frame(width: 8, height: 8)
+                    .opacity(0.005)
                     .allowsHitTesting(false)
                     .zIndex(-10)
             }
