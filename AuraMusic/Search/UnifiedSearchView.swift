@@ -33,21 +33,23 @@ public final class UnifiedSearchViewModel: ObservableObject {
 
     public init() {}
 
-    public func triggerDebouncedSearch() {
+    public func clearResults() {
+        searchTask?.cancel()
+        groupedTrackResults = []
+        albumResults = []
+        artistResults = []
+        lyricMatchResults = []
+        isSearching = false
+    }
+
+    public func submitManualSearch() {
         searchTask?.cancel()
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
-            groupedTrackResults = []
-            albumResults = []
-            artistResults = []
-            lyricMatchResults = []
-            isSearching = false
+            clearResults()
             return
         }
-
         searchTask = Task {
-            try? await Task.sleep(nanoseconds: 340_000_000)
-            guard !Task.isCancelled else { return }
             await executeSearch(for: trimmed)
         }
     }
@@ -159,7 +161,34 @@ public struct UnifiedSearchView: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
-                    if viewModel.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    if !viewModel.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        Button {
+                            viewModel.submitManualSearch()
+                        } label: {
+                            HStack(spacing: 8) {
+                                Image(systemName: "magnifyingglass")
+                                    .font(.system(size: 14, weight: .bold))
+                                Text("Search \"\(viewModel.query)\"")
+                                    .font(.system(size: 15, weight: .bold))
+                                    .lineLimit(1)
+                                Spacer()
+                                Text("Tap or press Search")
+                                    .font(.system(size: 12, weight: .medium))
+                                    .opacity(0.85)
+                            }
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 11)
+                            .background(
+                                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                    .fill(AuraTheme.accentPink)
+                            )
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.horizontal, AuraTheme.horizontalMargin)
+                    }
+
+                    if viewModel.groupedTrackResults.isEmpty && viewModel.albumResults.isEmpty && viewModel.artistResults.isEmpty && !viewModel.isSearching {
                         emptyQueryDiscoveryContent
                     } else {
                         activeSearchResultsContent
@@ -174,13 +203,13 @@ public struct UnifiedSearchView: View {
                 placement: .navigationBarDrawer(displayMode: .always),
                 prompt: "Apple Music, Audius, YouTube, Spotify, Lyrics…"
             )
-            .onChange(of: viewModel.query) { _, _ in
-                viewModel.triggerDebouncedSearch()
+            .onChange(of: viewModel.query) { _, newValue in
+                if newValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    viewModel.clearResults()
+                }
             }
             .onSubmit(of: .search) {
-                Task {
-                    await viewModel.executeSearch(for: viewModel.query)
-                }
+                viewModel.submitManualSearch()
             }
         }
     }
