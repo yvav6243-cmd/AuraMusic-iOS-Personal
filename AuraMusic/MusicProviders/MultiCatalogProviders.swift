@@ -454,6 +454,29 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
         config.allowsInlineMediaPlayback = true
         config.mediaTypesRequiringUserActionForPlayback = []
 
+        // 1. Early script at document start: lock HTMLMediaElement.prototype.muted = false so YouTube cannot mute autoplay
+        let unmuteLockScriptSource = """
+        (function() {
+          try {
+            Object.defineProperty(HTMLMediaElement.prototype, 'muted', {
+              get: function() { return false; },
+              set: function(v) { try { this.removeAttribute('muted'); } catch(e) {} }
+            });
+            Object.defineProperty(HTMLMediaElement.prototype, 'defaultMuted', {
+              get: function() { return false; },
+              set: function(v) {}
+            });
+          } catch(e) {}
+        })();
+        """
+        let unmuteScript = WKUserScript(
+            source: unmuteLockScriptSource,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false
+        )
+        config.userContentController.addUserScript(unmuteScript)
+
+        // 2. Main audio bridge at document end
         let bridgeScriptSource = """
         (function() {
           if (window._auraBridgeInstalled) return;
@@ -461,19 +484,13 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
 
           var style = document.createElement('style');
           style.innerHTML = `
-            html, body { margin: 0 !important; padding: 0 !important; background: #000 !important; overflow: hidden !important; }
-            ytm-mobile-topbar-renderer, ytm-pivot-bar-renderer, ytm-item-section-renderer,
-            ytm-single-column-watch-next-results-renderer, ytm-companion-ad-renderer,
-            .player-controls-content, .ytp-chrome-top, .ytp-watermark { display: none !important; }
-            video {
-              position: fixed !important;
-              top: 0 !important;
-              left: 0 !important;
-              width: 100vw !important;
-              height: 100vh !important;
-              z-index: 2147483647 !important;
-              background: #000 !important;
-              object-fit: cover !important;
+            html, body, video {
+              margin: 0 !important;
+              padding: 0 !important;
+              background: transparent !important;
+              opacity: 0.001 !important;
+              overflow: hidden !important;
+              pointer-events: none !important;
             }
           `;
           if (document.head) {
@@ -484,57 +501,98 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
             });
           }
 
+          function forceUnmuteAndPlay(v) {
+            try {
+              v.muted = false;
+              v.defaultMuted = false;
+              v.removeAttribute('muted');
+              if (v.volume === 0) v.volume = 1.0;
+              v.setAttribute('playsinline', '');
+              v.setAttribute('webkit-playsinline', '');
+              var mp = document.getElementById('movie_player');
+              if (mp) {
+                if (mp.unMute) mp.unMute();
+                if (mp.setVolume && window._auraTargetVol !== undefined) mp.setVolume(window._auraTargetVol);
+                else if (mp.setVolume) mp.setVolume(100);
+                if (mp.playVideo && !window._auraUserPaused) mp.playVideo();
+              }
+              var unmuteBtn = document.querySelector('.ytp-unmute, button[aria-label*="Unmute"], button[aria-label*="unmute"], button[aria-label*="Звук"]');
+              if (unmuteBtn) { unmuteBtn.click(); }
+            } catch(e) {}
+          }
+
           window.auraControl = {
             play: function() {
+              window._auraUserPaused = false;
               var v = document.querySelector('video');
               if (v) {
-                v.muted = false;
-                v.setAttribute('playsinline', '');
-                v.setAttribute('webkit-playsinline', '');
-                v.play();
+                forceUnmuteAndPlay(v);
+                v.play().catch(function(){});
               }
             },
             pause: function() {
+              window._auraUserPaused = true;
               var v = document.querySelector('video');
-              if (v) {
-                window._auraUserPaused = true;
-                v.pause();
-              }
+              if (v) v.pause();
+              var mp = document.getElementById('movie_player');
+              if (mp && mp.pauseVideo) { try { mp.pauseVideo(); } catch(e) {} }
             },
             resume: function() {
+              window._auraUserPaused = false;
               var v = document.querySelector('video');
               if (v) {
-                window._auraUserPaused = false;
-                v.muted = false;
-                v.play();
+                forceUnmuteAndPlay(v);
+                v.play().catch(function(){});
               }
             },
             seek: function(sec) {
               var v = document.querySelector('video');
               if (v) {
                 v.currentTime = sec;
-                if (!window._auraUserPaused) v.play();
+                if (!window._auraUserPaused) {
+                  forceUnmuteAndPlay(v);
+                  v.play().catch(function(){});
+                }
               }
             },
             setVolume: function(vol) {
+              window._auraTargetVol = vol;
               var v = document.querySelector('video');
               if (v) {
                 v.volume = Math.max(0.0, Math.min(1.0, vol / 100.0));
               }
+              var mp = document.getElementById('movie_player');
+              if (mp && mp.setVolume) { try { mp.setVolume(vol); } catch(e) {} }
             }
           };
 
+          var ticksWithoutVideo = 0;
           setInterval(function() {
             var skipBtn = document.querySelector('.ytp-ad-skip-button, .ytp-ad-skip-button-modern, .ytp-skip-ad-button');
             if (skipBtn) { try { skipBtn.click(); } catch(e) {} }
 
-            var v = document.querySelector('video');
-            if (!v) return;
-            v.setAttribute('playsinline', '');
-            v.setAttribute('webkit-playsinline', '');
+            var errBox = document.querySelector('.player-error-message-container, ytm-playability-error-supported-renderers');
+            if (errBox && errBox.innerText && errBox.innerText.length > 3) {
+              if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.auraYT) {
+                window.webkit.messageHandlers.auraYT.postMessage({ type: 'error', currentTime: 0, duration: 0, state: -99 });
+                return;
+              }
+            }
 
-            if (!window._auraUserPaused && v.paused && !v.ended && v.readyState >= 2) {
-              v.muted = false;
+            var v = document.querySelector('video');
+            if (!v) {
+              ticksWithoutVideo++;
+              if (ticksWithoutVideo > 28 && window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.auraYT) {
+                ticksWithoutVideo = 0;
+                window.webkit.messageHandlers.auraYT.postMessage({ type: 'error', currentTime: 0, duration: 0, state: -99 });
+              }
+              return;
+            }
+            ticksWithoutVideo = 0;
+
+            forceUnmuteAndPlay(v);
+
+            if (!window._auraUserPaused && v.paused && !v.ended && v.readyState >= 1) {
               v.play().catch(function(){});
             }
 
@@ -565,7 +623,7 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
         webView.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"
         webView.scrollView.isScrollEnabled = false
         webView.isOpaque = false
-        webView.backgroundColor = .black
+        webView.backgroundColor = .clear
         context.coordinator.webView = webView
         playerEngine.registerYouTubeWebView(webView)
         return webView
