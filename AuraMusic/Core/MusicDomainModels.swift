@@ -204,7 +204,9 @@ public struct UniversalTrack: Identifiable, Codable, Hashable, Sendable {
                 return .preview30s
             }
             return .externalApp
-        case .youtubeMusic, .youtube:
+        case .youtubeMusic:
+            return .directFullAudio
+        case .youtube:
             return .embeddedVideo
         case .spotify:
             if previewURL != nil {
@@ -248,7 +250,7 @@ public struct TrackVariantGroup: Identifiable, Hashable, Sendable {
         return result
     }
 
-    /// Picks the best directly playable variant (offline > direct full stream > MusicKit > preview > embedded video > external)
+    /// Automatically inspects which APIs are configured and picks the best full-track playable variant
     public var bestPlayableVariant: UniversalTrack {
         let sorted = variants.sorted { lhs, rhs in
             priorityScore(for: lhs) > priorityScore(for: rhs)
@@ -257,13 +259,27 @@ public struct TrackVariantGroup: Identifiable, Hashable, Sendable {
     }
 
     private func priorityScore(for track: UniversalTrack) -> Int {
-        switch track.playbackCapability {
-        case .offlineFile: return 100
-        case .directFullAudio: return 90
-        case .appleMusicKit: return 80
-        case .preview30s: return 60
-        case .embeddedVideo: return 50
-        case .externalApp: return 20
+        if track.localFileRelativePath != nil || track.provider == .localFile {
+            return 100
+        }
+        let hasYouTubeKey = !(ProviderCredentialsStore.readKeychain(key: "aura.token.youtube") ?? "").isEmpty
+        let hasSoundCloudKey = !(ProviderCredentialsStore.readKeychain(key: "aura.token.soundcloud") ?? "").isEmpty
+
+        switch track.provider {
+        case .localFile:
+            return 100
+        case .youtubeMusic:
+            return hasYouTubeKey ? 95 : 40
+        case .audius, .radio:
+            return 92
+        case .soundCloud:
+            return (hasSoundCloudKey && track.isStreamable) ? 90 : 35
+        case .appleMusic:
+            return track.isStreamable ? 96 : 60
+        case .youtube:
+            return hasYouTubeKey ? 85 : 30
+        case .spotify:
+            return track.previewURL != nil ? 55 : 20
         }
     }
 }
