@@ -313,10 +313,15 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
 
         case .audius, .radio:
             if let resolvedURL = try? await audiusProvider.resolvePlayableStreamURL(for: track) ?? track.streamURL {
-                if track.provider == .radio || (await verifyHTTPStreamPlayable(url: resolvedURL)) {
+                if track.provider == .radio {
                     startAVPlayer(with: resolvedURL, for: track, banner: nil)
                 } else {
-                    await attemptCrossProviderFallback(for: track)
+                    let isPlayable = await verifyHTTPStreamPlayable(url: resolvedURL)
+                    if isPlayable {
+                        startAVPlayer(with: resolvedURL, for: track, banner: nil)
+                    } else {
+                        await attemptCrossProviderFallback(for: track)
+                    }
                 }
             } else if let direct = track.streamURL {
                 startAVPlayer(with: direct, for: track, banner: nil)
