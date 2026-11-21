@@ -303,6 +303,115 @@ public final class YouTubeMusicProvider: MusicProviderProtocol, @unchecked Senda
 
     public static let iosPlayerUserAgent = "com.google.ios.youtube/20.03.02 (iPhone16,2; U; CPU iOS 18_2_1 like Mac OS X;)"
 
+    /// Extracts an 11-character YouTube video ID from any youtube.com, youtu.be, or music.youtube.com link
+    public static func extractYouTubeVideoID(from rawInput: String) -> String? {
+        let trimmed = rawInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.lowercased().contains("youtu.be") || trimmed.lowercased().contains("youtube.com") else {
+            return nil
+        }
+        if let components = URLComponents(string: trimmed) {
+            if let vParam = components.queryItems?.first(where: { $0.name == "v" })?.value,
+               vParam.count >= 11 {
+                return String(vParam.prefix(11))
+            }
+            let pathParts = components.path.split(separator: "/").map(String.init)
+            if let host = components.host?.lowercased(), host.contains("youtu.be"), let first = pathParts.first, first.count >= 11 {
+                return String(first.prefix(11))
+            }
+            if let idx = pathParts.firstIndex(where: { $0 == "shorts" || $0 == "embed" || $0 == "live" || $0 == "v" }),
+               pathParts.count > idx + 1 {
+                return String(pathParts[idx + 1].prefix(11))
+            }
+        }
+        let pattern = "(?:v=|youtu\\.be/|embed/|shorts/)([A-Za-z0-9_-]{11})"
+        if let regex = try? NSRegularExpression(pattern: pattern),
+           let match = regex.firstMatch(in: trimmed, range: NSRange(trimmed.startIndex..<trimmed.endIndex, in: trimmed)),
+           let r = Range(match.range(at: 1), in: trimmed) {
+            return String(trimmed[r])
+        }
+        return nil
+    }
+
+    /// Resolves a pasted YouTube / YouTube Music URL into a full UniversalTrack with clean title, artist, cover, and lyrics compatibility
+    public func resolveTrackFromYouTubeURL(_ rawURLString: String) async -> UniversalTrack? {
+        guard let videoID = Self.extractYouTubeVideoID(from: rawURLString) else {
+            return nil
+        }
+        let apiKey = ProviderCredentialsStore.readKeychain(key: "aura.token.youtube") ?? "AIzaSyCHoPSdrgYinPSDvIn1dbIFyWjnLdgJ8ww"
+
+        var rawTitle = "YouTube Track"
+        var rawChannel = "YouTube Music"
+        var thumbURL: URL? = URL(string: "https://i.ytimg.com/vi/\(videoID)/hqdefault.jpg")
+        var durationSeconds: TimeInterval = 210
+
+        // 1. Query official YouTube Data API v3 /videos endpoint for exact title, channel, and duration
+        var components = URLComponents(string: "https://www.googleapis.com/youtube/v3/videos")!
+        components.queryItems = [
+            URLQueryItem(name: "part", value: "snippet,contentDetails"),
+            URLQueryItem(name: "id", value: videoID),
+            URLQueryItem(name: "key", value: apiKey)
+        ]
+        if let url = components.url,
+           let (data, _) = try? await session.data(from: url),
+           let decoded = try? JSONDecoder().decode(YouTubeFullVideoListResponse.self, from: data),
+           let item = decoded.items.first {
+            rawTitle = Self.decodeHTMLEntities(item.snippet.title)
+            rawChannel = Self.decodeHTMLEntities(item.snippet.channelTitle)
+            if let hi = item.snippet.thumbnails.high?.url ?? item.snippet.thumbnails.medium?.url,
+               let parsedThumb = URL(string: hi) {
+                thumbURL = parsedThumb
+            }
+            if let isoDur = item.contentDetails?.duration {
+                durationSeconds = Self.parseISO8601Duration(isoDur)
+            }
+        } else {
+            // 2. Fallback to YouTube's official oEmbed metadata endpoint
+            var oembed = URLComponents(string: "https://www.youtube.com/oembed")!
+            oembed.queryItems = [
+                URLQueryItem(name: "url", value: "https://www.youtube.com/watch?v=\(videoID)"),
+                URLQueryItem(name: "format", value: "json")
+            ]
+            if let oURL = oembed.url,
+               let (oData, _) = try? await session.data(from: oURL),
+               let oJSON = try? JSONSerialization.jsonObject(with: oData) as? [String: Any] {
+                if let t = oJSON["title"] as? String { rawTitle = t }
+                if let a = oJSON["author_name"] as? String { rawChannel = a }
+                if let th = oJSON["thumbnail_url"] as? String, let u = URL(string: th) { thumbURL = u }
+            }
+        }
+
+        let cleaned = LyricsService.extractCleanTitleAndArtist(
+            rawTitle: Self.cleanStudioTrackTitle(rawTitle),
+            rawArtist: rawChannel
+        )
+
+        var albumName = "YouTube Music"
+        // Try upgrading to crisp 600x600 square default album cover from catalog metadata
+        if let appleMatches = try? await AppleMusicProvider().searchTracks(query: "\(cleaned.title) \(cleaned.artist)", limit: 1),
+           let match = appleMatches.first {
+            if let sqArt = match.artworkURL {
+                thumbURL = sqArt
+            }
+            if match.album != "Single" {
+                albumName = match.album
+            }
+        }
+
+        return UniversalTrack(
+            provider: .youtubeMusic,
+            providerTrackID: videoID,
+            title: cleaned.title,
+            artist: cleaned.artist,
+            album: albumName,
+            artworkURL: thumbURL,
+            duration: durationSeconds,
+            externalDeepLink: URL(string: "https://www.youtube.com/watch?v=\(videoID)"),
+            isStreamable: true,
+            isDownloadPermitted: true,
+            audioQualityBadge: "YT MUSIC"
+        )
+    }
+
     public func searchAlbums(query: String, limit: Int = 10) async throws -> [UniversalAlbum] { [] }
     public func searchArtists(query: String, limit: Int = 10) async throws -> [UniversalArtist] { [] }
     public func fetchTopCharts(limit: Int = 15) async throws -> [UniversalTrack] {
@@ -435,6 +544,18 @@ private struct YouTubeVideoDetailsResponse: Codable {
     var items: [Item]
 }
 
+private struct YouTubeFullVideoListResponse: Codable {
+    struct ContentDetails: Codable {
+        var duration: String
+    }
+    struct Item: Codable {
+        var id: String
+        var snippet: YouTubeSearchListResponse.Snippet
+        var contentDetails: ContentDetails?
+    }
+    var items: [Item]
+}
+
 // MARK: - Full-Length Mobile YouTube Music WebKit Audio/Video Engine Bridge
 
 public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
@@ -558,33 +679,31 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
             });
           }
 
-          function forceUnmuteAndPlay(v) {
+          function ensureUnmutedIfNeeded(v) {
             try {
-              v.muted = false;
-              v.defaultMuted = false;
-              v.removeAttribute('muted');
-              if (v.volume === 0) v.volume = 1.0;
               v.setAttribute('playsinline', '');
               v.setAttribute('webkit-playsinline', '');
-              var mp = document.getElementById('movie_player');
-              if (mp) {
-                if (mp.unMute) mp.unMute();
-                if (mp.setVolume && window._auraTargetVol !== undefined) mp.setVolume(window._auraTargetVol);
-                else if (mp.setVolume) mp.setVolume(100);
-                if (mp.playVideo && !window._auraUserPaused) mp.playVideo();
+              if (v.muted || v.volume === 0) {
+                v.muted = false;
+                v.defaultMuted = false;
+                v.removeAttribute('muted');
+                v.volume = (window._auraTargetVol !== undefined) ? Math.max(0.05, window._auraTargetVol / 100.0) : 1.0;
+                var mp = document.getElementById('movie_player');
+                if (mp && mp.unMute) mp.unMute();
+                var unmuteBtn = document.querySelector('.ytp-unmute, button[aria-label*="Unmute"], button[aria-label*="unmute"], button[aria-label*="Звук"]');
+                if (unmuteBtn) { unmuteBtn.click(); }
               }
-              var unmuteBtn = document.querySelector('.ytp-unmute, button[aria-label*="Unmute"], button[aria-label*="unmute"], button[aria-label*="Звук"]');
-              if (unmuteBtn) { unmuteBtn.click(); }
             } catch(e) {}
           }
 
           window.auraControl = {
             play: function() {
               window._auraUserPaused = false;
+              window._auraAllowPause = false;
               var v = document.querySelector('video');
               if (v) {
-                forceUnmuteAndPlay(v);
-                v.play().catch(function(){});
+                ensureUnmutedIfNeeded(v);
+                if (v.paused) { v.play().catch(function(){}); }
               }
             },
             pause: function() {
@@ -601,16 +720,19 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
               window._auraAllowPause = false;
               var v = document.querySelector('video');
               if (v) {
-                forceUnmuteAndPlay(v);
-                v.play().catch(function(){});
+                ensureUnmutedIfNeeded(v);
+                // Only call play() if actually paused — prevents audio buffer hitch during background/foreground transitions
+                if (v.paused && !v.ended) {
+                  v.play().catch(function(){});
+                }
               }
             },
             seek: function(sec) {
               var v = document.querySelector('video');
               if (v) {
                 v.currentTime = sec;
-                if (!window._auraUserPaused) {
-                  forceUnmuteAndPlay(v);
+                if (!window._auraUserPaused && v.paused) {
+                  ensureUnmutedIfNeeded(v);
                   v.play().catch(function(){});
                 }
               }
@@ -673,7 +795,7 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
               v.addEventListener('ended', function() { postCurrentVideoTick(v); });
             }
 
-            forceUnmuteAndPlay(v);
+            ensureUnmutedIfNeeded(v);
 
             if (!window._auraUserPaused && v.paused && !v.ended && v.readyState >= 1) {
               v.play().catch(function(){});
