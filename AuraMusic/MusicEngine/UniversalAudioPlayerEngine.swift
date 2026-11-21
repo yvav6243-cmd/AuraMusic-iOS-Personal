@@ -61,6 +61,9 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     private var itemStatusObservation: NSKeyValueObservation?
     private var sleepTimerTask: Task<Void, Never>?
     private var youtubeWatchdogTask: Task<Void, Never>?
+    private var youtubeClockInterpolatorTask: Task<Void, Never>?
+    private var lastYouTubeJSTickWallTime: TimeInterval = 0
+    private var hasReceivedFirstYouTubeProgressTick: Bool = false
     private var fallbackYouTubeVideoIDs: [String] = []
     private var crossfadeTriggeredForCurrentItem = false
 
@@ -85,8 +88,12 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
 
     public func handleYouTubePlayerEvent(currentTime: Double, duration: Double, stateCode: Int) {
         guard activeYouTubeVideoID != nil else { return }
-        if currentTime.isFinite && currentTime >= 0 && abs(currentTime - self.currentTime) >= 0.22 {
-            self.currentTime = currentTime
+        if currentTime.isFinite && currentTime > 0.05 {
+            hasReceivedFirstYouTubeProgressTick = true
+            lastYouTubeJSTickWallTime = CACurrentMediaTime()
+            if abs(currentTime - self.currentTime) >= 0.12 {
+                self.currentTime = currentTime
+            }
         }
         if duration.isFinite && duration > 0 && abs(duration - self.duration) >= 0.5 {
             self.duration = duration
@@ -123,14 +130,37 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
 
     private func startFullLengthYouTubeMusicPlayback(videoID: String, for track: UniversalTrack) {
         youtubeWatchdogTask?.cancel()
+        youtubeClockInterpolatorTask?.cancel()
         primaryPlayer.pause()
         ApplicationMusicPlayer.shared.pause()
         fallbackYouTubeVideoIDs = []
+        hasReceivedFirstYouTubeProgressTick = false
+        lastYouTubeJSTickWallTime = CACurrentMediaTime()
         activeYouTubeVideoID = videoID
         isBuffering = false
         isPlaying = true
         playbackStatusBanner = nil
         refreshNowPlayingMetadata()
+
+        // Native Swift 150ms smooth clock interpolator so lyrics highlight & scroll continuously even if WebKit throttles JS timers
+        youtubeClockInterpolatorTask = Task { @MainActor in
+            while !Task.isCancelled && self.activeYouTubeVideoID != nil {
+                try? await Task.sleep(nanoseconds: 150_000_000)
+                guard !Task.isCancelled,
+                      self.activeYouTubeVideoID != nil,
+                      self.isPlaying,
+                      self.hasReceivedFirstYouTubeProgressTick else {
+                    continue
+                }
+                let elapsedSinceJSTick = CACurrentMediaTime() - self.lastYouTubeJSTickWallTime
+                if elapsedSinceJSTick >= 0.16 {
+                    let maxDur = self.duration > 0 ? self.duration : 240
+                    if self.currentTime + 0.15 < maxDur {
+                        self.currentTime += 0.15
+                    }
+                }
+            }
+        }
 
         // Pre-fetch backup audio videoIDs so if a clip is age/region restricted, we seamlessly switch to an alternate audio upload
         Task {
