@@ -20,12 +20,12 @@ public struct AppleMusicPlayerOverlayView: View {
 
     public var body: some View {
         ZStack(alignment: .bottom) {
-            // Keep YouTube Music audio bridge alive even when mini-player is collapsed or lyrics tab is active
+            // Keep YouTube Music audio bridge alive with >= 200x200 viewport required by YouTube HTML5 IFrame API
             if let videoID = player.activeYouTubeVideoID,
                (!player.isPlayerExpanded || !player.isYouTubeVideoVisible || player.activeOverlayTab != .none) {
                 AuthorizedYouTubeIFramePlayerView(videoID: videoID)
-                    .frame(width: 2, height: 2)
-                    .opacity(0.01)
+                    .frame(width: 220, height: 220)
+                    .opacity(0.015)
                     .allowsHitTesting(false)
             }
 
