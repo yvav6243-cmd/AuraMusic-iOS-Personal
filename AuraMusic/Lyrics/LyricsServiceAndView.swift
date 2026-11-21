@@ -260,7 +260,7 @@ public final class LyricsService: ObservableObject {
     }
 
     /// Splits composite titles like "Miyagi & Эндшпиль feat. Рем Дигга - I Got Love (Official Video)" into ("I Got Love", "Miyagi & Эндшпиль")
-    public static func extractCleanTitleAndArtist(rawTitle: String, rawArtist: String) -> (title: String, artist: String) {
+    nonisolated public static func extractCleanTitleAndArtist(rawTitle: String, rawArtist: String) -> (title: String, artist: String) {
         var workingTitle = rawTitle
         var workingArtist = rawArtist
             .replacingOccurrences(of: " - Topic", with: "")
@@ -347,7 +347,7 @@ public final class LyricsService: ObservableObject {
     }
 
     /// Selects the best lyric entry while strictly preserving the song's original language and rejecting English translations/romanizations
-    private static func selectBestOriginalLanguageCandidate(
+    nonisolated private static func selectBestOriginalLanguageCandidate(
         from candidates: [LRCLIBEntryDTO],
         referenceText: String,
         targetDuration: TimeInterval
@@ -405,7 +405,7 @@ public final class LyricsService: ObservableObject {
         return scored.max(by: { $0.score < $1.score })?.dto
     }
 
-    private static func containsScript(_ text: String, pattern: String) -> Bool {
+    nonisolated private static func containsScript(_ text: String, pattern: String) -> Bool {
         guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
             return false
         }
