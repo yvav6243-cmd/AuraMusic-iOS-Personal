@@ -46,15 +46,17 @@ public final class ProviderCredentialsStore: ObservableObject {
         self.appleMusicDeveloperToken = Self.readKeychain(key: "aura.token.appleMusic") ?? ""
         let savedYT = Self.readKeychain(key: "aura.token.youtube") ?? ""
         let verifiedWorkingYTKey = "AIzaSyCHoPSdrgYinPSDvIn1dbIFyWjnLdgJ8ww"
+        let resolvedYTKey: String
         if savedYT.isEmpty || savedYT == "AIzaSyCQhB2utBO9vGfh_dl1fmv3Aya-cd33FfQ" {
-            self.youtubeAPIKey = verifiedWorkingYTKey
-            saveKeychain(key: "aura.token.youtube", value: verifiedWorkingYTKey)
+            resolvedYTKey = verifiedWorkingYTKey
         } else {
-            self.youtubeAPIKey = savedYT
+            resolvedYTKey = savedYT
         }
+        self.youtubeAPIKey = resolvedYTKey
         self.spotifyClientID = Self.readKeychain(key: "aura.token.spotifyClientID") ?? ""
         self.spotifyAccessToken = Self.readKeychain(key: "aura.token.spotifyAccess") ?? ""
         self.soundCloudClientID = Self.readKeychain(key: "aura.token.soundcloud") ?? ""
+        saveKeychain(key: "aura.token.youtube", value: resolvedYTKey)
         refreshActiveProviderPriority()
     }
 
