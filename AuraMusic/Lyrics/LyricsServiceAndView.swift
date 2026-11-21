@@ -89,14 +89,12 @@ public enum LRCParser {
 
         let sorted = parsedEntries.sorted { $0.timestamp < $1.timestamp }
         return sorted.enumerated().map { idx, item in
-            let parts = item.text.components(separatedBy: " // ")
-            let original = parts.first ?? item.text
-            let translation = parts.count > 1 ? parts[1] : nil
+            let original = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
             return SyncedLyricLine(
                 index: idx,
                 timestamp: item.timestamp,
                 text: original.isEmpty ? "•••" : original,
-                translatedText: translation
+                translatedText: nil
             )
         }
     }
@@ -174,45 +172,60 @@ public final class LyricsService: ObservableObject {
             return
         }
 
-        // 2. Multi-stage LRCLIB search prioritizing time-synchronized LRC lyrics
+        // 2. Multi-stage LRCLIB search prioritizing time-synchronized LRC lyrics in the ORIGINAL language
+        let referenceScriptText = "\(track.title) \(track.artist) \(parsedTitle) \(parsedArtist)"
         do {
-            var resolvedDTO = try await fetchExactLRCLIB(title: parsedTitle, artist: parsedArtist, album: track.album, duration: track.duration)
+            var allCandidates: [LRCLIBEntryDTO] = []
 
-            if resolvedDTO == nil || resolvedDTO?.syncedLyrics == nil {
-                let candidates1 = try await searchLRCLIB(title: parsedTitle, artist: parsedArtist)
-                if let bestSynced = candidates1.first(where: { !($0.syncedLyrics ?? "").isEmpty }) {
-                    resolvedDTO = bestSynced
-                } else if resolvedDTO == nil {
-                    resolvedDTO = candidates1.first(where: { !($0.plainLyrics ?? "").isEmpty })
+            if let exact = try? await fetchExactLRCLIB(title: parsedTitle, artist: parsedArtist, album: track.album, duration: track.duration) {
+                allCandidates.append(exact)
+            }
+
+            if let search1 = try? await searchLRCLIB(title: parsedTitle, artist: parsedArtist) {
+                allCandidates.append(contentsOf: search1)
+            }
+
+            // If no synced lyrics found yet, try searching by clean title alone
+            if !allCandidates.contains(where: { !($0.syncedLyrics ?? "").isEmpty }) {
+                if let search2 = try? await searchLRCLIB(title: parsedTitle, artist: "") {
+                    allCandidates.append(contentsOf: search2)
                 }
             }
 
-            if resolvedDTO == nil {
-                // Fallback: search by cleaned song title alone if artist channel name differed
-                let candidates2 = try await searchLRCLIB(title: parsedTitle, artist: "")
-                resolvedDTO = candidates2.first(where: { !($0.syncedLyrics ?? "").isEmpty })
-                    ?? candidates2.first(where: { !($0.plainLyrics ?? "").isEmpty })
+            // Stage 3: Resolve canonical song title & artist via iTunes catalog metadata if YouTube title was heavily stylized
+            if !allCandidates.contains(where: { !($0.syncedLyrics ?? "").isEmpty }) {
+                if let canonical = await resolveCanonicalMetadataFromCatalog(query: "\(parsedTitle) \(parsedArtist)") {
+                    if let search3 = try? await searchLRCLIB(title: canonical.title, artist: canonical.artist) {
+                        allCandidates.append(contentsOf: search3)
+                    }
+                    if !allCandidates.contains(where: { !($0.syncedLyrics ?? "").isEmpty }),
+                       let search4 = try? await searchLRCLIB(title: canonical.title, artist: "") {
+                        allCandidates.append(contentsOf: search4)
+                    }
+                }
             }
 
-            if let dto = resolvedDTO {
+            if let bestDTO = Self.selectBestOriginalLanguageCandidate(
+                from: allCandidates,
+                referenceText: referenceScriptText,
+                targetDuration: track.duration
+            ) {
                 cacheLyrics(
                     cacheKey: cacheKey,
                     title: track.title,
                     artist: track.artist,
-                    syncedLRC: dto.syncedLyrics,
-                    plainLyrics: dto.plainLyrics
+                    syncedLRC: bestDTO.syncedLyrics,
+                    plainLyrics: bestDTO.plainLyrics
                 )
                 self.currentDocument = buildDocument(
                     title: track.title,
                     artist: track.artist,
-                    syncedLRC: dto.syncedLyrics,
-                    plainLyrics: dto.plainLyrics
+                    syncedLRC: bestDTO.syncedLyrics,
+                    plainLyrics: bestDTO.plainLyrics
                 )
                 self.isLoading = false
                 return
             }
-        } catch {
-            // Fall through
         }
 
         self.currentDocument = nil
@@ -220,7 +233,7 @@ public final class LyricsService: ObservableObject {
         self.isLoading = false
     }
 
-    /// Splits composite titles like "The Weeknd - Starboy (Official Audio) ft. Daft Punk" into ("Starboy", "The Weeknd")
+    /// Splits composite titles like "Miyagi & Эндшпиль feat. Рем Дигга - I Got Love (Official Video)" into ("I Got Love", "Miyagi & Эндшпиль")
     public static func extractCleanTitleAndArtist(rawTitle: String, rawArtist: String) -> (title: String, artist: String) {
         var workingTitle = rawTitle
         var workingArtist = rawArtist
@@ -228,21 +241,34 @@ public final class LyricsService: ObservableObject {
             .replacingOccurrences(of: "VEVO", with: "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
-        // Strip parenthetical & bracketed noise
-        let noisePatterns = [
-            "\\([^)]*(?:official|audio|video|lyric|remaster|visualizer|feat\\.|ft\\.|live|hd|4k)[^)]*\\)",
-            "\\[[^\\]]*(?:official|audio|video|lyric|remaster|visualizer|feat\\.|ft\\.|live|hd|4k)[^\\]]*\\]",
-            "(?i)\\b(?:feat\\.?|ft\\.?)\\s+.+$"
+        // 1. Handle Japanese/Asian corner brackets e.g. YOASOBI「アイドル」Official Music Video
+        if let openBracket = workingTitle.firstIndex(of: "「"),
+           let closeBracket = workingTitle.firstIndex(of: "」"),
+           openBracket < closeBracket {
+            let prefixArtist = String(workingTitle[..<openBracket]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let insideTitle = String(workingTitle[workingTitle.index(after: openBracket)..<closeBracket]).trimmingCharacters(in: .whitespacesAndNewlines)
+            if !insideTitle.isEmpty {
+                workingTitle = insideTitle
+                if !prefixArtist.isEmpty {
+                    workingArtist = prefixArtist
+                }
+            }
+        }
+
+        // 2. Strip parenthetical & bracketed video/audio noise in both Russian and English FIRST
+        let bracketPatterns = [
+            "\\([^)]*(?:official|audio|video|lyric|remaster|visualizer|live|hd|4k|клип|видео|аудио|премьера|официальн|текст|музыка|ost|prod)[^)]*\\)",
+            "\\[[^\\]]*(?:official|audio|video|lyric|remaster|visualizer|live|hd|4k|клип|видео|аудио|премьера|официальн|текст|музыка|ost|prod)[^\\]]*\\]"
         ]
-        for pattern in noisePatterns {
+        for pattern in bracketPatterns {
             if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
                 let range = NSRange(workingTitle.startIndex..<workingTitle.endIndex, in: workingTitle)
                 workingTitle = regex.stringByReplacingMatches(in: workingTitle, range: range, withTemplate: "")
             }
         }
 
-        // If title contains "Artist - Song", separate them
-        let separators = [" - ", " – ", " — "]
+        // 3. Split "Artist - Song" BEFORE stripping feat./ft. so "Artist feat. Guest - Song" keeps "Song"!
+        let separators = [" - ", " – ", " — ", " ~ "]
         for sep in separators {
             if workingTitle.contains(sep) {
                 let parts = workingTitle.components(separatedBy: sep)
@@ -256,12 +282,127 @@ public final class LyricsService: ObservableObject {
             }
         }
 
+        // 4. Now strip trailing feat./ft./prod. from both title and artist
+        let featPatterns = [
+            "\\([^)]*(?:feat\\.?|ft\\.?|prod\\.?)[^)]*\\)",
+            "\\[[^\\]]*(?:feat\\.?|ft\\.?|prod\\.?)[^\\]]*\\]",
+            "(?i)\\b(?:feat\\.?|ft\\.?|prod\\.?)\\s+.+$",
+            "(?i)\\b(?:official\\s+music\\s+video|official\\s+video|official\\s+audio|lyric\\s+video|премьера\\s+клипа|официальный\\s+клип).*$"
+        ]
+        for pattern in featPatterns {
+            if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
+                let titleRange = NSRange(workingTitle.startIndex..<workingTitle.endIndex, in: workingTitle)
+                workingTitle = regex.stringByReplacingMatches(in: workingTitle, range: titleRange, withTemplate: "")
+                let artistRange = NSRange(workingArtist.startIndex..<workingArtist.endIndex, in: workingArtist)
+                workingArtist = regex.stringByReplacingMatches(in: workingArtist, range: artistRange, withTemplate: "")
+            }
+        }
+
         if let artistComma = workingArtist.components(separatedBy: ",").first {
             workingArtist = artistComma.trimmingCharacters(in: .whitespacesAndNewlines)
         }
+        if let artistAmp = workingArtist.components(separatedBy: "&").first {
+            let trimmedAmp = artistAmp.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmedAmp.isEmpty {
+                workingArtist = trimmedAmp
+            }
+        }
 
-        let finalTitle = workingTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-        return (finalTitle.isEmpty ? rawTitle : finalTitle, workingArtist.isEmpty ? rawArtist : workingArtist)
+        let finalTitle = workingTitle
+            .replacingOccurrences(of: "\"", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let finalArtist = workingArtist
+            .replacingOccurrences(of: "\"", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        return (finalTitle.isEmpty ? rawTitle : finalTitle, finalArtist.isEmpty ? rawArtist : finalArtist)
+    }
+
+    /// Selects the best lyric entry while strictly preserving the song's original language and rejecting English translations/romanizations
+    private static func selectBestOriginalLanguageCandidate(
+        from candidates: [LRCLIBEntryDTO],
+        referenceText: String,
+        targetDuration: TimeInterval
+    ) -> LRCLIBEntryDTO? {
+        let valid = candidates.filter { !($0.syncedLyrics ?? "").isEmpty || !($0.plainLyrics ?? "").isEmpty }
+        guard !valid.isEmpty else { return nil }
+
+        let expectsCyrillic = containsScript(referenceText, pattern: "\\p{Cyrillic}")
+        let expectsJapanese = containsScript(referenceText, pattern: "[\\p{Hiragana}\\p{Katakana}]")
+        let expectsKorean = containsScript(referenceText, pattern: "\\p{Hangul}")
+
+        let scored = valid.map { item -> (dto: LRCLIBEntryDTO, score: Int) in
+            let textSample = (item.syncedLyrics ?? item.plainLyrics ?? "")
+            let metaSample = "\(item.trackName) \(item.albumName ?? "")"
+            var score = 0
+
+            // Strongly prefer time-synchronized LRC lyrics
+            if !(item.syncedLyrics ?? "").isEmpty {
+                score += 100
+            }
+
+            // Penalize any entry marked as a translation or romanization
+            if metaSample.range(of: "translation|translated|romanized|romaji|перевод|english ver", options: .regularExpression) != nil {
+                score -= 250
+            }
+
+            // Enforce original script preservation
+            let hasCyrillic = containsScript(textSample, pattern: "\\p{Cyrillic}")
+            let hasJapanese = containsScript(textSample, pattern: "[\\p{Hiragana}\\p{Katakana}]")
+            let hasKorean = containsScript(textSample, pattern: "\\p{Hangul}")
+
+            if expectsCyrillic {
+                score += hasCyrillic ? 150 : -120
+            } else if expectsJapanese {
+                score += hasJapanese ? 150 : -150
+            } else if expectsKorean {
+                score += hasKorean ? 150 : -150
+            }
+
+            // Duration proximity bonus
+            if targetDuration > 20, let itemDur = item.duration, itemDur > 20 {
+                let delta = abs(targetDuration - itemDur)
+                if delta <= 3 {
+                    score += 40
+                } else if delta <= 10 {
+                    score += 20
+                } else if delta > 45 {
+                    score -= 30
+                }
+            }
+
+            return (item, score)
+        }
+
+        return scored.max(by: { $0.score < $1.score })?.dto
+    }
+
+    private static func containsScript(_ text: String, pattern: String) -> Bool {
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+            return false
+        }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return regex.firstMatch(in: text, range: range) != nil
+    }
+
+    private func resolveCanonicalMetadataFromCatalog(query: String) async -> (title: String, artist: String)? {
+        var components = URLComponents(string: "https://itunes.apple.com/search")!
+        components.queryItems = [
+            URLQueryItem(name: "term", value: query),
+            URLQueryItem(name: "media", value: "music"),
+            URLQueryItem(name: "entity", value: "song"),
+            URLQueryItem(name: "limit", value: "1")
+        ]
+        guard let url = components.url,
+              let (data, _) = try? await session.data(from: url),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let results = json["results"] as? [[String: Any]],
+              let first = results.first,
+              let trackName = first["trackName"] as? String,
+              let artistName = first["artistName"] as? String else {
+            return nil
+        }
+        return Self.extractCleanTitleAndArtist(rawTitle: trackName, rawArtist: artistName)
     }
 
     public func manualLyricsSearch(songTitle: String, artistName: String) async throws -> [LRCLIBEntryDTO] {
