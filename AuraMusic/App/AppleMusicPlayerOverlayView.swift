@@ -348,6 +348,18 @@ public struct AppleMusicPlayerOverlayView: View {
 
             Spacer()
 
+            // Direct 1-Tap Offline Download Button on Expanded Player
+            Button {
+                downloadManager.enqueueDownload(for: track)
+            } label: {
+                let isDownloaded = downloadManager.isDownloaded(track.id)
+                Image(systemName: isDownloaded ? "checkmark.circle.fill" : "arrow.down.circle.fill")
+                    .font(.system(size: 17, weight: .bold))
+                    .foregroundStyle(isDownloaded ? Color.green : .white)
+                    .frame(width: 34, height: 34)
+                    .background(Circle().fill(.white.opacity(0.16)))
+            }
+
             Button {
                 persistence.toggleFavorite(track)
             } label: {
