@@ -7,6 +7,7 @@ public struct AppleMusicPlayerOverlayView: View {
     @ObservedObject var player: UniversalAudioPlayerEngine = .shared
     @ObservedObject var persistence: PersistenceController = .shared
     @ObservedObject var downloadManager: OfflineDownloadManager = .shared
+    @ObservedObject var lyricsService: LyricsService = .shared
 
     @Namespace private var playerAnimationNamespace
     @State private var dragOffset: CGFloat = 0
@@ -19,6 +20,15 @@ public struct AppleMusicPlayerOverlayView: View {
 
     public var body: some View {
         ZStack(alignment: .bottom) {
+            // Keep YouTube Music audio bridge alive even when mini-player is collapsed or lyrics tab is active
+            if let videoID = player.activeYouTubeVideoID,
+               (!player.isPlayerExpanded || !player.isYouTubeVideoVisible || player.activeOverlayTab != .none) {
+                AuthorizedYouTubeIFramePlayerView(videoID: videoID)
+                    .frame(width: 2, height: 2)
+                    .opacity(0.01)
+                    .allowsHitTesting(false)
+            }
+
             if let track = player.currentTrack {
                 if player.isPlayerExpanded {
                     expandedFullScreenPlayer(track: track)
@@ -202,13 +212,52 @@ public struct AppleMusicPlayerOverlayView: View {
         }
     }
 
-    // MARK: - Center Artwork / Authorized YouTube IFrame Section
+    // MARK: - Center Artwork / Apple Music Audio-First Section
 
     private func standardArtworkCenterSection(track: UniversalTrack) -> some View {
         VStack(spacing: 14) {
-            Spacer(minLength: 8)
+            if player.activeYouTubeVideoID != nil {
+                // Apple Music / YouTube Music style Audio vs Video switch pill (defaults to Audio cover art)
+                HStack(spacing: 0) {
+                    Button {
+                        withAnimation(AuraTheme.springInteractive) {
+                            player.isYouTubeVideoVisible = false
+                        }
+                    } label: {
+                        Text("Song")
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundStyle(!player.isYouTubeVideoVisible ? .white : .white.opacity(0.6))
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 6)
+                            .background(
+                                Capsule().fill(!player.isYouTubeVideoVisible ? Color.white.opacity(0.24) : Color.clear)
+                            )
+                    }
+                    .buttonStyle(.plain)
 
-            if let videoID = player.activeYouTubeVideoID {
+                    Button {
+                        withAnimation(AuraTheme.springInteractive) {
+                            player.isYouTubeVideoVisible = true
+                        }
+                    } label: {
+                        Text("Video")
+                            .font(.system(size: 12, weight: .bold))
+                            .foregroundStyle(player.isYouTubeVideoVisible ? .white : .white.opacity(0.6))
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 6)
+                            .background(
+                                Capsule().fill(player.isYouTubeVideoVisible ? Color.white.opacity(0.24) : Color.clear)
+                            )
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(3)
+                .background(Capsule().fill(Color.black.opacity(0.28)))
+            }
+
+            Spacer(minLength: 4)
+
+            if let videoID = player.activeYouTubeVideoID, player.isYouTubeVideoVisible {
                 AuthorizedYouTubeIFramePlayerView(videoID: videoID)
                     .frame(height: 235)
                     .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
@@ -234,7 +283,45 @@ public struct AppleMusicPlayerOverlayView: View {
                     .padding(.horizontal, 28)
             }
 
-            Spacer(minLength: 8)
+            // Live Synchronized Lyric Line Preview Pill (Tap to open Full-Screen Apple Music Lyrics)
+            Button {
+                withAnimation(AuraTheme.springInteractive) {
+                    player.activeOverlayTab = .lyrics
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "quote.bubble.fill")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(.white.opacity(0.9))
+                    if let activeLine = lyricsService.activeLyricLineText(at: player.currentTime) {
+                        Text(activeLine)
+                            .font(.system(size: 14, weight: .bold))
+                            .foregroundStyle(.white)
+                            .lineLimit(1)
+                    } else if lyricsService.isLoading {
+                        Text("Loading Synchronized Lyrics…")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.75))
+                    } else {
+                        Text("View Full-Screen Lyrics")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.85))
+                    }
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.white.opacity(0.6))
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 9)
+                .background(
+                    Capsule(style: .continuous)
+                        .fill(Color.white.opacity(0.16))
+                )
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 24)
+
+            Spacer(minLength: 4)
         }
     }
 
