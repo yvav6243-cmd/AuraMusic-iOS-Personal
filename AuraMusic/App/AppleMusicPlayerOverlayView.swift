@@ -11,6 +11,8 @@ public struct AppleMusicPlayerOverlayView: View {
 
     @Namespace private var playerAnimationNamespace
     @State private var dragOffset: CGFloat = 0
+    @State private var isPlayPauseCoolingDown: Bool = false
+    @State private var playPauseCooldownResetTask: Task<Void, Never>?
     @State private var showAddToPlaylistSheet: Bool = false
     @State private var showShareSheet: Bool = false
     @State private var showCustomCoverPicker: Bool = false
@@ -44,58 +46,98 @@ public struct AppleMusicPlayerOverlayView: View {
             }
         }
         .animation(AuraTheme.springInteractive, value: player.isPlayerExpanded)
+        .onChange(of: player.currentTrack?.id) { _, _ in
+            playPauseCooldownResetTask?.cancel()
+            isPlayPauseCoolingDown = false
+        }
+    }
+
+    private func triggerPlayPauseWithCooldownFeedback(hapticStyle: UIImpactFeedbackGenerator.FeedbackStyle) {
+        guard player.togglePlayPause() else { return }
+        UIImpactFeedbackGenerator(style: hapticStyle).impactOccurred()
+        isPlayPauseCoolingDown = true
+        playPauseCooldownResetTask?.cancel()
+        playPauseCooldownResetTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            guard !Task.isCancelled else { return }
+            isPlayPauseCoolingDown = false
+        }
     }
 
     // MARK: - 1. Floating Apple Music Mini-Player Bar
 
     private func floatingMiniPlayerBar(track: UniversalTrack) -> some View {
-        HStack(spacing: 12) {
-            AuraArtworkView(url: track.artworkURL, size: 42, cornerRadius: 8)
-                .matchedGeometryEffect(id: "playerArtwork", in: playerAnimationNamespace)
+        HStack(spacing: 10) {
+            HStack(spacing: 12) {
+                AuraArtworkView(url: track.artworkURL, size: 42, cornerRadius: 8)
+                    .matchedGeometryEffect(id: "playerArtwork", in: playerAnimationNamespace)
 
-            VStack(alignment: .leading, spacing: 2) {
-                Text(track.title)
-                    .font(.system(size: 15, weight: .semibold))
-                    .foregroundStyle(.primary)
-                    .lineLimit(1)
-                HStack(spacing: 5) {
-                    Text(track.artist)
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(track.title)
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(.primary)
                         .lineLimit(1)
-                    Text("• \(track.provider.shortBadgeName)")
-                        .font(.system(size: 9, weight: .bold))
-                        .foregroundStyle(track.provider.badgeColor)
+                    HStack(spacing: 5) {
+                        Text(track.artist)
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        Text("• \(track.provider.shortBadgeName)")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundStyle(track.provider.badgeColor)
+                    }
+                }
+
+                Spacer(minLength: 4)
+            }
+            .contentShape(Rectangle())
+            .onTapGesture {
+                withAnimation(AuraTheme.springInteractive) {
+                    player.isPlayerExpanded = true
                 }
             }
 
-            Spacer()
-
-            HStack(spacing: 18) {
+            HStack(spacing: 6) {
                 Button {
-                    player.togglePlayPause()
+                    triggerPlayPauseWithCooldownFeedback(hapticStyle: .light)
                 } label: {
-                    if player.isBuffering {
-                        ProgressView()
-                            .frame(width: 24, height: 24)
-                    } else {
+                    ZStack {
+                        Circle()
+                            .fill(Color.primary.opacity(0.08))
+                            .frame(width: 40, height: 40)
                         Image(systemName: player.isPlaying ? "pause.fill" : "play.fill")
-                            .font(.system(size: 21, weight: .bold))
+                            .font(.system(size: 19, weight: .bold))
                             .foregroundStyle(.primary)
+                            .offset(x: player.isPlaying ? 0 : 1)
+                            .contentTransition(.symbolEffect(.replace))
+                        if player.isBuffering {
+                            ProgressView()
+                                .scaleEffect(0.6)
+                                .offset(x: 14, y: -13)
+                                .allowsHitTesting(false)
+                        }
                     }
+                    .frame(width: 46, height: 46)
+                    .contentShape(Rectangle())
+                    .opacity(isPlayPauseCoolingDown ? 0.72 : 1.0)
+                    .animation(.easeInOut(duration: 0.15), value: isPlayPauseCoolingDown)
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(AuraTactileTransportButtonStyle())
+                .accessibilityLabel(player.isPlaying ? "Pause" : "Play")
 
                 Button {
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
                     player.skipToNext()
                 } label: {
                     Image(systemName: "forward.fill")
                         .font(.system(size: 19, weight: .bold))
                         .foregroundStyle(.primary)
+                        .frame(width: 42, height: 46)
+                        .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(AuraTactileTransportButtonStyle())
             }
-            .padding(.trailing, 6)
+            .padding(.trailing, 2)
         }
         .padding(.horizontal, 10)
         .frame(height: AuraTheme.miniPlayerHeight)
@@ -108,16 +150,10 @@ public struct AppleMusicPlayerOverlayView: View {
             RoundedRectangle(cornerRadius: 15, style: .continuous)
                 .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
         )
-        .contentShape(Rectangle())
-        .onTapGesture {
-            withAnimation(AuraTheme.springInteractive) {
-                player.isPlayerExpanded = true
-            }
-        }
-        .gesture(
-            DragGesture(minimumDistance: 12)
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 24)
                 .onEnded { value in
-                    if value.translation.height < -25 {
+                    if value.translation.height < -30 && abs(value.translation.height) > abs(value.translation.width) {
                         withAnimation(AuraTheme.springInteractive) {
                             player.isPlayerExpanded = true
                         }
@@ -185,15 +221,15 @@ public struct AppleMusicPlayerOverlayView: View {
             .offset(y: max(0, dragOffset))
         }
         .environment(\.colorScheme, .dark)
-        .gesture(
-            DragGesture()
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 32)
                 .onChanged { value in
-                    if value.translation.height > 0 {
+                    if value.translation.height > 20 && abs(value.translation.height) > abs(value.translation.width) * 1.4 {
                         dragOffset = value.translation.height
                     }
                 }
                 .onEnded { value in
-                    if value.translation.height > 130 {
+                    if value.translation.height > 130 && abs(value.translation.height) > abs(value.translation.width) * 1.2 {
                         withAnimation(AuraTheme.springInteractive) {
                             dragOffset = 0
                             player.isPlayerExpanded = false
@@ -426,43 +462,67 @@ public struct AppleMusicPlayerOverlayView: View {
     // MARK: - Transport Controls
 
     private var primaryTransportControls: some View {
-        HStack(spacing: 52) {
+        HStack(spacing: 38) {
             Button {
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
                 player.skipToPrevious()
             } label: {
                 Image(systemName: "backward.fill")
-                    .font(.system(size: 31, weight: .bold))
+                    .font(.system(size: 30, weight: .bold))
                     .foregroundStyle(.white)
+                    .frame(width: 56, height: 56)
+                    .contentShape(Circle())
             }
-            .buttonStyle(.plain)
+            .buttonStyle(AuraTactileTransportButtonStyle())
 
             Button {
-                player.togglePlayPause()
+                triggerPlayPauseWithCooldownFeedback(hapticStyle: .medium)
             } label: {
-                if player.isBuffering {
-                    ProgressView()
-                        .tint(.white)
-                        .scaleEffect(1.4)
-                        .frame(width: 48, height: 48)
-                } else {
+                ZStack {
+                    Circle()
+                        .fill(Color.white.opacity(0.16))
+                        .frame(width: 76, height: 76)
+                        .overlay(
+                            Circle()
+                                .strokeBorder(Color.white.opacity(0.24), lineWidth: 1)
+                        )
+                        .shadow(color: .black.opacity(0.22), radius: 10, x: 0, y: 4)
+
                     Image(systemName: player.isPlaying ? "pause.fill" : "play.fill")
-                        .font(.system(size: 46, weight: .bold))
+                        .font(.system(size: 36, weight: .bold))
                         .foregroundStyle(.white)
-                        .frame(width: 48, height: 48)
+                        .offset(x: player.isPlaying ? 0 : 2)
+                        .contentTransition(.symbolEffect(.replace))
+
+                    if player.isBuffering {
+                        ProgressView()
+                            .tint(.white.opacity(0.85))
+                            .scaleEffect(0.75)
+                            .offset(y: 27)
+                            .allowsHitTesting(false)
+                    }
                 }
+                .frame(width: 78, height: 78)
+                .contentShape(Circle())
+                .opacity(isPlayPauseCoolingDown ? 0.72 : 1.0)
+                .animation(.easeInOut(duration: 0.15), value: isPlayPauseCoolingDown)
             }
-            .buttonStyle(.plain)
+            .buttonStyle(AuraTactileTransportButtonStyle())
+            .accessibilityLabel(player.isPlaying ? "Pause" : "Play")
 
             Button {
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
                 player.skipToNext()
             } label: {
                 Image(systemName: "forward.fill")
-                    .font(.system(size: 31, weight: .bold))
+                    .font(.system(size: 30, weight: .bold))
                     .foregroundStyle(.white)
+                    .frame(width: 56, height: 56)
+                    .contentShape(Circle())
             }
-            .buttonStyle(.plain)
+            .buttonStyle(AuraTactileTransportButtonStyle())
         }
-        .padding(.vertical, 4)
+        .padding(.vertical, 2)
     }
 
     private var volumeAndOutputSlider: some View {
@@ -624,6 +684,15 @@ public struct AppleMusicPlayerOverlayView: View {
 }
 
 // MARK: - Isolated 120 FPS Leaf Subviews (Only these re-render on PlaybackClock ticks!)
+
+private struct AuraTactileTransportButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.88 : 1.0)
+            .opacity(configuration.isPressed ? 0.78 : 1.0)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+    }
+}
 
 private struct ExpandedPlaybackScrubberView: View {
     let track: UniversalTrack

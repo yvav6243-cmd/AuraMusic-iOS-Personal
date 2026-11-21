@@ -7,6 +7,33 @@ import SwiftUI
 import UIKit
 import WebKit
 
+/// Enforces at most one Play/Pause toggle per cooldown window (default: 1.0s) so accidental rapid double-taps
+/// or duplicate Lock Screen + MediaSession events can never double-toggle playback.
+public struct PlayPauseCooldownGate: Sendable {
+    public let cooldownInterval: TimeInterval
+    public private(set) var lastAcceptedTimestamp: TimeInterval?
+
+    public init(cooldownInterval: TimeInterval = 1.0) {
+        self.cooldownInterval = cooldownInterval
+    }
+
+    public mutating func tryConsume(at now: TimeInterval) -> Bool {
+        if let last = lastAcceptedTimestamp, (now - last) < cooldownInterval {
+            return false
+        }
+        lastAcceptedTimestamp = now
+        return true
+    }
+
+    public mutating func recordAction(at now: TimeInterval) {
+        lastAcceptedTimestamp = now
+    }
+
+    public mutating func reset() {
+        lastAcceptedTimestamp = nil
+    }
+}
+
 /// High-frequency playback clock isolated from `UniversalAudioPlayerEngine` so 5–10Hz timer ticks
 /// ONLY update the tiny scrubber & lyrics driver instead of re-rendering the entire SwiftUI app tree!
 @MainActor
@@ -96,6 +123,9 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     private var delayedKeepAliveStopTask: Task<Void, Never>?
     private var isUserPaused: Bool = false
     private var lastUserPauseWallTime: TimeInterval = 0
+    private var lastTrackStartWallTime: TimeInterval = 0
+    private var playbackGeneration: Int = 0
+    private var playPauseCooldownGate = PlayPauseCooldownGate(cooldownInterval: 1.0)
     private var lastYouTubeJSTickWallTime: TimeInterval = 0
     private var hasReceivedFirstYouTubeProgressTick: Bool = false
     private var fallbackYouTubeVideoIDs: [String] = []
@@ -149,10 +179,10 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         }
     }
 
-    private func setBackgroundKeepAliveActive(_ active: Bool) {
+    private func setBackgroundKeepAliveActive(_ active: Bool, mixWithWebKit: Bool = true) {
         if active {
+            configureAudioSession(mixWithWebKit: mixWithWebKit)
             if !(backgroundKeepAliveAudioPlayer?.isPlaying ?? false) {
-                configureAudioSession()
                 backgroundKeepAliveAudioPlayer?.play()
             }
             if backgroundTaskID == .invalid {
@@ -228,15 +258,23 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
                 self.backgroundProtectTask?.cancel()
                 self.isUserPaused = true
                 self.lastUserPauseWallTime = CACurrentMediaTime()
+                self.playPauseCooldownGate.recordAction(at: CACurrentMediaTime())
                 self.isPlaying = false
                 self.isBuffering = false
+                if UIApplication.shared.applicationState != .active {
+                    self.setBackgroundKeepAliveActive(true, mixWithWebKit: false)
+                }
                 self.refreshNowPlayingMetadata()
                 self.scheduleIdleKeepAliveTimeout()
                 return
             }
-            // Ignore transient initial paused state before playback has started so UI doesn't flicker or abort autoplay
-            guard hasReceivedFirstYouTubeProgressTick || currentTime > 0.05 else {
-                if !self.isBuffering { self.isBuffering = true }
+            // Ignore transient initial paused ticks before playback settles (or during the first 3.0s of startup)
+            // so YouTube ABR/init glitches can NEVER flip a brand-new song to paused!
+            let elapsedSinceStart = CACurrentMediaTime() - lastTrackStartWallTime
+            guard (hasReceivedFirstYouTubeProgressTick || currentTime > 0.05) && elapsedSinceStart >= 3.0 else {
+                if !self.isUserPaused && !self.isBuffering {
+                    self.isBuffering = true
+                }
                 return
             }
             if self.isPlaying || self.isBuffering {
@@ -305,12 +343,14 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         fallbackYouTubeVideoIDs = []
         hasReceivedFirstYouTubeProgressTick = false
         isUserPaused = false
+        lastTrackStartWallTime = CACurrentMediaTime()
+        playPauseCooldownGate.reset()
         lastYouTubeJSTickWallTime = CACurrentMediaTime()
         activeYouTubeVideoID = videoID
         isBuffering = false
         isPlaying = true
         playbackStatusBanner = nil
-        setBackgroundKeepAliveActive(true)
+        setBackgroundKeepAliveActive(true, mixWithWebKit: true)
         refreshNowPlayingMetadata()
 
         // Native Swift 200ms smooth clock interpolator so lyrics highlight & scroll continuously even if WebKit throttles JS timers
@@ -355,21 +395,40 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
 
     // MARK: - Audio Session & System Notifications
 
-    /// Non-mixing `.playback` options are REQUIRED on iOS so AuraMusic owns MPNowPlayingInfoCenter and MPRemoteCommandCenter
-    /// (`.mixWithOthers` disables Lock Screen Play/Pause remote commands on iOS).
-    public static let preferredAudioSessionOptions: AVAudioSession.CategoryOptions = [
+    /// While actively playing YouTube in WKWebView, `.mixWithOthers` MUST be enabled so the WebContent process
+    /// and AuraMusic's silent keep-alive NEVER interrupt each other (which otherwise causes every song to start paused!).
+    public static let activePlaybackAudioSessionOptions: AVAudioSession.CategoryOptions = [
+        .mixWithOthers,
         .allowAirPlay,
         .allowBluetoothA2DP
     ]
 
-    private func configureAudioSession() {
+    /// When soft-paused in background (with WKWebView muted), non-mixing `.playback` hands 100% Lock Screen
+    /// `MPRemoteCommandCenter` ownership to AuraMusic so the Lock Screen Play button stays enabled and clickable!
+    public static let backgroundPausedLockScreenAudioSessionOptions: AVAudioSession.CategoryOptions = [
+        .allowAirPlay,
+        .allowBluetoothA2DP
+    ]
+
+    private func configureAudioSession(mixWithWebKit: Bool = true) {
         do {
             let session = AVAudioSession.sharedInstance()
-            try session.setCategory(.playback, mode: .default, options: Self.preferredAudioSessionOptions)
+            let options = mixWithWebKit
+                ? Self.activePlaybackAudioSessionOptions
+                : Self.backgroundPausedLockScreenAudioSessionOptions
+            try session.setCategory(.playback, mode: .default, options: options)
             try session.setActive(true)
         } catch {
             // Simulator or restricted audio environment
         }
+    }
+
+    /// Guards against spurious self-interruptions during the first 2.5s of starting a new YouTube track
+    internal func handleAudioSessionInterruptionBegan(at now: TimeInterval = CACurrentMediaTime()) {
+        if activeYouTubeVideoID != nil && (now - lastTrackStartWallTime) < 2.5 {
+            return
+        }
+        pause()
     }
 
     private func configureAudioNotifications() {
@@ -433,7 +492,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
             Task { @MainActor in
                 switch type {
                 case .began:
-                    self.pause()
+                    self.handleAudioSessionInterruptionBegan()
                 case .ended:
                     if let optionsValue = userInfo[AVAudioSessionInterruptionOptionKey] as? UInt {
                         let options = AVAudioSession.InterruptionOptions(rawValue: optionsValue)
@@ -475,14 +534,22 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         commandCenter.playCommand.isEnabled = true
         commandCenter.playCommand.addTarget { [weak self] _ in
             guard let self else { return .commandFailed }
-            Task { @MainActor in self.resume() }
+            Task { @MainActor in
+                if !self.isPlaying {
+                    self.togglePlayPause()
+                }
+            }
             return .success
         }
 
         commandCenter.pauseCommand.isEnabled = true
         commandCenter.pauseCommand.addTarget { [weak self] _ in
             guard let self else { return .commandFailed }
-            Task { @MainActor in self.pause() }
+            Task { @MainActor in
+                if self.isPlaying {
+                    self.togglePlayPause()
+                }
+            }
             return .success
         }
 
@@ -567,12 +634,19 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
 
         currentTime = 0
         duration = max(track.duration, 0)
+        isUserPaused = false
+        isPlaying = true
         isBuffering = true
+        playbackGeneration += 1
+        let activeGeneration = playbackGeneration
+        lastTrackStartWallTime = CACurrentMediaTime()
+        playPauseCooldownGate.reset()
         playbackStatusBanner = nil
         activeYouTubeVideoID = nil
         // Default to pure Apple Music square-artwork audio view; only show video automatically if user explicitly tapped a raw YouTube video
         isYouTubeVideoVisible = (track.provider == .youtube)
         crossfadeTriggeredForCurrentItem = false
+        refreshNowPlayingMetadata()
 
         Task { @MainActor in
             PersistenceController.shared.recordPlayback(of: track)
@@ -584,13 +658,14 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         }
 
         Task {
-            await loadAndStartPlayback(for: track)
+            await loadAndStartPlayback(for: track, generation: activeGeneration)
         }
     }
 
-    private func loadAndStartPlayback(for track: UniversalTrack) async {
+    private func loadAndStartPlayback(for track: UniversalTrack, generation: Int) async {
+        guard generation == playbackGeneration, !isUserPaused else { return }
         if !(backgroundKeepAliveAudioPlayer?.isPlaying ?? false) {
-            configureAudioSession()
+            configureAudioSession(mixWithWebKit: true)
         }
 
         // 1. Check if downloaded offline or imported as a local file first (works 100% offline in Airplane Mode)
@@ -612,11 +687,13 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
 
         case .audius, .radio:
             if let resolvedURL = try? await audiusProvider.resolvePlayableStreamURL(for: track) ?? track.streamURL {
+                guard generation == playbackGeneration, !isUserPaused else { return }
                 startAVPlayer(with: resolvedURL, for: track, banner: nil)
             } else if let direct = track.streamURL {
+                guard generation == playbackGeneration, !isUserPaused else { return }
                 startAVPlayer(with: direct, for: track, banner: nil)
             } else {
-                await attemptCrossProviderFallback(for: track)
+                await attemptCrossProviderFallback(for: track, generation: generation)
             }
 
         case .appleMusic:
@@ -629,6 +706,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
                         equalTo: MusicItemID(track.providerTrackID)
                     )
                     let response = try await request.response()
+                    guard generation == playbackGeneration, !isUserPaused else { return }
                     if let song = response.items.first {
                         ApplicationMusicPlayer.shared.queue = [song]
                         try await ApplicationMusicPlayer.shared.play()
@@ -644,18 +722,20 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
             }
 
             // Since Apple Music API is not configured, route through the user's active configured API (e.g. YouTube Music)
-            if await tryUpgradeToFullLengthStream(for: track) {
+            if await tryUpgradeToFullLengthStream(for: track, generation: generation) {
                 return
             }
+            guard generation == playbackGeneration, !isUserPaused else { return }
 
             if let previewURL = try? await appleProvider.resolvePlayableStreamURL(for: track) {
+                guard generation == playbackGeneration, !isUserPaused else { return }
                 startAVPlayer(
                     with: previewURL,
                     for: track,
                     banner: nil
                 )
             } else {
-                await attemptCrossProviderFallback(for: track)
+                await attemptCrossProviderFallback(for: track, generation: generation)
             }
 
         case .youtubeMusic, .youtube:
@@ -668,29 +748,31 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
             if let streamURL = track.streamURL, track.isStreamable {
                 startAVPlayer(with: streamURL, for: track, banner: nil)
             } else {
-                await attemptCrossProviderFallback(for: track)
+                await attemptCrossProviderFallback(for: track, generation: generation)
             }
 
         case .spotify:
-            if await tryUpgradeToFullLengthStream(for: track) {
+            if await tryUpgradeToFullLengthStream(for: track, generation: generation) {
                 return
             }
+            guard generation == playbackGeneration, !isUserPaused else { return }
             if let preview = track.previewURL {
                 startAVPlayer(with: preview, for: track, banner: "Spotify 30s Preview")
             } else {
-                await attemptCrossProviderFallback(for: track)
+                await attemptCrossProviderFallback(for: track, generation: generation)
             }
         }
     }
 
     /// Checks native AVPlayer full-stream providers (SoundCloud, Audius) for an exact match
-    private func tryUpgradeToNativeAVStream(for track: UniversalTrack) async -> Bool {
+    private func tryUpgradeToNativeAVStream(for track: UniversalTrack, generation: Int) async -> Bool {
         let query = "\(track.title) \(track.artist)"
 
         if soundCloudProvider.isConfigured,
            let scCandidates = try? await soundCloudProvider.searchTracks(query: query, limit: 3),
            let bestSC = scCandidates.first(where: { $0.streamURL != nil && $0.isStreamable }),
            let streamURL = bestSC.streamURL {
+            guard generation == playbackGeneration, !isUserPaused else { return true }
             if bestSC.duration > 35 {
                 self.duration = bestSC.duration
             }
@@ -701,6 +783,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         if let openCandidates = try? await audiusProvider.searchTracks(query: query, limit: 5),
            let matchedOpen = openCandidates.first(where: { matcher.isSameSong(track, $0) }),
            let fullStreamURL = try? await audiusProvider.resolvePlayableStreamURL(for: matchedOpen) {
+            guard generation == playbackGeneration, !isUserPaused else { return true }
             if matchedOpen.duration > 35 {
                 self.duration = matchedOpen.duration
             }
@@ -711,13 +794,14 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         return false
     }
 
-    private func tryUpgradeToFullLengthStream(for track: UniversalTrack) async -> Bool {
+    private func tryUpgradeToFullLengthStream(for track: UniversalTrack, generation: Int) async -> Bool {
         let query = "\(track.title) \(track.artist)"
 
         // 1. If YouTube Music API is configured, resolve full studio track
         if ProviderCredentialsStore.shared.hasConfiguredAPI(for: .youtubeMusic),
            let ytCandidates = try? await ytMusicProvider.searchTracks(query: query, limit: 3),
            let bestYT = ytCandidates.first {
+            guard generation == playbackGeneration, !isUserPaused else { return true }
             if bestYT.duration > 35 {
                 self.duration = bestYT.duration
             }
@@ -727,7 +811,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         }
 
         // 2. Otherwise check other configured native AVPlayer full-stream providers
-        if await tryUpgradeToNativeAVStream(for: track) {
+        if await tryUpgradeToNativeAVStream(for: track, generation: generation) {
             return true
         }
         return false
@@ -760,14 +844,16 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         refreshNowPlayingMetadata()
     }
 
-    private func attemptCrossProviderFallback(for track: UniversalTrack) async {
-        if await tryUpgradeToFullLengthStream(for: track) {
+    private func attemptCrossProviderFallback(for track: UniversalTrack, generation: Int) async {
+        if await tryUpgradeToFullLengthStream(for: track, generation: generation) {
             return
         }
+        guard generation == playbackGeneration, !isUserPaused else { return }
         let query = "\(track.title) \(track.artist)"
         if let appleMatches = try? await appleProvider.searchTracks(query: query, limit: 2),
            let first = appleMatches.first,
            let preview = first.previewURL {
+            guard generation == playbackGeneration, !isUserPaused else { return }
             startAVPlayer(
                 with: preview,
                 for: track,
@@ -775,6 +861,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
             )
             return
         }
+        guard generation == playbackGeneration, !isUserPaused else { return }
         isBuffering = false
         isPlaying = false
         playbackStatusBanner = "Direct stream restricted by \(track.provider.displayName)."
@@ -788,6 +875,9 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         customUserAgent: String? = nil
     ) {
         youtubeWatchdogTask?.cancel()
+        youtubeClockInterpolatorTask?.cancel()
+        setBackgroundKeepAliveActive(false)
+        configureAudioSession(mixWithWebKit: false)
         ApplicationMusicPlayer.shared.pause()
         activeYouTubeVideoID = nil
         playbackStatusBanner = banner
@@ -846,15 +936,32 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         refreshNowPlayingMetadata()
     }
 
-    public func togglePlayPause() {
-        if isPlaying {
-            pause()
-        } else {
-            resume()
+    /// User-triggered Play/Pause toggle protected by a 1.0-second cooldown so pause/play fires at most once per second.
+    @discardableResult
+    public func togglePlayPause(at now: TimeInterval = CACurrentMediaTime()) -> Bool {
+        guard playPauseCooldownGate.tryConsume(at: now) else {
+            return false
         }
+        if isPlaying {
+            pause(recordCooldownAt: nil)
+        } else {
+            resume(recordCooldownAt: nil)
+        }
+        return true
+    }
+
+    public func resetPlayPauseCooldownForTesting() {
+        playPauseCooldownGate.reset()
     }
 
     public func pause() {
+        pause(recordCooldownAt: CACurrentMediaTime())
+    }
+
+    private func pause(recordCooldownAt timestamp: TimeInterval?) {
+        if let timestamp {
+            playPauseCooldownGate.recordAction(at: timestamp)
+        }
         backgroundProtectTask?.cancel()
         delayedKeepAliveStopTask?.cancel()
         isUserPaused = true
@@ -869,10 +976,10 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         if activeYouTubeVideoID != nil {
             let isInBackground = UIApplication.shared.applicationState != .active
             if isInBackground {
-                // Soft-pause in background: silences audio & freezes progress WITHOUT calling pauseAllMediaPlayback(),
-                // preventing iOS WebKit from blocking video.play() when the user taps Play on the Lock Screen / Control Center!
+                // Phase 2: Soft-pause & mute <video> FIRST, then switch AVAudioSession to non-mixing `.playback`
+                // so AuraMusic owns Lock Screen MPRemoteCommandCenter with Play ▶ 100% enabled & clickable!
                 evaluateYouTubeJS("if(window.auraControl){window.auraControl.pauseInBackground();}")
-                setBackgroundKeepAliveActive(true)
+                setBackgroundKeepAliveActive(true, mixWithWebKit: false)
                 scheduleIdleKeepAliveTimeout()
             } else {
                 evaluateYouTubeJS("if(window.auraControl){window.auraControl.pause();}")
@@ -887,17 +994,24 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     }
 
     public func resume() {
+        resume(recordCooldownAt: CACurrentMediaTime())
+    }
+
+    private func resume(recordCooldownAt timestamp: TimeInterval?) {
         guard currentTrack != nil || activeYouTubeVideoID != nil else { return }
+        if let timestamp {
+            playPauseCooldownGate.recordAction(at: timestamp)
+        }
         delayedKeepAliveStopTask?.cancel()
         isUserPaused = false
-        if !(backgroundKeepAliveAudioPlayer?.isPlaying ?? false) {
-            configureAudioSession()
-        }
+        lastTrackStartWallTime = CACurrentMediaTime()
         if activeYouTubeVideoID != nil {
-            setBackgroundKeepAliveActive(true)
+            // Phase 3: Switch back to `.mixWithOthers` BEFORE unmuting <video> so WebKit & keep-alive never interrupt each other!
+            setBackgroundKeepAliveActive(true, mixWithWebKit: true)
             evaluateYouTubeJS("if(window.auraControl){window.auraControl.resume();}")
             isPlaying = true
         } else {
+            configureAudioSession(mixWithWebKit: false)
             primaryPlayer.play()
             isPlaying = true
         }

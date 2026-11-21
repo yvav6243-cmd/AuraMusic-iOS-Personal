@@ -1,6 +1,7 @@
 import AVFoundation
 import Combine
 import MediaPlayer
+import QuartzCore
 import WebKit
 import XCTest
 @testable import AuraMusic
@@ -431,14 +432,24 @@ final class AuraMusicCoreTests: XCTestCase {
     }
 
     @MainActor
-    func testAudioSessionDoesNotUseMixWithOthersAndRemoteCommandsAreEnabled() {
-        // Apple iOS disables MPRemoteCommandCenter & Lock Screen Play button if .mixWithOthers is enabled!
-        XCTAssertFalse(
-            UniversalAudioPlayerEngine.preferredAudioSessionOptions.contains(.mixWithOthers),
-            ".mixWithOthers MUST NOT be set or iOS disables Lock Screen Play/Pause remote controls"
+    func testTwoPhaseAudioSessionOptionsAndAllRemoteCommandsEnabled() {
+        // Phase 1 (active playback): .mixWithOthers MUST be set so WKWebView WebContent & silent keep-alive
+        // NEVER trigger AVAudioSession.interruptionNotification (.began) causing every new song to start paused!
+        XCTAssertTrue(
+            UniversalAudioPlayerEngine.activePlaybackAudioSessionOptions.contains(.mixWithOthers),
+            "Active playback audio session MUST include .mixWithOthers so WKWebView never self-interrupts on startup"
         )
-        XCTAssertTrue(UniversalAudioPlayerEngine.preferredAudioSessionOptions.contains(.allowAirPlay))
-        XCTAssertTrue(UniversalAudioPlayerEngine.preferredAudioSessionOptions.contains(.allowBluetoothA2DP))
+        XCTAssertTrue(UniversalAudioPlayerEngine.activePlaybackAudioSessionOptions.contains(.allowAirPlay))
+        XCTAssertTrue(UniversalAudioPlayerEngine.activePlaybackAudioSessionOptions.contains(.allowBluetoothA2DP))
+
+        // Phase 2 (background soft-pause): .mixWithOthers MUST NOT be set so AuraMusic owns MPRemoteCommandCenter
+        // and the Lock Screen Play button stays 100% enabled and clickable!
+        XCTAssertFalse(
+            UniversalAudioPlayerEngine.backgroundPausedLockScreenAudioSessionOptions.contains(.mixWithOthers),
+            "Background-paused Lock Screen audio session MUST omit .mixWithOthers so Lock Screen Play stays enabled"
+        )
+        XCTAssertTrue(UniversalAudioPlayerEngine.backgroundPausedLockScreenAudioSessionOptions.contains(.allowAirPlay))
+        XCTAssertTrue(UniversalAudioPlayerEngine.backgroundPausedLockScreenAudioSessionOptions.contains(.allowBluetoothA2DP))
 
         // Initialize shared engine so remote command center is configured
         _ = UniversalAudioPlayerEngine.shared
@@ -485,12 +496,13 @@ final class AuraMusicCoreTests: XCTestCase {
             XCTAssertEqual(MPNowPlayingInfoCenter.default().nowPlayingInfo?[MPNowPlayingInfoPropertyPlaybackRate] as? Double, 1.0)
         }
 
-        // Verify togglePlayPause() also works cleanly in both directions
-        engine.togglePlayPause()
+        // Verify togglePlayPause() works cleanly in both directions when spaced >= 1.0s apart
+        engine.resetPlayPauseCooldownForTesting()
+        XCTAssertTrue(engine.togglePlayPause(at: 100.0))
         XCTAssertFalse(engine.isPlaying)
         XCTAssertEqual(MPNowPlayingInfoCenter.default().playbackState, .paused)
 
-        engine.togglePlayPause()
+        XCTAssertTrue(engine.togglePlayPause(at: 101.2))
         XCTAssertTrue(engine.isPlaying)
         XCTAssertEqual(MPNowPlayingInfoCenter.default().playbackState, .playing)
 
@@ -629,5 +641,405 @@ final class AuraMusicCoreTests: XCTestCase {
             "High-frequency currentTime/duration ticks MUST NEVER trigger UniversalAudioPlayerEngine.objectWillChange (root cause of SwiftUI lag)"
         )
         XCTAssertGreaterThanOrEqual(clockChangeCount, 200, "PlaybackClock must still emit every time update to scrubber and lyrics")
+    }
+
+    // MARK: - Startup Playback & 1-Second Play/Pause Cooldown Tests
+
+    func testPlayPauseCooldownGateAllowsExactlyOncePerSecond() {
+        var gate = PlayPauseCooldownGate(cooldownInterval: 1.0)
+
+        XCTAssertTrue(gate.tryConsume(at: 0.0), "First press must always be accepted")
+        XCTAssertFalse(gate.tryConsume(at: 0.001), "Press 1ms later must be blocked")
+        XCTAssertFalse(gate.tryConsume(at: 0.25), "Press 250ms later must be blocked")
+        XCTAssertFalse(gate.tryConsume(at: 0.50), "Press 500ms later must be blocked")
+        XCTAssertFalse(gate.tryConsume(at: 0.999), "Press 999ms later must be blocked")
+
+        XCTAssertTrue(gate.tryConsume(at: 1.0), "Press at exact 1.0s mark must be accepted")
+        XCTAssertFalse(gate.tryConsume(at: 1.4), "Press 400ms after second press must be blocked")
+        XCTAssertFalse(gate.tryConsume(at: 1.999), "Press 999ms after second press must be blocked")
+        XCTAssertTrue(gate.tryConsume(at: 2.05), "Press after >=1.0s must be accepted")
+
+        gate.recordAction(at: 5.0)
+        XCTAssertFalse(gate.tryConsume(at: 5.8), "recordAction must arm the 1.0s cooldown")
+        XCTAssertTrue(gate.tryConsume(at: 6.0), "Action after 1.0s from recordAction must be accepted")
+
+        gate.reset()
+        XCTAssertTrue(gate.tryConsume(at: 6.01), "reset() must clear cooldown immediately")
+    }
+
+    @MainActor
+    func testEngineTogglePlayPauseRespectsOneSecondCooldownAndBlocksRapidDoubleTaps() {
+        let engine = UniversalAudioPlayerEngine.shared
+        let track = UniversalTrack(
+            provider: .youtubeMusic,
+            providerTrackID: "cooldown-test-01",
+            title: "Starboy",
+            artist: "The Weeknd",
+            album: "Starboy",
+            duration: 230.0,
+            isStreamable: true
+        )
+
+        engine.play(track)
+        engine.activeYouTubeVideoID = track.providerTrackID
+        engine.resetPlayPauseCooldownForTesting()
+        XCTAssertTrue(engine.isPlaying)
+
+        // Burst of 5 rapid taps within 1 second: ONLY the very first tap may pause!
+        XCTAssertTrue(engine.togglePlayPause(at: 10.0), "First tap at 10.0s must pause")
+        XCTAssertFalse(engine.isPlaying)
+
+        for rapidTime in [10.05, 10.25, 10.50, 10.95] {
+            XCTAssertFalse(engine.togglePlayPause(at: rapidTime), "Rapid tap at \(rapidTime)s (<1.0s) must be blocked")
+            XCTAssertFalse(engine.isPlaying, "Playback state must stay paused during 1s cooldown at \(rapidTime)s")
+        }
+
+        // Next tap after >= 1.0s resumes cleanly
+        XCTAssertTrue(engine.togglePlayPause(at: 11.05), "Tap at 11.05s (>=1.0s) must resume")
+        XCTAssertTrue(engine.isPlaying)
+
+        // Another rapid burst while playing: must NOT pause until 1.0s elapses
+        XCTAssertFalse(engine.togglePlayPause(at: 11.20))
+        XCTAssertFalse(engine.togglePlayPause(at: 11.99))
+        XCTAssertTrue(engine.isPlaying)
+
+        // Tap at 12.10s pauses again
+        XCTAssertTrue(engine.togglePlayPause(at: 12.10))
+        XCTAssertFalse(engine.isPlaying)
+
+        engine.activeYouTubeVideoID = nil
+    }
+
+    @MainActor
+    func testNewSongAlwaysStartsPlayingNeverStartsPausedEvenAfterPreviousTrackWasPaused() {
+        let engine = UniversalAudioPlayerEngine.shared
+        let trackA = UniversalTrack(
+            provider: .youtubeMusic,
+            providerTrackID: "startup-track-A",
+            title: "Track A",
+            artist: "Artist A",
+            album: "Album A",
+            duration: 210.0,
+            isStreamable: true
+        )
+        let trackB = UniversalTrack(
+            provider: .youtubeMusic,
+            providerTrackID: "startup-track-B",
+            title: "Track B",
+            artist: "Artist B",
+            album: "Album B",
+            duration: 195.0,
+            isStreamable: true
+        )
+        let trackC = UniversalTrack(
+            provider: .youtubeMusic,
+            providerTrackID: "startup-track-C",
+            title: "Track C",
+            artist: "Artist C",
+            album: "Album C",
+            duration: 240.0,
+            isStreamable: true
+        )
+
+        engine.play(trackA)
+        engine.pause()
+        XCTAssertFalse(engine.isPlaying)
+        XCTAssertEqual(MPNowPlayingInfoCenter.default().playbackState, .paused)
+
+        // Starting a new song after being paused MUST immediately start playing (never paused!)
+        engine.play(trackB)
+        XCTAssertTrue(engine.isPlaying, "New song MUST start with isPlaying = true, never paused")
+        XCTAssertEqual(engine.currentTrack?.id, trackB.id)
+        XCTAssertEqual(engine.currentTime, 0.0, accuracy: 0.001)
+        XCTAssertEqual(MPNowPlayingInfoCenter.default().playbackState, .playing)
+        XCTAssertEqual(MPNowPlayingInfoCenter.default().nowPlayingInfo?[MPNowPlayingInfoPropertyPlaybackRate] as? Double, 1.0)
+
+        // Pause Track B, immediately switch to Track C
+        engine.pause()
+        XCTAssertFalse(engine.isPlaying)
+        engine.play(trackC)
+        XCTAssertTrue(engine.isPlaying, "Switching to Track C from paused state MUST start playing immediately")
+        XCTAssertEqual(engine.currentTrack?.id, trackC.id)
+        XCTAssertEqual(MPNowPlayingInfoCenter.default().playbackState, .playing)
+
+        engine.pause()
+        engine.activeYouTubeVideoID = nil
+    }
+
+    @MainActor
+    func testSpuriousAudioSessionInterruptionDuringTrackStartupNeverPausesNewSong() {
+        let engine = UniversalAudioPlayerEngine.shared
+        let track = UniversalTrack(
+            provider: .youtubeMusic,
+            providerTrackID: "startup-interrupt-01",
+            title: "Blinding Lights",
+            artist: "The Weeknd",
+            album: "After Hours",
+            duration: 200.0,
+            isStreamable: true
+        )
+
+        engine.play(track)
+        engine.activeYouTubeVideoID = track.providerTrackID
+        XCTAssertTrue(engine.isPlaying)
+
+        // Simulate mediaserverd firing spurious .interruptionNotification (.began) while WKWebView starts audio
+        let now = CACurrentMediaTime()
+        engine.handleAudioSessionInterruptionBegan(at: now + 0.4)
+        XCTAssertTrue(engine.isPlaying, "Spurious interruption 0.4s into track startup MUST NOT pause the new song")
+        XCTAssertEqual(MPNowPlayingInfoCenter.default().playbackState, .playing)
+
+        engine.handleAudioSessionInterruptionBegan(at: now + 1.8)
+        XCTAssertTrue(engine.isPlaying, "Spurious interruption 1.8s into track startup MUST NOT pause the new song")
+
+        engine.pause()
+        engine.activeYouTubeVideoID = nil
+    }
+
+    @MainActor
+    func testRealAudioSessionInterruptionAfterStartupWindowProperlyPausesTrack() {
+        let engine = UniversalAudioPlayerEngine.shared
+        let track = UniversalTrack(
+            provider: .youtubeMusic,
+            providerTrackID: "real-interrupt-01",
+            title: "Asphalt 8",
+            artist: "MACAN",
+            album: "12",
+            duration: 136.0,
+            isStreamable: true
+        )
+
+        engine.play(track)
+        engine.activeYouTubeVideoID = track.providerTrackID
+        XCTAssertTrue(engine.isPlaying)
+
+        // Simulate a genuine interruption (e.g., incoming phone call) 5 seconds after track start
+        engine.handleAudioSessionInterruptionBegan(at: CACurrentMediaTime() + 5.0)
+        XCTAssertFalse(engine.isPlaying, "Real audio interruption after startup window MUST pause playback")
+        XCTAssertEqual(MPNowPlayingInfoCenter.default().playbackState, .paused)
+
+        engine.activeYouTubeVideoID = nil
+    }
+
+    @MainActor
+    func testPlayingNewTrackResetsPlayPauseCooldownImmediately() {
+        let engine = UniversalAudioPlayerEngine.shared
+        let trackA = UniversalTrack(
+            provider: .youtubeMusic,
+            providerTrackID: "reset-cd-A",
+            title: "Song A",
+            artist: "Artist",
+            album: "Album",
+            duration: 180.0,
+            isStreamable: true
+        )
+        let trackB = UniversalTrack(
+            provider: .youtubeMusic,
+            providerTrackID: "reset-cd-B",
+            title: "Song B",
+            artist: "Artist",
+            album: "Album",
+            duration: 180.0,
+            isStreamable: true
+        )
+
+        engine.play(trackA)
+        engine.resetPlayPauseCooldownForTesting()
+        XCTAssertTrue(engine.togglePlayPause(at: 200.0))
+        XCTAssertFalse(engine.isPlaying)
+        XCTAssertFalse(engine.togglePlayPause(at: 200.2), "Cooldown is active on Track A")
+
+        // Playing a brand-new song resets the cooldown immediately
+        engine.play(trackB)
+        XCTAssertTrue(engine.isPlaying)
+        XCTAssertTrue(engine.togglePlayPause(at: 200.25), "New song must reset cooldown so user can pause immediately if desired")
+        XCTAssertFalse(engine.isPlaying)
+
+        engine.activeYouTubeVideoID = nil
+    }
+
+    @MainActor
+    func testDuplicateRemotePauseAndToggleWithinOneSecondNeverDoubleToggles() {
+        let engine = UniversalAudioPlayerEngine.shared
+        let track = UniversalTrack(
+            provider: .youtubeMusic,
+            providerTrackID: "dup-remote-01",
+            title: "I Got Love",
+            artist: "Miyagi & Эндшпиль",
+            album: "I Got Love",
+            duration: 277.0,
+            isStreamable: true
+        )
+
+        engine.play(track)
+        engine.activeYouTubeVideoID = track.providerTrackID
+        XCTAssertTrue(engine.isPlaying)
+
+        // Pause arrives (e.g., from Lock Screen pauseCommand), then 20ms later a duplicate togglePlayPause arrives
+        engine.pause()
+        XCTAssertFalse(engine.isPlaying)
+
+        let toggledAgain = engine.togglePlayPause(at: CACurrentMediaTime() + 0.02)
+        XCTAssertFalse(toggledAgain, "Duplicate togglePlayPause 20ms after pause() MUST be blocked by 1.0s cooldown")
+        XCTAssertFalse(engine.isPlaying, "Song must remain paused and never bounce back to playing")
+
+        engine.activeYouTubeVideoID = nil
+    }
+
+    @MainActor
+    func testInitialTransientYouTubePausedTicksBeforeAudioStartsNeverSetIsPlayingFalse() {
+        let engine = UniversalAudioPlayerEngine.shared
+        let track = UniversalTrack(
+            provider: .youtubeMusic,
+            providerTrackID: "transient-yt-01",
+            title: "Midnight City",
+            artist: "M83",
+            album: "Hurry Up, We're Dreaming",
+            duration: 243.0,
+            isStreamable: true
+        )
+
+        engine.play(track)
+        engine.activeYouTubeVideoID = track.providerTrackID
+        XCTAssertTrue(engine.isPlaying)
+
+        // 1. Unsolicited paused tick at t=0.0 before video starts
+        engine.handleYouTubePlayerEvent(currentTime: 0.0, duration: 243.0, stateCode: 2, userPaused: false, userResumed: false)
+        XCTAssertTrue(engine.isPlaying, "Transient initial YouTube state=2 at t=0.0 must NOT pause a starting song")
+
+        // 2. Unsolicited paused tick at t=0.25 during ABR quality switch in first 3.0s
+        engine.handleYouTubePlayerEvent(currentTime: 0.25, duration: 243.0, stateCode: 2, userPaused: false, userResumed: false)
+        XCTAssertTrue(engine.isPlaying, "Transient ABR paused tick within first 3.0s must NOT pause a starting song")
+
+        // 3. Explicit user pause (userPaused: true) MUST STILL pause immediately even during startup
+        engine.handleYouTubePlayerEvent(currentTime: 0.30, duration: 243.0, stateCode: 2, userPaused: true, userResumed: false)
+        XCTAssertFalse(engine.isPlaying, "Explicit user pause must immediately pause even during startup window")
+
+        engine.activeYouTubeVideoID = nil
+    }
+
+    @MainActor
+    func testStalePreviousTrackWebViewMessageNeverPausesNewlyStartedTrack() async throws {
+        let engine = UniversalAudioPlayerEngine.shared
+        let oldTrack = UniversalTrack(
+            provider: .youtubeMusic,
+            providerTrackID: "OLD_VID_111",
+            title: "Old Track",
+            artist: "Artist",
+            album: "Album",
+            duration: 200.0,
+            isStreamable: true
+        )
+        let newTrack = UniversalTrack(
+            provider: .youtubeMusic,
+            providerTrackID: "NEW_VID_222",
+            title: "New Track",
+            artist: "Artist",
+            album: "Album",
+            duration: 210.0,
+            isStreamable: true
+        )
+
+        let oldView = AuthorizedYouTubeIFramePlayerView(videoID: oldTrack.providerTrackID)
+        let staleCoordinator = oldView.makeCoordinator()
+        staleCoordinator.loadedVideoID = oldTrack.providerTrackID
+
+        // User starts New Track
+        engine.play(newTrack)
+        engine.activeYouTubeVideoID = newTrack.providerTrackID
+        XCTAssertTrue(engine.isPlaying)
+
+        // Old WebView emits stale userPaused tick and stale remotePause during teardown
+        staleCoordinator.handleBridgePayload([
+            "type": "tick",
+            "currentTime": 45.0,
+            "duration": 200.0,
+            "state": 2,
+            "userPaused": true,
+            "userResumed": false
+        ])
+        staleCoordinator.handleBridgePayload(["type": "remotePause"])
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertTrue(engine.isPlaying, "Stale pause messages from a previous track's WebView MUST NEVER pause the new song")
+        XCTAssertEqual(engine.activeYouTubeVideoID, newTrack.providerTrackID)
+
+        engine.pause()
+        engine.activeYouTubeVideoID = nil
+    }
+
+    @MainActor
+    func testWebKitStartupPauseProtectionBlocksUnsolicitedPauseButAllowsExplicitUserPause() async throws {
+        let playerView = AuthorizedYouTubeIFramePlayerView(videoID: "YkY4X_OaF6o")
+        let coordinator = playerView.makeCoordinator()
+        let webView = AuthorizedYouTubeIFramePlayerView.makeConfiguredWebView(coordinator: coordinator)
+        let navWaiter = TestWKNavigationWaiter()
+        webView.navigationDelegate = navWaiter
+        defer {
+            webView.navigationDelegate = nil
+            webView.configuration.userContentController.removeScriptMessageHandler(forName: "auraYT")
+        }
+
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            navWaiter.continuation = cont
+            webView.loadHTMLString(
+                "<!doctype html><html><head><title>StartupTest</title></head><body><video id='v' playsinline></video></body></html>",
+                baseURL: URL(string: "https://m.youtube.com/watch?v=YkY4X_OaF6o")
+            )
+        }
+
+        // Wait for bridge + initial 180ms interval to attach <video> event listeners
+        var ready = false
+        for _ in 0..<15 {
+            if let ok = try? await webView.evaluateJavaScript("typeof window.auraControl === 'object' && document.querySelector('video') && document.querySelector('video')._auraListenersAttached === true") as? Bool,
+               ok {
+                ready = true
+                break
+            }
+            try await Task.sleep(nanoseconds: 200_000_000)
+        }
+        XCTAssertTrue(ready, "WebKit bridge and video listeners must attach on load")
+
+        // 1. Verify fresh page starts unpaused with active 4s startup protection
+        let initialState = try await webView.evaluateJavaScript("""
+        (function() {
+          return {
+            userPaused: window._auraUserPaused === true,
+            softPaused: window._auraSoftPaused === true,
+            startupProtected: (window._auraStartupProtectUntil || 0) > Date.now()
+          };
+        })()
+        """) as? [String: Any]
+        XCTAssertEqual(initialState?["userPaused"] as? Bool, false)
+        XCTAssertEqual(initialState?["softPaused"] as? Bool, false)
+        XCTAssertEqual(initialState?["startupProtected"] as? Bool, true)
+
+        // 2. Simulate unsolicited YouTube ABR/init pause event during startup window -> MUST NOT flip _auraUserPaused!
+        let afterGlitchPause = try await webView.evaluateJavaScript("""
+        (function() {
+          var v = document.querySelector('video');
+          v._auraHasPlayedOnce = true;
+          v.dispatchEvent(new Event('pause'));
+          return {
+            userPaused: window._auraUserPaused === true,
+            allowPause: window._auraAllowPause === true
+          };
+        })()
+        """) as? [String: Any]
+        XCTAssertEqual(afterGlitchPause?["userPaused"] as? Bool, false, "Unsolicited startup pause event MUST NOT mark song user-paused")
+        XCTAssertEqual(afterGlitchPause?["allowPause"] as? Bool, false)
+
+        // 3. Explicit user pause via window.auraControl.pause() MUST clear startup guard & pause immediately!
+        let afterExplicitPause = try await webView.evaluateJavaScript("""
+        (function() {
+          window.auraControl.pause();
+          return {
+            userPaused: window._auraUserPaused === true,
+            startupProtectUntil: window._auraStartupProtectUntil || 0
+          };
+        })()
+        """) as? [String: Any]
+        XCTAssertEqual(afterExplicitPause?["userPaused"] as? Bool, true, "Explicit user pause MUST work immediately even during startup window")
+        XCTAssertEqual(afterExplicitPause?["startupProtectUntil"] as? Double ?? -1, 0, accuracy: 0.001)
     }
 }

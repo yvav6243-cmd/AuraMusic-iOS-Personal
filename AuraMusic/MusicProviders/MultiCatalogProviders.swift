@@ -842,9 +842,10 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
                 // Keep <video> alive & muted during background soft-pause so iOS WebKit never revokes background audio permission
                 return;
               }
+              var inStartupProtect = Date.now() < (window._auraStartupProtectUntil || 0);
               var inBgProtect = Date.now() < (window._auraBgProtectUntil || 0);
               var inResumeProtect = Date.now() < (window._auraPendingUserResumeUntil || 0);
-              if ((!inBgProtect && !inResumeProtect) || window._auraAllowPause === true || window._auraUserPaused === true || this.ended) {
+              if ((!inStartupProtect && !inBgProtect && !inResumeProtect) || window._auraAllowPause === true || window._auraUserPaused === true || this.ended) {
                 return origPause.apply(this, arguments);
               }
               var self = this;
@@ -904,6 +905,10 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
         (function() {
           if (window._auraBridgeInstalled) return;
           window._auraBridgeInstalled = true;
+          window._auraStartupProtectUntil = Date.now() + 4000;
+          window._auraUserPaused = false;
+          window._auraSoftPaused = false;
+          window._auraAllowPause = false;
 
           var style = document.createElement('style');
           style.innerHTML = `
@@ -1018,6 +1023,7 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
               window._auraSoftPaused = true;
               window._auraUserPaused = true;
               window._auraAllowPause = false;
+              window._auraStartupProtectUntil = 0;
               window._auraBgProtectUntil = 0;
               window._auraPendingUserResumeUntil = 0;
               try { if (navigator.mediaSession) navigator.mediaSession.playbackState = 'paused'; } catch(e) {}
@@ -1042,6 +1048,7 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
               window._auraSoftPaused = false;
               window._auraUserPaused = true;
               window._auraAllowPause = true;
+              window._auraStartupProtectUntil = 0;
               window._auraBgProtectUntil = 0;
               window._auraPendingUserResumeUntil = 0;
               try { if (navigator.mediaSession) navigator.mediaSession.playbackState = 'paused'; } catch(e) {}
@@ -1297,9 +1304,10 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
                   try { v.play().catch(function(){}); } catch(e) {}
                   return;
                 }
+                var inStartupProtect = Date.now() < (window._auraStartupProtectUntil || 0);
                 var inBgProtect = Date.now() < (window._auraBgProtectUntil || 0);
                 var inResumeProtect = Date.now() < (window._auraPendingUserResumeUntil || 0);
-                if ((inBgProtect || inResumeProtect) && !window._auraUserPaused) {
+                if ((inStartupProtect || inBgProtect || inResumeProtect) && !window._auraUserPaused && !window._auraAllowPause) {
                   forceUnmuteAndPlayIfNeeded(v, false);
                   return;
                 }
@@ -1401,22 +1409,33 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
 
         public func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
             guard let dict = message.body as? [String: Any] else { return }
+            handleBridgePayload(dict)
+        }
+
+        internal func handleBridgePayload(_ dict: [String: Any]) {
+            let messageVideoID = loadedVideoID
             if let msgType = dict["type"] as? String {
                 switch msgType {
                 case "audioStream":
                     if let audioURLString = dict["audioURL"] as? String,
                        let audioURL = URL(string: audioURLString),
-                       let vid = loadedVideoID {
+                       let vid = messageVideoID {
                         Task { @MainActor in
                             self.playerEngine?.recordCapturedYouTubeAudioStreamURL(audioURL, forVideoID: vid)
                         }
                     }
                     return
                 case "remotePause":
-                    Task { @MainActor in self.playerEngine?.pause() }
+                    Task { @MainActor in
+                        if let vid = messageVideoID, self.playerEngine?.activeYouTubeVideoID != vid { return }
+                        self.playerEngine?.pause()
+                    }
                     return
                 case "remotePlay":
-                    Task { @MainActor in self.playerEngine?.resume() }
+                    Task { @MainActor in
+                        if let vid = messageVideoID, self.playerEngine?.activeYouTubeVideoID != vid { return }
+                        self.playerEngine?.resume()
+                    }
                     return
                 case "remoteNext":
                     Task { @MainActor in self.playerEngine?.skipToNext() }
@@ -1434,6 +1453,7 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
             let userPaused = (dict["userPaused"] as? Bool) ?? false
             let userResumed = (dict["userResumed"] as? Bool) ?? false
             Task { @MainActor in
+                if let vid = messageVideoID, self.playerEngine?.activeYouTubeVideoID != vid { return }
                 self.playerEngine?.handleYouTubePlayerEvent(
                     currentTime: cur,
                     duration: dur,
