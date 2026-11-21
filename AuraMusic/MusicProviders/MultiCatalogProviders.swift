@@ -435,7 +435,7 @@ private struct YouTubeVideoDetailsResponse: Codable {
     var items: [Item]
 }
 
-// MARK: - Apple Music-Integrated YouTube IFrame JS Audio & Video Engine Bridge
+// MARK: - Full-Length Mobile YouTube Music WebKit Audio/Video Engine Bridge
 
 public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
     public let videoID: String
@@ -453,12 +453,119 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
         let config = WKWebViewConfiguration()
         config.allowsInlineMediaPlayback = true
         config.mediaTypesRequiringUserActionForPlayback = []
+
+        let bridgeScriptSource = """
+        (function() {
+          if (window._auraBridgeInstalled) return;
+          window._auraBridgeInstalled = true;
+
+          var style = document.createElement('style');
+          style.innerHTML = `
+            html, body { margin: 0 !important; padding: 0 !important; background: #000 !important; overflow: hidden !important; }
+            ytm-mobile-topbar-renderer, ytm-pivot-bar-renderer, ytm-item-section-renderer,
+            ytm-single-column-watch-next-results-renderer, ytm-companion-ad-renderer,
+            .player-controls-content, .ytp-chrome-top, .ytp-watermark { display: none !important; }
+            video {
+              position: fixed !important;
+              top: 0 !important;
+              left: 0 !important;
+              width: 100vw !important;
+              height: 100vh !important;
+              z-index: 2147483647 !important;
+              background: #000 !important;
+              object-fit: cover !important;
+            }
+          `;
+          if (document.head) {
+            document.head.appendChild(style);
+          } else {
+            document.addEventListener('DOMContentLoaded', function() {
+              if (document.head) document.head.appendChild(style);
+            });
+          }
+
+          window.auraControl = {
+            play: function() {
+              var v = document.querySelector('video');
+              if (v) {
+                v.muted = false;
+                v.setAttribute('playsinline', '');
+                v.setAttribute('webkit-playsinline', '');
+                v.play();
+              }
+            },
+            pause: function() {
+              var v = document.querySelector('video');
+              if (v) {
+                window._auraUserPaused = true;
+                v.pause();
+              }
+            },
+            resume: function() {
+              var v = document.querySelector('video');
+              if (v) {
+                window._auraUserPaused = false;
+                v.muted = false;
+                v.play();
+              }
+            },
+            seek: function(sec) {
+              var v = document.querySelector('video');
+              if (v) {
+                v.currentTime = sec;
+                if (!window._auraUserPaused) v.play();
+              }
+            },
+            setVolume: function(vol) {
+              var v = document.querySelector('video');
+              if (v) {
+                v.volume = Math.max(0.0, Math.min(1.0, vol / 100.0));
+              }
+            }
+          };
+
+          setInterval(function() {
+            var skipBtn = document.querySelector('.ytp-ad-skip-button, .ytp-ad-skip-button-modern, .ytp-skip-ad-button');
+            if (skipBtn) { try { skipBtn.click(); } catch(e) {} }
+
+            var v = document.querySelector('video');
+            if (!v) return;
+            v.setAttribute('playsinline', '');
+            v.setAttribute('webkit-playsinline', '');
+
+            if (!window._auraUserPaused && v.paused && !v.ended && v.readyState >= 2) {
+              v.muted = false;
+              v.play().catch(function(){});
+            }
+
+            var cur = v.currentTime || 0;
+            var dur = v.duration || 0;
+            var st = v.ended ? 0 : (v.paused ? 2 : 1);
+            if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.auraYT) {
+              window.webkit.messageHandlers.auraYT.postMessage({
+                type: 'tick',
+                currentTime: cur,
+                duration: (isFinite(dur) && dur > 0) ? dur : 0,
+                state: st
+              });
+            }
+          }, 180);
+        })();
+        """
+
+        let userScript = WKUserScript(
+            source: bridgeScriptSource,
+            injectionTime: .atDocumentEnd,
+            forMainFrameOnly: false
+        )
+        config.userContentController.addUserScript(userScript)
         config.userContentController.add(context.coordinator, name: "auraYT")
 
         let webView = WKWebView(frame: .zero, configuration: config)
+        webView.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"
         webView.scrollView.isScrollEnabled = false
         webView.isOpaque = false
-        webView.backgroundColor = .clear
+        webView.backgroundColor = .black
         context.coordinator.webView = webView
         playerEngine.registerYouTubeWebView(webView)
         return webView
@@ -472,94 +579,11 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
         if context.coordinator.loadedVideoID != safeVideoID {
             context.coordinator.loadedVideoID = safeVideoID
             playerEngine.registerYouTubeWebView(webView)
-
-            let embedHTML = """
-            <!DOCTYPE html>
-            <html>
-            <head>
-            <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-            <style>
-              body, html { margin: 0; padding: 0; width: 100%; height: 100%; background: #000; overflow: hidden; }
-              #player { width: 100%; height: 100%; border: 0; }
-            </style>
-            </head>
-            <body>
-            <div id="player"></div>
-            <script src="https://www.youtube.com/iframe_api"></script>
-            <script>
-              var ytPlayer = null;
-              var timerId = null;
-              function onYouTubeIframeAPIReady() {
-                ytPlayer = new YT.Player('player', {
-                  width: '100%',
-                  height: '100%',
-                  videoId: '\(safeVideoID)',
-                  playerVars: {
-                    'playsinline': 1,
-                    'autoplay': 1,
-                    'controls': 0,
-                    'rel': 0,
-                    'modestbranding': 1,
-                    'fs': 0,
-                    'iv_load_policy': 3,
-                    'origin': 'https://www.youtube.com'
-                  },
-                  events: {
-                    'onReady': function(e) {
-                      e.target.playVideo();
-                      startProgressTimer();
-                    },
-                    'onStateChange': function(e) {
-                      postState(e.data);
-                    },
-                    'onError': function(e) {
-                      window.webkit.messageHandlers.auraYT.postMessage({
-                        type: 'error',
-                        currentTime: 0,
-                        duration: 0,
-                        state: -99
-                      });
-                    }
-                  }
-                });
-              }
-              function startProgressTimer() {
-                if (timerId) clearInterval(timerId);
-                timerId = setInterval(function() {
-                  if (ytPlayer && ytPlayer.getCurrentTime) {
-                    var cur = ytPlayer.getCurrentTime() || 0;
-                    var dur = ytPlayer.getDuration() || 0;
-                    var st = ytPlayer.getPlayerState ? ytPlayer.getPlayerState() : -1;
-                    window.webkit.messageHandlers.auraYT.postMessage({
-                      type: 'tick',
-                      currentTime: cur,
-                      duration: dur,
-                      state: st
-                    });
-                  }
-                }, 260);
-              }
-              function postState(st) {
-                var cur = (ytPlayer && ytPlayer.getCurrentTime) ? ytPlayer.getCurrentTime() : 0;
-                var dur = (ytPlayer && ytPlayer.getDuration) ? ytPlayer.getDuration() : 0;
-                window.webkit.messageHandlers.auraYT.postMessage({
-                  type: 'state',
-                  currentTime: cur,
-                  duration: dur,
-                  state: st
-                });
-              }
-              window.auraControl = {
-                play: function() { if (ytPlayer && ytPlayer.playVideo) ytPlayer.playVideo(); },
-                pause: function() { if (ytPlayer && ytPlayer.pauseVideo) ytPlayer.pauseVideo(); },
-                seek: function(sec) { if (ytPlayer && ytPlayer.seekTo) ytPlayer.seekTo(sec, true); },
-                setVolume: function(vol) { if (ytPlayer && ytPlayer.setVolume) ytPlayer.setVolume(vol); }
-              };
-            </script>
-            </body>
-            </html>
-            """
-            webView.loadHTMLString(embedHTML, baseURL: URL(string: "https://www.youtube.com"))
+            if let watchURL = URL(string: "https://m.youtube.com/watch?v=\(safeVideoID)") {
+                var request = URLRequest(url: watchURL)
+                request.setValue("https://m.youtube.com/", forHTTPHeaderField: "Referer")
+                webView.load(request)
+            }
         }
     }
 
