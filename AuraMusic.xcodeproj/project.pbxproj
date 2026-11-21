@@ -1,0 +1,261 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		AA000101 /* MusicDomainModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000201 /* MusicDomainModels.swift */; };
+		AA000102 /* MusicProviderProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000202 /* MusicProviderProtocol.swift */; };
+		AA000103 /* PersistenceController.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000203 /* PersistenceController.swift */; };
+		AA000104 /* ArtworkCacheManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000204 /* ArtworkCacheManager.swift */; };
+		AA000105 /* AppleMusicDesignSystem.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000205 /* AppleMusicDesignSystem.swift */; };
+		AA000106 /* ProviderCredentialsStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000206 /* ProviderCredentialsStore.swift */; };
+		AA000107 /* AppleMusicProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000207 /* AppleMusicProvider.swift */; };
+		AA000108 /* MultiCatalogProviders.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000208 /* MultiCatalogProviders.swift */; };
+		AA000109 /* SystemMediaIntegration.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000209 /* SystemMediaIntegration.swift */; };
+		AA000110 /* UniversalAudioPlayerEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000210 /* UniversalAudioPlayerEngine.swift */; };
+		AA000111 /* LyricsServiceAndView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000211 /* LyricsServiceAndView.swift */; };
+		AA000112 /* DownloadManagerAndView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000212 /* DownloadManagerAndView.swift */; };
+		AA000113 /* PlaylistManagerAndViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000213 /* PlaylistManagerAndViews.swift */; };
+		AA000114 /* LibraryAndLocalFileImporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000214 /* LibraryAndLocalFileImporter.swift */; };
+		AA000115 /* UnifiedSearchView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000215 /* UnifiedSearchView.swift */; };
+		AA000116 /* SettingsAndPersonalizationView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000216 /* SettingsAndPersonalizationView.swift */; };
+		AA000117 /* ListenNowBrowseRadioViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000217 /* ListenNowBrowseRadioViews.swift */; };
+		AA000118 /* AppleMusicPlayerOverlayView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000218 /* AppleMusicPlayerOverlayView.swift */; };
+		AA000119 /* AuraMusicApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000219 /* AuraMusicApp.swift */; };
+		AA000120 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = AA000220 /* Assets.xcassets */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		AA000001 /* AuraMusic.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AuraMusic.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		AA000201 /* MusicDomainModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuraMusic/Core/MusicDomainModels.swift; sourceTree = "<group>"; };
+		AA000202 /* MusicProviderProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuraMusic/Core/MusicProviderProtocol.swift; sourceTree = "<group>"; };
+		AA000203 /* PersistenceController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuraMusic/Persistence/PersistenceController.swift; sourceTree = "<group>"; };
+		AA000204 /* ArtworkCacheManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuraMusic/Persistence/ArtworkCacheManager.swift; sourceTree = "<group>"; };
+		AA000205 /* AppleMusicDesignSystem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuraMusic/DesignSystem/AppleMusicDesignSystem.swift; sourceTree = "<group>"; };
+		AA000206 /* ProviderCredentialsStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuraMusic/MusicProviders/ProviderCredentialsStore.swift; sourceTree = "<group>"; };
+		AA000207 /* AppleMusicProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuraMusic/MusicProviders/AppleMusicProvider.swift; sourceTree = "<group>"; };
+		AA000208 /* MultiCatalogProviders.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuraMusic/MusicProviders/MultiCatalogProviders.swift; sourceTree = "<group>"; };
+		AA000209 /* SystemMediaIntegration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuraMusic/Integrations/SystemMediaIntegration.swift; sourceTree = "<group>"; };
+		AA000210 /* UniversalAudioPlayerEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuraMusic/MusicEngine/UniversalAudioPlayerEngine.swift; sourceTree = "<group>"; };
+		AA000211 /* LyricsServiceAndView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuraMusic/Lyrics/LyricsServiceAndView.swift; sourceTree = "<group>"; };
+		AA000212 /* DownloadManagerAndView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuraMusic/Downloads/DownloadManagerAndView.swift; sourceTree = "<group>"; };
+		AA000213 /* PlaylistManagerAndViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuraMusic/Playlists/PlaylistManagerAndViews.swift; sourceTree = "<group>"; };
+		AA000214 /* LibraryAndLocalFileImporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuraMusic/Library/LibraryAndLocalFileImporter.swift; sourceTree = "<group>"; };
+		AA000215 /* UnifiedSearchView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuraMusic/Search/UnifiedSearchView.swift; sourceTree = "<group>"; };
+		AA000216 /* SettingsAndPersonalizationView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuraMusic/Settings/SettingsAndPersonalizationView.swift; sourceTree = "<group>"; };
+		AA000217 /* ListenNowBrowseRadioViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuraMusic/App/ListenNowBrowseRadioViews.swift; sourceTree = "<group>"; };
+		AA000218 /* AppleMusicPlayerOverlayView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuraMusic/App/AppleMusicPlayerOverlayView.swift; sourceTree = "<group>"; };
+		AA000219 /* AuraMusicApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuraMusic/App/AuraMusicApp.swift; sourceTree = "<group>"; };
+		AA000220 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = AuraMusic/Resources/Assets.xcassets; sourceTree = "<group>"; };
+		AA000221 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = AuraMusic/Info.plist; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXGroup section */
+		AA000300 = {
+			isa = PBXGroup;
+			children = (
+				AA000201 /* MusicDomainModels.swift */,
+				AA000202 /* MusicProviderProtocol.swift */,
+				AA000203 /* PersistenceController.swift */,
+				AA000204 /* ArtworkCacheManager.swift */,
+				AA000205 /* AppleMusicDesignSystem.swift */,
+				AA000206 /* ProviderCredentialsStore.swift */,
+				AA000207 /* AppleMusicProvider.swift */,
+				AA000208 /* MultiCatalogProviders.swift */,
+				AA000209 /* SystemMediaIntegration.swift */,
+				AA000210 /* UniversalAudioPlayerEngine.swift */,
+				AA000211 /* LyricsServiceAndView.swift */,
+				AA000212 /* DownloadManagerAndView.swift */,
+				AA000213 /* PlaylistManagerAndViews.swift */,
+				AA000214 /* LibraryAndLocalFileImporter.swift */,
+				AA000215 /* UnifiedSearchView.swift */,
+				AA000216 /* SettingsAndPersonalizationView.swift */,
+				AA000217 /* ListenNowBrowseRadioViews.swift */,
+				AA000218 /* AppleMusicPlayerOverlayView.swift */,
+				AA000219 /* AuraMusicApp.swift */,
+				AA000220 /* Assets.xcassets */,
+				AA000221 /* Info.plist */,
+				AA000301 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		AA000301 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				AA000001 /* AuraMusic.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		AA000400 /* AuraMusic */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = AA000700 /* Build configuration list for PBXNativeTarget "AuraMusic" */;
+			buildPhases = (
+				AA000500 /* Sources */,
+				AA000600 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = AuraMusic;
+			productName = AuraMusic;
+			productReference = AA000001 /* AuraMusic.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		AA000800 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1600;
+				LastUpgradeCheck = 1600;
+			};
+			buildConfigurationList = AA000900 /* Build configuration list for PBXProject "AuraMusic" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = AA000300;
+			productRefGroup = AA000301 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				AA000400 /* AuraMusic */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		AA000600 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AA000120 /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		AA000500 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AA000101 /* MusicDomainModels.swift in Sources */,
+				AA000102 /* MusicProviderProtocol.swift in Sources */,
+				AA000103 /* PersistenceController.swift in Sources */,
+				AA000104 /* ArtworkCacheManager.swift in Sources */,
+				AA000105 /* AppleMusicDesignSystem.swift in Sources */,
+				AA000106 /* ProviderCredentialsStore.swift in Sources */,
+				AA000107 /* AppleMusicProvider.swift in Sources */,
+				AA000108 /* MultiCatalogProviders.swift in Sources */,
+				AA000109 /* SystemMediaIntegration.swift in Sources */,
+				AA000110 /* UniversalAudioPlayerEngine.swift in Sources */,
+				AA000111 /* LyricsServiceAndView.swift in Sources */,
+				AA000112 /* DownloadManagerAndView.swift in Sources */,
+				AA000113 /* PlaylistManagerAndViews.swift in Sources */,
+				AA000114 /* LibraryAndLocalFileImporter.swift in Sources */,
+				AA000115 /* UnifiedSearchView.swift in Sources */,
+				AA000116 /* SettingsAndPersonalizationView.swift in Sources */,
+				AA000117 /* ListenNowBrowseRadioViews.swift in Sources */,
+				AA000118 /* AppleMusicPlayerOverlayView.swift in Sources */,
+				AA000119 /* AuraMusicApp.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		AA000701 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				INFOPLIST_FILE = AuraMusic/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MARKETING_VERSION = 1.0.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.personal.auramusic.player;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 5.10;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Debug;
+		};
+		AA000702 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				INFOPLIST_FILE = AuraMusic/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				MARKETING_VERSION = 1.0.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.personal.auramusic.player;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_VERSION = 5.10;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Release;
+		};
+		AA000901 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 5.10;
+			};
+			name = Debug;
+		};
+		AA000902 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
+				SDKROOT = iphoneos;
+				SWIFT_VERSION = 5.10;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		AA000700 /* Build configuration list for PBXNativeTarget "AuraMusic" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				AA000701 /* Debug */,
+				AA000702 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		AA000900 /* Build configuration list for PBXProject "AuraMusic" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				AA000901 /* Debug */,
+				AA000902 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = AA000800 /* Project object */;
+}
