@@ -26,6 +26,15 @@ public final class ArtworkCacheManager: ObservableObject {
             return cached
         }
 
+        if url.isFileURL {
+            if let data = try? Data(contentsOf: url),
+               let localImg = UIImage(data: data) {
+                memoryCache.setObject(localImg, forKey: key)
+                return localImg
+            }
+            return nil
+        }
+
         let diskURL = diskFileURL(for: url)
         if fileManager.fileExists(atPath: diskURL.path),
            let data = try? Data(contentsOf: diskURL),
