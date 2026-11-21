@@ -20,13 +20,13 @@ public struct AppleMusicPlayerOverlayView: View {
 
     public var body: some View {
         ZStack(alignment: .bottom) {
-            // Keep YouTube Music audio bridge alive with >= 200x200 viewport required by YouTube HTML5 IFrame API
+            // Keep YouTube Music audio bridge alive at full opacity (behind the opaque UI) so iOS WebKit never suspends playback
             if let videoID = player.activeYouTubeVideoID,
                (!player.isPlayerExpanded || !player.isYouTubeVideoVisible || player.activeOverlayTab != .none) {
                 AuthorizedYouTubeIFramePlayerView(videoID: videoID)
                     .frame(width: 220, height: 220)
-                    .opacity(0.015)
                     .allowsHitTesting(false)
+                    .zIndex(-1)
             }
 
             if let track = player.currentTrack {
