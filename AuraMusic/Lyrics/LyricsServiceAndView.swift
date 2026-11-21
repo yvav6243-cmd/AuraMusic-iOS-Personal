@@ -168,7 +168,8 @@ public final class LyricsService: ObservableObject {
                 title: track.title,
                 artist: track.artist,
                 syncedLRC: cached.syncedLRC,
-                plainLyrics: cached.plainLyrics
+                plainLyrics: cached.plainLyrics,
+                trackDuration: track.duration
             )
             self.isLoading = false
             return
@@ -187,23 +188,18 @@ public final class LyricsService: ObservableObject {
                 allCandidates.append(contentsOf: search1)
             }
 
-            // If no synced lyrics found yet, try searching by clean title alone
-            if !allCandidates.contains(where: { !($0.syncedLyrics ?? "").isEmpty }) {
-                if let search2 = try? await searchLRCLIB(title: parsedTitle, artist: "") {
-                    allCandidates.append(contentsOf: search2)
-                }
+            // Always also query by clean song title alone (handles YouTube label channels like Gazgolder, VEVO, 1theK, HYBE)
+            if let search2 = try? await searchLRCLIB(title: parsedTitle, artist: "") {
+                allCandidates.append(contentsOf: search2)
             }
 
-            // Stage 3: Resolve canonical song title & artist via iTunes catalog metadata if YouTube title was heavily stylized
-            if !allCandidates.contains(where: { !($0.syncedLyrics ?? "").isEmpty }) {
-                if let canonical = await resolveCanonicalMetadataFromCatalog(query: "\(parsedTitle) \(parsedArtist)") {
-                    if let search3 = try? await searchLRCLIB(title: canonical.title, artist: canonical.artist) {
-                        allCandidates.append(contentsOf: search3)
-                    }
-                    if !allCandidates.contains(where: { !($0.syncedLyrics ?? "").isEmpty }),
-                       let search4 = try? await searchLRCLIB(title: canonical.title, artist: "") {
-                        allCandidates.append(contentsOf: search4)
-                    }
+            // Stage 3: Resolve canonical song title & artist via iTunes catalog metadata
+            if let canonical = await resolveCanonicalMetadataFromCatalog(query: "\(parsedTitle) \(parsedArtist)") {
+                if let search3 = try? await searchLRCLIB(title: canonical.title, artist: canonical.artist) {
+                    allCandidates.append(contentsOf: search3)
+                }
+                if let search4 = try? await searchLRCLIB(title: canonical.title, artist: "") {
+                    allCandidates.append(contentsOf: search4)
                 }
             }
 
@@ -223,7 +219,8 @@ public final class LyricsService: ObservableObject {
                     title: track.title,
                     artist: track.artist,
                     syncedLRC: bestDTO.syncedLyrics,
-                    plainLyrics: bestDTO.plainLyrics
+                    plainLyrics: bestDTO.plainLyrics,
+                    trackDuration: track.duration
                 )
                 self.isLoading = false
                 return
@@ -425,7 +422,8 @@ public final class LyricsService: ObservableObject {
             title: track.title,
             artist: track.artist,
             syncedLRC: dto.syncedLyrics,
-            plainLyrics: dto.plainLyrics
+            plainLyrics: dto.plainLyrics,
+            trackDuration: track.duration
         )
         self.errorMessage = nil
     }
@@ -495,13 +493,18 @@ public final class LyricsService: ObservableObject {
         try? context.save()
     }
 
-    private func buildDocument(title: String, artist: String, syncedLRC: String?, plainLyrics: String?) -> TrackLyricsDocument? {
+    private func buildDocument(
+        title: String,
+        artist: String,
+        syncedLRC: String?,
+        plainLyrics: String?,
+        trackDuration: TimeInterval = 200
+    ) -> TrackLyricsDocument? {
         if let syncedLRC, !syncedLRC.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             let parsedLines = LRCParser.parseSyncedLRC(syncedLRC)
             if !parsedLines.isEmpty {
                 let fullSample = parsedLines.map(\.text).joined(separator: "\n")
                 let lang = LRCParser.detectScriptLanguage(for: fullSample)
-                let hasTrans = parsedLines.contains { $0.translatedText != nil }
                 return TrackLyricsDocument(
                     trackTitle: title,
                     artistName: artist,
@@ -510,24 +513,45 @@ public final class LyricsService: ObservableObject {
                     detectedLanguageDisplayName: lang.displayName,
                     syncedLines: parsedLines,
                     plainLines: parsedLines.map(\.text),
-                    hasTranslationAvailable: hasTrans
+                    hasTranslationAvailable: false
                 )
             }
         }
 
         if let plainLyrics, !plainLyrics.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            let lines = plainLyrics
+            let rawLines = plainLyrics
                 .components(separatedBy: .newlines)
-                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+            guard !rawLines.isEmpty else { return nil }
+
+            // Automatically distribute timestamps proportionally across the track duration
+            // so even plain lyrics in any language highlight line-by-line and auto-scroll smoothly!
+            let totalDur = trackDuration > 30 ? trackDuration : 200.0
+            let introOffset = min(6.0, totalDur * 0.05)
+            let activeSpan = max(totalDur - introOffset - 6.0, Double(rawLines.count) * 2.5)
+            let step = activeSpan / Double(max(rawLines.count, 1))
+
+            let autoSyncedLines = rawLines.enumerated().map { idx, text in
+                let parts = text.components(separatedBy: " // ")
+                let cleanOriginal = (parts.first ?? text).trimmingCharacters(in: .whitespacesAndNewlines)
+                return SyncedLyricLine(
+                    index: idx,
+                    timestamp: introOffset + (Double(idx) * step),
+                    text: cleanOriginal.isEmpty ? "•••" : cleanOriginal,
+                    translatedText: nil
+                )
+            }
+
             let lang = LRCParser.detectScriptLanguage(for: plainLyrics)
             return TrackLyricsDocument(
                 trackTitle: title,
                 artistName: artist,
-                isSynchronized: false,
+                isSynchronized: true,
                 detectedLanguageCode: lang.code,
                 detectedLanguageDisplayName: lang.displayName,
-                syncedLines: [],
-                plainLines: lines,
+                syncedLines: autoSyncedLines,
+                plainLines: rawLines,
                 hasTranslationAvailable: false
             )
         }
