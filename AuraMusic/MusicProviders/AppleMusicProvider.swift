@@ -240,7 +240,7 @@ public final class AppleMusicProvider: MusicProviderProtocol, @unchecked Sendabl
         if let stream = track.streamURL {
             return stream
         }
-        // Lookup by track ID via iTunes Lookup API
+        // 1. Lookup by track ID via iTunes Lookup API
         var components = URLComponents(string: "https://itunes.apple.com/lookup")!
         components.queryItems = [URLQueryItem(name: "id", value: track.providerTrackID)]
         if let url = components.url,
@@ -249,6 +249,13 @@ public final class AppleMusicProvider: MusicProviderProtocol, @unchecked Sendabl
            let first = decoded.results.first,
            let previewStr = first.previewUrl,
            let resolved = URL(string: previewStr) {
+            return resolved
+        }
+        // 2. Fallback: search by title + artist if chart track ID was storefront-specific
+        let fallbackQuery = "\(track.title) \(track.artist)"
+        if let searchMatches = try? await searchTracks(query: fallbackQuery, limit: 2),
+           let matchWithPreview = searchMatches.first(where: { $0.previewURL != nil }),
+           let resolved = matchWithPreview.previewURL {
             return resolved
         }
         return nil
