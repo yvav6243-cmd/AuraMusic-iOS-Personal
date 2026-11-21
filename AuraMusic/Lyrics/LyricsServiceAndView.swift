@@ -403,33 +403,80 @@ public struct LRCLIBEntryDTO: Codable, Identifiable, Sendable {
     public var syncedLyrics: String?
 }
 
-// MARK: - Apple Music Sing / Karaoke Animated Instrumental Waiting Dots
+// MARK: - Apple Music Stationary Instrumental Progress Dots (1/3 -> 1 dot, 2/3 -> 2 dots, 3/3 -> 3 dots)
 
-public struct AppleMusicInstrumentalDotsView: View {
-    public let isActive: Bool
-    @State private var pulse: Bool = false
+public struct AppleMusicInstrumentalDotsView: View, Equatable {
+    public let litDotsCount: Int
 
-    public init(isActive: Bool) {
-        self.isActive = isActive
+    public init(litDotsCount: Int) {
+        self.litDotsCount = litDotsCount
     }
 
     public var body: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 10) {
             ForEach(0..<3, id: \.self) { index in
+                let isLit = index < litDotsCount
                 Circle()
-                    .fill(Color.white.opacity(isActive ? 0.95 : 0.35))
-                    .frame(width: 11, height: 11)
-                    .scaleEffect(pulse && isActive ? 1.25 : 0.85)
-                    .animation(
-                        isActive
-                            ? .easeInOut(duration: 0.55).repeatForever(autoreverses: true).delay(Double(index) * 0.18)
-                            : .default,
-                        value: pulse
-                    )
+                    .fill(Color.white.opacity(isLit ? 1.0 : 0.25))
+                    .frame(width: 10, height: 10)
             }
         }
         .padding(.vertical, 6)
-        .onAppear { pulse = true }
+        .animation(.easeInOut(duration: 0.2), value: litDotsCount)
+    }
+
+    /// Computes how many dots (0...3) should be lit based on elapsed fraction of the pause
+    public static func calculateLitDots(currentTime: TimeInterval, startTime: TimeInterval, endTime: TimeInterval) -> Int {
+        let duration = endTime - startTime
+        guard duration > 0.2 else { return 3 }
+        let elapsed = currentTime - startTime
+        let progress = elapsed / duration
+        if progress >= 0.90 {
+            return 3
+        } else if progress >= 0.66 {
+            return 2
+        } else if progress >= 0.33 {
+            return 1
+        } else {
+            return 0
+        }
+    }
+}
+
+// MARK: - High-Performance Equatable Lyric Row (Prevents Re-Rendering Inactive Lines)
+
+private struct EquatableSyncedLyricRowView: View, Equatable {
+    let line: SyncedLyricLine
+    let isCurrent: Bool
+    let showTranslationOverlay: Bool
+    let litDotsCount: Int
+
+    static func == (lhs: EquatableSyncedLyricRowView, rhs: EquatableSyncedLyricRowView) -> Bool {
+        lhs.line.id == rhs.line.id &&
+        lhs.isCurrent == rhs.isCurrent &&
+        lhs.showTranslationOverlay == rhs.showTranslationOverlay &&
+        lhs.litDotsCount == rhs.litDotsCount
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if line.text == "•••" {
+                AppleMusicInstrumentalDotsView(litDotsCount: isCurrent ? litDotsCount : 0)
+            } else {
+                Text(line.text)
+                    .font(.system(size: isCurrent ? 29 : 24, weight: .bold))
+                    .foregroundStyle(.white.opacity(isCurrent ? 1.0 : 0.34))
+            }
+
+            if showTranslationOverlay, let translated = line.translatedText {
+                Text(translated)
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.white.opacity(isCurrent ? 0.85 : 0.30))
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 4)
+        .contentShape(Rectangle())
     }
 }
 
@@ -609,64 +656,63 @@ public struct SynchronizedLyricsView: View {
     private func synchronizedLyricsScroll(doc: TrackLyricsDocument) -> some View {
         ScrollViewReader { proxy in
             ScrollView(.vertical, showsIndicators: false) {
-                LazyVStack(alignment: .leading, spacing: 26) {
-                    Spacer().frame(height: 24)
+                LazyVStack(alignment: .leading, spacing: 22) {
+                    Spacer().frame(height: 20)
 
-                    if isInIntroBeforeFirstLine {
-                        AppleMusicInstrumentalDotsView(isActive: player.isPlaying)
+                    if isInIntroBeforeFirstLine, let firstLine = doc.syncedLines.first {
+                        let introDots = AppleMusicInstrumentalDotsView.calculateLitDots(
+                            currentTime: player.currentTime,
+                            startTime: 0,
+                            endTime: firstLine.timestamp
+                        )
+                        AppleMusicInstrumentalDotsView(litDotsCount: introDots)
                             .id(-1)
                     }
 
                     ForEach(doc.syncedLines) { line in
                         let isCurrent = (activeLineIndex == line.index)
-                        let distance = abs((activeLineIndex ?? 0) - line.index)
+                        let nextTimestamp: TimeInterval = (line.index + 1 < doc.syncedLines.count)
+                            ? doc.syncedLines[line.index + 1].timestamp
+                            : max(player.duration, line.timestamp + 6.0)
+                        let dotStage = (isCurrent && line.text == "•••")
+                            ? AppleMusicInstrumentalDotsView.calculateLitDots(
+                                currentTime: player.currentTime,
+                                startTime: line.timestamp,
+                                endTime: nextTimestamp
+                            )
+                            : 0
 
-                        VStack(alignment: .leading, spacing: 6) {
-                            if line.text == "•••" {
-                                AppleMusicInstrumentalDotsView(isActive: isCurrent && player.isPlaying)
-                            } else {
-                                Text(line.text)
-                                    .font(.system(size: isCurrent ? 31 : 25, weight: .heavy))
-                                    .foregroundStyle(.white.opacity(isCurrent ? 1.0 : 0.34))
-                                    .shadow(color: isCurrent ? .white.opacity(0.32) : .clear, radius: 10, x: 0, y: 0)
-                                    .scaleEffect(isCurrent ? 1.03 : 0.96, anchor: .leading)
-                                    .blur(radius: isUserManualScrolling || isCurrent ? 0 : min(CGFloat(distance) * 0.5, 2.0))
-                            }
-
-                            if showTranslationOverlay, let translated = line.translatedText {
-                                Text(translated)
-                                    .font(.system(size: 15, weight: .semibold))
-                                    .foregroundStyle(.white.opacity(isCurrent ? 0.85 : 0.30))
-                            }
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.vertical, 4)
-                        .contentShape(Rectangle())
+                        EquatableSyncedLyricRowView(
+                            line: line,
+                            isCurrent: isCurrent,
+                            showTranslationOverlay: showTranslationOverlay,
+                            litDotsCount: dotStage
+                        )
+                        .equatable()
                         .id(line.index)
                         .onTapGesture {
                             isUserManualScrolling = false
-                            withAnimation(AuraTheme.springInteractive) {
-                                player.seek(to: line.timestamp)
-                                if !player.isPlaying {
-                                    player.resume()
-                                }
+                            player.seek(to: line.timestamp)
+                            if !player.isPlaying {
+                                player.resume()
                             }
                         }
-                        .animation(AuraTheme.springInteractive, value: activeLineIndex)
                     }
 
-                    Spacer().frame(height: 160)
+                    Spacer().frame(height: 150)
                 }
                 .padding(.horizontal, 26)
             }
             .simultaneousGesture(
                 DragGesture().onChanged { _ in
-                    isUserManualScrolling = true
+                    if !isUserManualScrolling {
+                        isUserManualScrolling = true
+                    }
                 }
             )
             .onChange(of: activeLineIndex) { _, newIndex in
                 guard !isUserManualScrolling, let newIndex else { return }
-                withAnimation(.spring(response: 0.45, dampingFraction: 0.84)) {
+                withAnimation(.easeInOut(duration: 0.32)) {
                     proxy.scrollTo(newIndex, anchor: .center)
                 }
             }
