@@ -1,0 +1,61 @@
+name: Build iOS IPA for Windows Sideloading
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-unsigned-ipa:
+    name: Build AuraMusic.ipa on macOS 15 (Xcode 16)
+    runs-on: macos-15
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 16
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      - name: Install XcodeGen & Generate AuraMusic.xcodeproj
+        run: |
+          brew list xcodegen || brew install xcodegen
+          xcodegen generate
+
+      - name: Run Unit Tests on iOS Simulator
+        run: |
+          SIM_ID=$(xcrun simctl list devices available | grep -m 1 "iPhone 16" | sed -E 's/.*\(([0-9A-F-]+)\).*/\1/')
+          if [ -n "$SIM_ID" ]; then
+            xcodebuild test \
+              -project AuraMusic.xcodeproj \
+              -scheme AuraMusic \
+              -destination "platform=iOS Simulator,id=$SIM_ID" \
+              CODE_SIGNING_ALLOWED=NO
+          fi
+
+      - name: Build Release iOS App Archive (Unsigned for Windows Sideloadly / AltStore / SideStore)
+        run: |
+          xcodebuild clean build \
+            -project AuraMusic.xcodeproj \
+            -scheme AuraMusic \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Package AuraMusic.ipa Artifact
+        run: |
+          mkdir -p build/Payload
+          cp -R build/DerivedData/Build/Products/Release-iphoneos/AuraMusic.app build/Payload/
+          cd build
+          zip -qry AuraMusic.ipa Payload
+          ls -lh AuraMusic.ipa
+
+      - name: Upload AuraMusic.ipa for Windows Download
+        uses: actions/upload-artifact@v4
+        with:
+          name: AuraMusic-iOS-IPA
+          path: build/AuraMusic.ipa
+          retention-days: 30
