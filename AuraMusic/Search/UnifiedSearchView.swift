@@ -61,6 +61,20 @@ public final class UnifiedSearchViewModel: ObservableObject {
         isSearching = true
         PersistenceController.shared.addSearchQuery(trimmed)
 
+        // 1. Direct YouTube / YouTube Music URL Paste Resolution
+        if YouTubeMusicProvider.extractYouTubeVideoID(from: trimmed) != nil {
+            if let resolvedTrack = await ytMusicProvider.resolveTrackFromYouTubeURL(trimmed) {
+                PersistenceController.shared.upsertTrack(resolvedTrack, addToLibrary: true)
+                self.groupedTrackResults = [TrackVariantGroup(primaryTrack: resolvedTrack, variants: [resolvedTrack])]
+                self.albumResults = []
+                self.artistResults = []
+                self.lyricMatchResults = []
+                self.isSearching = false
+                UniversalAudioPlayerEngine.shared.play(resolvedTrack, queue: [resolvedTrack])
+                return
+            }
+        }
+
         let creds = ProviderCredentialsStore.shared
         let localMatches = PersistenceController.shared.libraryTracks
             .filter {
