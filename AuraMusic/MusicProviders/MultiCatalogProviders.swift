@@ -419,7 +419,7 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
                       state: st
                     });
                   }
-                }, 150);
+                }, 260);
               }
               function postState(st) {
                 var cur = (ytPlayer && ytPlayer.getCurrentTime) ? ytPlayer.getCurrentTime() : 0;
