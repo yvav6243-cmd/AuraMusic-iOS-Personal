@@ -816,13 +816,17 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
             });
 
             var origPause = HTMLMediaElement.prototype.pause;
+            window._auraOrigPause = origPause;
             HTMLMediaElement.prototype.pause = function() {
-              if (window._auraAllowPause === true || this.ended) {
+              var inBgProtect = Date.now() < (window._auraBgProtectUntil || 0);
+              if (!inBgProtect || window._auraAllowPause === true || window._auraUserPaused === true || this.ended) {
                 return origPause.apply(this, arguments);
               }
               var self = this;
               setTimeout(function() {
-                if (!window._auraUserPaused) { try { self.play(); } catch(e) {} }
+                if (!window._auraUserPaused && Date.now() < (window._auraBgProtectUntil || 0)) {
+                  try { self.play(); } catch(e) {}
+                }
               }, 25);
             };
 
@@ -897,6 +901,8 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
 
           function forceUnmuteAndPlayIfNeeded(v, forceUnmute) {
             try {
+              // Respect user pause strictly — never auto-resume when user paused in app or from Lock Screen / Control Center / AirPods
+              if (window._auraUserPaused === true) return;
               v.setAttribute('playsinline', '');
               v.setAttribute('webkit-playsinline', '');
               var mp = document.getElementById('movie_player');
@@ -939,6 +945,12 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
             } catch(e) {}
           }
 
+          function postMessageToSwift(payload) {
+            if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.auraYT) {
+              window.webkit.messageHandlers.auraYT.postMessage(payload);
+            }
+          }
+
           window.auraControl = {
             play: function() {
               window._auraUserPaused = false;
@@ -951,17 +963,39 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
             pause: function() {
               window._auraUserPaused = true;
               window._auraAllowPause = true;
+              window._auraBgProtectUntil = 0;
               var v = document.querySelector('video');
-              if (v) v.pause();
+              if (v) {
+                try {
+                  if (window._auraOrigPause) { window._auraOrigPause.call(v); }
+                  else { v.pause(); }
+                } catch(e) {}
+              }
               var mp = document.getElementById('movie_player');
               if (mp && mp.pauseVideo) { try { mp.pauseVideo(); } catch(e) {} }
-              setTimeout(function() { window._auraAllowPause = false; }, 100);
+              if (v) {
+                postMessageToSwift({
+                  type: 'tick',
+                  currentTime: v.currentTime || 0,
+                  duration: (isFinite(v.duration) && v.duration > 0) ? v.duration : 0,
+                  state: 2,
+                  userPaused: true
+                });
+              }
             },
             resume: function() {
               window._auraUserPaused = false;
               window._auraAllowPause = false;
               var v = document.querySelector('video');
               if (v) {
+                forceUnmuteAndPlayIfNeeded(v, false);
+              }
+            },
+            enterBackgroundProtect: function(ms) {
+              if (window._auraUserPaused === true) return;
+              window._auraBgProtectUntil = Date.now() + (ms || 1800);
+              var v = document.querySelector('video');
+              if (v && v.paused && !v.ended) {
                 forceUnmuteAndPlayIfNeeded(v, false);
               }
             },
@@ -985,7 +1019,29 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
             }
           };
 
-          function postCurrentVideoTick(v) {
+          function installMediaSessionHandlers() {
+            try {
+              if (!navigator.mediaSession || !navigator.mediaSession.setActionHandler) return;
+              navigator.mediaSession.setActionHandler('pause', function() {
+                window._auraBgProtectUntil = 0;
+                window.auraControl.pause();
+                postMessageToSwift({ type: 'remotePause' });
+              });
+              navigator.mediaSession.setActionHandler('play', function() {
+                window.auraControl.resume();
+                postMessageToSwift({ type: 'remotePlay' });
+              });
+              navigator.mediaSession.setActionHandler('nexttrack', function() {
+                postMessageToSwift({ type: 'remoteNext' });
+              });
+              navigator.mediaSession.setActionHandler('previoustrack', function() {
+                postMessageToSwift({ type: 'remotePrev' });
+              });
+            } catch(e) {}
+          }
+          installMediaSessionHandlers();
+
+          function postCurrentVideoTick(v, extraFlags) {
             if (!v) return;
             var cur = v.currentTime || 0;
             var dur = v.duration || 0;
@@ -995,35 +1051,43 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
             } else if (v.paused) {
               st = (!window._auraUserPaused && (cur <= 0.05 || v.readyState < 3)) ? 3 : 2;
             }
-            if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.auraYT) {
-              window.webkit.messageHandlers.auraYT.postMessage({
-                type: 'tick',
-                currentTime: cur,
-                duration: (isFinite(dur) && dur > 0) ? dur : 0,
-                state: st
-              });
+            var payload = {
+              type: 'tick',
+              currentTime: cur,
+              duration: (isFinite(dur) && dur > 0) ? dur : 0,
+              state: st,
+              userPaused: window._auraUserPaused === true
+            };
+            if (extraFlags) {
+              if (extraFlags.userPaused !== undefined) payload.userPaused = extraFlags.userPaused;
+              if (extraFlags.userResumed !== undefined) payload.userResumed = extraFlags.userResumed;
             }
+            postMessageToSwift(payload);
           }
 
           var ticksWithoutVideo = 0;
+          var mediaSessionTickCounter = 0;
           setInterval(function() {
+            mediaSessionTickCounter++;
+            if (mediaSessionTickCounter % 10 === 0) {
+              installMediaSessionHandlers();
+            }
+
             var skipBtn = document.querySelector('.ytp-ad-skip-button, .ytp-ad-skip-button-modern, .ytp-skip-ad-button');
             if (skipBtn) { try { skipBtn.click(); } catch(e) {} }
 
             var errBox = document.querySelector('.player-error-message-container, ytm-playability-error-supported-renderers');
             if (errBox && errBox.offsetParent !== null && errBox.innerText && errBox.innerText.trim().length > 3) {
-              if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.auraYT) {
-                window.webkit.messageHandlers.auraYT.postMessage({ type: 'error', currentTime: 0, duration: 0, state: -99 });
-                return;
-              }
+              postMessageToSwift({ type: 'error', currentTime: 0, duration: 0, state: -99 });
+              return;
             }
 
             var v = document.querySelector('video');
             if (!v) {
               ticksWithoutVideo++;
-              if (ticksWithoutVideo > 40 && window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.auraYT) {
+              if (ticksWithoutVideo > 40) {
                 ticksWithoutVideo = 0;
-                window.webkit.messageHandlers.auraYT.postMessage({ type: 'error', currentTime: 0, duration: 0, state: -99 });
+                postMessageToSwift({ type: 'error', currentTime: 0, duration: 0, state: -99 });
               }
               return;
             }
@@ -1031,10 +1095,52 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
 
             if (!v._auraListenersAttached) {
               v._auraListenersAttached = true;
-              v.addEventListener('timeupdate', function() { postCurrentVideoTick(v); });
-              v.addEventListener('playing', function() { postCurrentVideoTick(v); });
-              v.addEventListener('pause', function() { postCurrentVideoTick(v); });
+              v.addEventListener('timeupdate', function() {
+                if (!v.paused && v.currentTime > 0.25) { v._auraHasPlayedOnce = true; }
+                postCurrentVideoTick(v);
+              });
+              v.addEventListener('play', function() {
+                var wasUserPaused = (window._auraUserPaused === true);
+                window._auraUserPaused = false;
+                window._auraAllowPause = false;
+                if (wasUserPaused) {
+                  postCurrentVideoTick(v, { userPaused: false, userResumed: true });
+                }
+              });
+              v.addEventListener('playing', function() {
+                var wasUserPaused = (window._auraUserPaused === true);
+                v._auraHasPlayedOnce = true;
+                window._auraUserPaused = false;
+                window._auraAllowPause = false;
+                postCurrentVideoTick(v, { userPaused: false, userResumed: wasUserPaused });
+              });
+              v.addEventListener('pause', function() {
+                if (v.ended) {
+                  postCurrentVideoTick(v);
+                  return;
+                }
+                var inBgProtect = Date.now() < (window._auraBgProtectUntil || 0);
+                if (inBgProtect && !window._auraUserPaused) {
+                  // iOS tried to auto-pause right when minimizing the app — immediately keep playing smoothly
+                  forceUnmuteAndPlayIfNeeded(v, false);
+                  return;
+                }
+                if (v._auraHasPlayedOnce && v.currentTime > 0.25) {
+                  // Genuine pause triggered from Lock Screen, Control Center, AirPods, or user tap — honor it and stay paused!
+                  window._auraUserPaused = true;
+                  window._auraAllowPause = true;
+                  var mp = document.getElementById('movie_player');
+                  if (mp && mp.pauseVideo) { try { mp.pauseVideo(); } catch(e) {} }
+                  postCurrentVideoTick(v, { userPaused: true });
+                } else {
+                  postCurrentVideoTick(v);
+                }
+              });
               v.addEventListener('ended', function() { postCurrentVideoTick(v); });
+            }
+
+            if (!v.paused && v.currentTime > 0.25) {
+              v._auraHasPlayedOnce = true;
             }
 
             forceUnmuteAndPlayIfNeeded(v, false);
@@ -1088,21 +1194,46 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
 
         public func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
             guard let dict = message.body as? [String: Any] else { return }
-            if let msgType = dict["type"] as? String,
-               msgType == "audioStream",
-               let audioURLString = dict["audioURL"] as? String,
-               let audioURL = URL(string: audioURLString),
-               let vid = loadedVideoID {
-                Task { @MainActor in
-                    self.playerEngine?.recordCapturedYouTubeAudioStreamURL(audioURL, forVideoID: vid)
+            if let msgType = dict["type"] as? String {
+                switch msgType {
+                case "audioStream":
+                    if let audioURLString = dict["audioURL"] as? String,
+                       let audioURL = URL(string: audioURLString),
+                       let vid = loadedVideoID {
+                        Task { @MainActor in
+                            self.playerEngine?.recordCapturedYouTubeAudioStreamURL(audioURL, forVideoID: vid)
+                        }
+                    }
+                    return
+                case "remotePause":
+                    Task { @MainActor in self.playerEngine?.pause() }
+                    return
+                case "remotePlay":
+                    Task { @MainActor in self.playerEngine?.resume() }
+                    return
+                case "remoteNext":
+                    Task { @MainActor in self.playerEngine?.skipToNext() }
+                    return
+                case "remotePrev":
+                    Task { @MainActor in self.playerEngine?.skipToPrevious() }
+                    return
+                default:
+                    break
                 }
-                return
             }
             let cur = (dict["currentTime"] as? Double) ?? 0
             let dur = (dict["duration"] as? Double) ?? 0
             let st = (dict["state"] as? Int) ?? -1
+            let userPaused = (dict["userPaused"] as? Bool) ?? false
+            let userResumed = (dict["userResumed"] as? Bool) ?? false
             Task { @MainActor in
-                self.playerEngine?.handleYouTubePlayerEvent(currentTime: cur, duration: dur, stateCode: st)
+                self.playerEngine?.handleYouTubePlayerEvent(
+                    currentTime: cur,
+                    duration: dur,
+                    stateCode: st,
+                    userPaused: userPaused,
+                    userResumed: userResumed
+                )
             }
         }
     }

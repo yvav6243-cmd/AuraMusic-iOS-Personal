@@ -387,4 +387,34 @@ final class AuraMusicCoreTests: XCTestCase {
         XCTAssertEqual(cleaned.title, "I Got Love")
         XCTAssertEqual(cleaned.artist, "Miyagi")
     }
+
+    @MainActor
+    func testBackgroundPauseRejectsStalePlayTicksAndAllowsExplicitResume() {
+        let engine = UniversalAudioPlayerEngine.shared
+        engine.activeYouTubeVideoID = "YkY4X_OaF6o"
+
+        // Simulate playing track at 25.0s
+        engine.handleYouTubePlayerEvent(currentTime: 25.0, duration: 277.0, stateCode: 1, userPaused: false, userResumed: true)
+        XCTAssertTrue(engine.isPlaying)
+
+        // Simulate user tapping Pause from Lock Screen / Control Center / Background
+        engine.handleYouTubePlayerEvent(currentTime: 25.2, duration: 277.0, stateCode: 2, userPaused: true, userResumed: false)
+        XCTAssertFalse(engine.isPlaying, "Background/Lock Screen pause must immediately set isPlaying = false")
+
+        // Simulate a stale in-flight JS play tick arriving right after pause -> must NOT unpause!
+        engine.handleYouTubePlayerEvent(currentTime: 25.3, duration: 277.0, stateCode: 1, userPaused: false, userResumed: false)
+        XCTAssertFalse(engine.isPlaying, "Stale play tick while user-paused must NEVER resume playback")
+
+        // Simulate explicit Play tap from Lock Screen / Control Center (userResumed: true) -> must resume cleanly!
+        engine.handleYouTubePlayerEvent(currentTime: 25.4, duration: 277.0, stateCode: 1, userPaused: false, userResumed: true)
+        XCTAssertTrue(engine.isPlaying, "Explicit Lock Screen / Control Center Play must resume playback")
+
+        // Direct pause() call must also hold paused state against stale ticks
+        engine.pause()
+        XCTAssertFalse(engine.isPlaying)
+        engine.handleYouTubePlayerEvent(currentTime: 25.5, duration: 277.0, stateCode: 1, userPaused: false, userResumed: false)
+        XCTAssertFalse(engine.isPlaying, "Direct pause() must remain paused when stale play ticks arrive")
+
+        engine.activeYouTubeVideoID = nil
+    }
 }

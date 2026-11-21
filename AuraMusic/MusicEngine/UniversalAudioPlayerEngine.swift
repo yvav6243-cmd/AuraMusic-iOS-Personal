@@ -64,6 +64,9 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     private var sleepTimerTask: Task<Void, Never>?
     private var youtubeWatchdogTask: Task<Void, Never>?
     private var youtubeClockInterpolatorTask: Task<Void, Never>?
+    private var backgroundProtectTask: Task<Void, Never>?
+    private var delayedKeepAliveStopTask: Task<Void, Never>?
+    private var isUserPaused: Bool = false
     private var lastYouTubeJSTickWallTime: TimeInterval = 0
     private var hasReceivedFirstYouTubeProgressTick: Bool = false
     private var fallbackYouTubeVideoIDs: [String] = []
@@ -154,7 +157,13 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         self.youtubeWebView = webView
     }
 
-    public func handleYouTubePlayerEvent(currentTime: Double, duration: Double, stateCode: Int) {
+    public func handleYouTubePlayerEvent(
+        currentTime: Double,
+        duration: Double,
+        stateCode: Int,
+        userPaused: Bool = false,
+        userResumed: Bool = false
+    ) {
         guard activeYouTubeVideoID != nil else { return }
         if currentTime.isFinite && currentTime > 0.05 {
             hasReceivedFirstYouTubeProgressTick = true
@@ -169,12 +178,32 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         // YT.PlayerState: -1 unstarted, 0 ended, 1 playing, 2 paused, 3 buffering
         switch stateCode {
         case 1: // PLAYING
+            if self.isUserPaused && !userResumed {
+                // Reject stale/stray play ticks while user explicitly paused; reinforce pause in WebKit
+                evaluateYouTubeJS("if(window.auraControl){window.auraControl.pause();}")
+                youtubeWebView?.pauseAllMediaPlayback(completionHandler: nil)
+                return
+            }
+            if userResumed {
+                self.isUserPaused = false
+                self.delayedKeepAliveStopTask?.cancel()
+                self.setBackgroundKeepAliveActive(true)
+            }
             if !self.isPlaying || self.isBuffering {
                 self.isPlaying = true
                 self.isBuffering = false
                 updateNowPlayingElapsedTime()
             }
         case 2: // PAUSED
+            if userPaused {
+                self.backgroundProtectTask?.cancel()
+                self.isUserPaused = true
+                self.isPlaying = false
+                self.isBuffering = false
+                self.refreshNowPlayingMetadata()
+                self.scheduleDelayedKeepAliveStop()
+                return
+            }
             // Ignore transient initial paused state before playback has started so UI doesn't flicker or abort autoplay
             guard hasReceivedFirstYouTubeProgressTick || currentTime > 0.05 else {
                 if !self.isBuffering { self.isBuffering = true }
@@ -186,7 +215,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
                 updateNowPlayingElapsedTime()
             }
         case 3: // BUFFERING
-            if !self.isBuffering {
+            if !self.isUserPaused && !self.isBuffering {
                 self.isBuffering = true
             }
         case 0: // ENDED
@@ -201,13 +230,45 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         }
     }
 
+    private func scheduleDelayedKeepAliveStop() {
+        delayedKeepAliveStopTask?.cancel()
+        delayedKeepAliveStopTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            guard !Task.isCancelled, !self.isPlaying else { return }
+            self.setBackgroundKeepAliveActive(false)
+        }
+    }
+
+    private func activateBackgroundTransitionProtection() {
+        guard self.isPlaying && !self.isUserPaused else { return }
+        backgroundProtectTask?.cancel()
+        delayedKeepAliveStopTask?.cancel()
+        setBackgroundKeepAliveActive(true)
+        if activeYouTubeVideoID != nil {
+            evaluateYouTubeJS("if(window.auraControl){window.auraControl.enterBackgroundProtect(900);}")
+            backgroundProtectTask = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                guard !Task.isCancelled,
+                      self.isPlaying,
+                      !self.isUserPaused,
+                      self.activeYouTubeVideoID != nil else {
+                    return
+                }
+                self.evaluateYouTubeJS("if(window.auraControl && !window._auraUserPaused){window.auraControl.resume();}")
+            }
+        }
+    }
+
     private func startFullLengthYouTubeMusicPlayback(videoID: String, for track: UniversalTrack) {
         youtubeWatchdogTask?.cancel()
         youtubeClockInterpolatorTask?.cancel()
+        backgroundProtectTask?.cancel()
+        delayedKeepAliveStopTask?.cancel()
         primaryPlayer.pause()
         ApplicationMusicPlayer.shared.pause()
         fallbackYouTubeVideoIDs = []
         hasReceivedFirstYouTubeProgressTick = false
+        isUserPaused = false
         lastYouTubeJSTickWallTime = CACurrentMediaTime()
         activeYouTubeVideoID = videoID
         isBuffering = false
@@ -279,15 +340,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         ) { [weak self] _ in
             guard let self else { return }
             Task { @MainActor in
-                guard self.isPlaying else { return }
-                self.setBackgroundKeepAliveActive(true)
-                if self.activeYouTubeVideoID != nil {
-                    self.evaluateYouTubeJS("if(window.auraControl){window.auraControl.resume();}")
-                    try? await Task.sleep(nanoseconds: 350_000_000)
-                    if self.isPlaying && self.activeYouTubeVideoID != nil {
-                        self.evaluateYouTubeJS("if(window.auraControl){window.auraControl.resume();}")
-                    }
-                }
+                self.activateBackgroundTransitionProtection()
             }
         }
         NotificationCenter.default.addObserver(
@@ -723,20 +776,33 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     }
 
     public func pause() {
-        if activeYouTubeVideoID != nil {
-            evaluateYouTubeJS("if(window.auraControl){window.auraControl.pause();}")
-        }
+        backgroundProtectTask?.cancel()
+        delayedKeepAliveStopTask?.cancel()
+        isUserPaused = true
+        isPlaying = false
+        isBuffering = false
+
         primaryPlayer.pause()
         crossfadeSecondaryPlayer?.pause()
         ApplicationMusicPlayer.shared.pause()
-        setBackgroundKeepAliveActive(false)
-        isPlaying = false
+
+        if activeYouTubeVideoID != nil {
+            evaluateYouTubeJS("if(window.auraControl){window.auraControl.pause();}")
+            youtubeWebView?.pauseAllMediaPlayback(completionHandler: nil)
+            scheduleDelayedKeepAliveStop()
+        } else {
+            setBackgroundKeepAliveActive(false)
+        }
         refreshNowPlayingMetadata()
     }
 
     public func resume() {
         guard currentTrack != nil else { return }
-        configureAudioSession()
+        delayedKeepAliveStopTask?.cancel()
+        isUserPaused = false
+        if !(backgroundKeepAliveAudioPlayer?.isPlaying ?? false) {
+            configureAudioSession()
+        }
         if activeYouTubeVideoID != nil {
             setBackgroundKeepAliveActive(true)
             evaluateYouTubeJS("if(window.auraControl){window.auraControl.resume();}")
