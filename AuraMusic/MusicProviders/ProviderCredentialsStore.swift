@@ -68,8 +68,7 @@ public final class ProviderCredentialsStore: ObservableObject {
         case .youtubeMusic, .youtube:
             return !youtubeAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         case .appleMusic:
-            return MusicAuthorization.currentStatus == .authorized ||
-                   !appleMusicDeveloperToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            return !appleMusicDeveloperToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         case .soundCloud:
             return !soundCloudClientID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         case .spotify:
