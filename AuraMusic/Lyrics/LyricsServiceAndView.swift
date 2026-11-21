@@ -89,12 +89,14 @@ public enum LRCParser {
 
         let sorted = parsedEntries.sorted { $0.timestamp < $1.timestamp }
         return sorted.enumerated().map { idx, item in
-            let original = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let parts = item.text.components(separatedBy: " // ")
+            let original = (parts.first ?? item.text).trimmingCharacters(in: .whitespacesAndNewlines)
+            let translation = parts.count > 1 ? parts[1].trimmingCharacters(in: .whitespacesAndNewlines) : nil
             return SyncedLyricLine(
                 index: idx,
                 timestamp: item.timestamp,
                 text: original.isEmpty ? "•••" : original,
-                translatedText: nil
+                translatedText: translation
             )
         }
     }
