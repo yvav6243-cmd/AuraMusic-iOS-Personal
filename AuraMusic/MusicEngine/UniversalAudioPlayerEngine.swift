@@ -366,8 +366,9 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
             }
 
         case .appleMusic:
-            // Try native MusicKit full playback if user is subscribed & authorized
-            if MusicAuthorization.currentStatus == .authorized {
+            // Only use native MusicKit if the user actually has Apple MusicKit authorized
+            if ProviderCredentialsStore.shared.hasConfiguredAPI(for: .appleMusic),
+               MusicAuthorization.currentStatus == .authorized {
                 do {
                     let request = MusicCatalogResourceRequest<MusicKit.Song>(
                         matching: \.id,
@@ -388,12 +389,11 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
                 }
             }
 
-            // First check if a full-length native AVPlayer stream exists on Audius or SoundCloud
-            if await tryUpgradeToNativeAVStream(for: track) {
+            // Since Apple Music API is not configured, route through the user's active configured API (e.g. YouTube Music)
+            if await tryUpgradeToFullLengthStream(for: track) {
                 return
             }
 
-            // Otherwise play Apple Music's guaranteed native AAC stream immediately via AVPlayer
             if let previewURL = try? await appleProvider.resolvePlayableStreamURL(for: track) {
                 startAVPlayer(
                     with: previewURL,
@@ -405,10 +405,24 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
             }
 
         case .youtubeMusic, .youtube:
-            startYouTubePlaybackWithNativeFallbackWatchdog(videoID: track.providerTrackID, for: track)
             Task {
                 await upgradeToSquareAppleMusicCoverIfNeeded(for: track)
             }
+            // Resolve direct native audio/mp4 stream first for instant, background-capable AVPlayer playback
+            if let directAudio = await ytMusicProvider.resolveDirectYouTubeAudioStream(videoID: track.providerTrackID) {
+                if directAudio.duration > 10 {
+                    self.duration = directAudio.duration
+                }
+                startAVPlayer(
+                    with: directAudio.url,
+                    for: track,
+                    banner: nil,
+                    customUserAgent: YouTubeMusicProvider.iosPlayerUserAgent
+                )
+                return
+            }
+            // Fallback to embedded player with watchdog if direct stream was unavailable
+            startYouTubePlaybackWithNativeFallbackWatchdog(videoID: track.providerTrackID, for: track)
 
         case .soundCloud:
             if let streamURL = track.streamURL, track.isStreamable {
@@ -458,18 +472,34 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     }
 
     private func tryUpgradeToFullLengthStream(for track: UniversalTrack) async -> Bool {
-        if await tryUpgradeToNativeAVStream(for: track) {
-            return true
-        }
         let query = "\(track.title) \(track.artist)"
-        if ytMusicProvider.isConfigured,
+
+        // 1. If YouTube Music API is configured, resolve full studio track & play natively in AVPlayer
+        if ProviderCredentialsStore.shared.hasConfiguredAPI(for: .youtubeMusic),
            let ytCandidates = try? await ytMusicProvider.searchTracks(query: query, limit: 3),
            let bestYT = ytCandidates.first {
+            if let directAudio = await ytMusicProvider.resolveDirectYouTubeAudioStream(videoID: bestYT.providerTrackID) {
+                if directAudio.duration > 10 {
+                    self.duration = directAudio.duration
+                }
+                startAVPlayer(
+                    with: directAudio.url,
+                    for: track,
+                    banner: nil,
+                    customUserAgent: YouTubeMusicProvider.iosPlayerUserAgent
+                )
+                return true
+            }
             if bestYT.duration > 35 {
                 self.duration = bestYT.duration
             }
             self.isYouTubeVideoVisible = false
             startYouTubePlaybackWithNativeFallbackWatchdog(videoID: bestYT.providerTrackID, for: track)
+            return true
+        }
+
+        // 2. Otherwise check other configured native AVPlayer full-stream providers
+        if await tryUpgradeToNativeAVStream(for: track) {
             return true
         }
         return false
@@ -512,12 +542,23 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         playbackStatusBanner = "Direct stream restricted by \(track.provider.displayName)."
     }
 
-    private func startAVPlayer(with url: URL, for track: UniversalTrack, banner: String?, isFallbackRetry: Bool = false) {
+    private func startAVPlayer(
+        with url: URL,
+        for track: UniversalTrack,
+        banner: String?,
+        isFallbackRetry: Bool = false,
+        customUserAgent: String? = nil
+    ) {
+        youtubeWatchdogTask?.cancel()
         ApplicationMusicPlayer.shared.pause()
         activeYouTubeVideoID = nil
         playbackStatusBanner = banner
 
-        let asset = AVURLAsset(url: url)
+        var assetOptions: [String: Any] = [:]
+        if let customUserAgent {
+            assetOptions["AVURLAssetHTTPHeaderFieldsKey"] = ["User-Agent": customUserAgent]
+        }
+        let asset = AVURLAsset(url: url, options: assetOptions.isEmpty ? nil : assetOptions)
         let playerItem = AVPlayerItem(asset: asset)
 
         endOfTrackCancellable?.cancel()
