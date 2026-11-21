@@ -16,6 +16,7 @@ public final class MusicDiscoveryViewModel: ObservableObject {
 
     private let audiusProvider = AudiusProvider()
     private let appleProvider = AppleMusicProvider()
+    private let ytMusicProvider = YouTubeMusicProvider(providerType: .youtubeMusic)
 
     private init() {}
 
@@ -31,11 +32,40 @@ public final class MusicDiscoveryViewModel: ObservableObject {
             ?? PersistenceController.shared.libraryTracks.first?.artist
             ?? "The Weeknd Daft Punk"
 
+        let creds = ProviderCredentialsStore.shared
+        let hasYTMusic = creds.hasConfiguredAPI(for: .youtubeMusic)
+        let hasAppleMusic = creds.hasConfiguredAPI(for: .appleMusic)
+
         let audius = audiusProvider
         let apple = appleProvider
+        let ytMusic = ytMusicProvider
+
+        if hasYTMusic {
+            async let ytTrendingTask = (try? await ytMusic.searchTracks(query: "Top Hits 2026 Official Audio", limit: 15)) ?? []
+            async let ytChartsTask = (try? await ytMusic.searchTracks(query: "Global Top 50 Songs Audio", limit: 15)) ?? []
+            async let ytPersonalTask = (try? await ytMusic.searchTracks(query: recentArtistSeed, limit: 10)) ?? []
+            async let albumsTask = (try? await apple.searchAlbums(query: "Top Albums 2026", limit: 12)) ?? []
+            async let artistsTask = (try? await apple.searchArtists(query: recentArtistSeed, limit: 8)) ?? []
+
+            let (ytTrending, ytCharts, ytPersonal, albums, artists) = await (
+                ytTrendingTask,
+                ytChartsTask,
+                ytPersonalTask,
+                albumsTask,
+                artistsTask
+            )
+
+            self.trendingFullStreamTracks = ytTrending
+            self.appleTopChartTracks = ytCharts
+            self.recommendedAlbums = albums
+            self.featuredArtists = artists
+            self.personalizedTracks = ytPersonal.isEmpty ? Array(ytTrending.prefix(10)) : ytPersonal
+            self.isLoading = false
+            return
+        }
 
         async let audiusTrendingTask = (try? await audius.fetchTopCharts(limit: 20)) ?? []
-        async let appleChartsTask = (try? await apple.fetchTopCharts(limit: 20)) ?? []
+        async let appleChartsTask: [UniversalTrack] = hasAppleMusic ? ((try? await apple.fetchTopCharts(limit: 20)) ?? []) : []
         async let albumsTask = (try? await apple.searchAlbums(query: "Top Albums 2026", limit: 12)) ?? []
         async let artistsTask = (try? await apple.searchArtists(query: recentArtistSeed, limit: 8)) ?? []
         async let personalTask = (try? await audius.searchTracks(query: recentArtistSeed, limit: 12)) ?? []
