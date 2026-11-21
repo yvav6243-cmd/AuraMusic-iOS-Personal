@@ -111,50 +111,37 @@ public struct DynamicArtworkMeshBackground: View {
     public var body: some View {
         GeometryReader { proxy in
             ZStack {
-                Color(red: 0.05, green: 0.05, blue: 0.08)
+                Color(red: 0.06, green: 0.06, blue: 0.09)
 
-                Circle()
-                    .fill(palette[0].opacity(0.75))
-                    .frame(width: proxy.size.width * 1.15, height: proxy.size.width * 1.15)
-                    .offset(
-                        x: phaseShift ? -proxy.size.width * 0.25 : proxy.size.width * 0.22,
-                        y: phaseShift ? -proxy.size.height * 0.22 : -proxy.size.height * 0.10
-                    )
+                LinearGradient(
+                    colors: [palette[0].opacity(0.68), palette[1].opacity(0.58), palette[2].opacity(0.75)],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
 
-                Circle()
-                    .fill(palette[1].opacity(0.70))
-                    .frame(width: proxy.size.width * 1.25, height: proxy.size.width * 1.25)
-                    .offset(
-                        x: phaseShift ? proxy.size.width * 0.28 : -proxy.size.width * 0.18,
-                        y: phaseShift ? proxy.size.height * 0.12 : -proxy.size.height * 0.24
-                    )
+                RadialGradient(
+                    colors: [palette[0].opacity(0.55), .clear],
+                    center: .topLeading,
+                    startRadius: 20,
+                    endRadius: proxy.size.width * 0.95
+                )
 
-                Circle()
-                    .fill(palette[2].opacity(0.75))
-                    .frame(width: proxy.size.width * 1.2, height: proxy.size.width * 1.2)
-                    .offset(
-                        x: phaseShift ? -proxy.size.width * 0.15 : proxy.size.width * 0.18,
-                        y: phaseShift ? proxy.size.height * 0.26 : proxy.size.height * 0.18
-                    )
+                RadialGradient(
+                    colors: [palette[1].opacity(0.50), .clear],
+                    center: .bottomTrailing,
+                    startRadius: 20,
+                    endRadius: proxy.size.width * 0.95
+                )
 
-                Rectangle()
-                    .fill(.ultraThinMaterial)
-                    .environment(\.colorScheme, .dark)
+                Color.black.opacity(0.28)
             }
-            .blur(radius: 58)
-            .clipped()
+            .drawingGroup()
         }
         .ignoresSafeArea()
         .task(id: artworkURL) {
             let newPalette = await ArtworkCacheManager.shared.dominantColors(for: artworkURL)
-            withAnimation(.easeInOut(duration: 0.9)) {
+            withAnimation(.easeInOut(duration: 0.6)) {
                 palette = newPalette
-            }
-        }
-        .onAppear {
-            guard isAnimating else { return }
-            withAnimation(.easeInOut(duration: 9.0).repeatForever(autoreverses: true)) {
-                phaseShift.toggle()
             }
         }
     }
