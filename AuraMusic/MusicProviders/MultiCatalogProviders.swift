@@ -149,7 +149,7 @@ private struct AudiusTracksResponse: Codable {
     var data: [TrackItem]
 }
 
-// MARK: - 2. YouTube & YouTube Music Official Data API v3 Provider
+// MARK: - 2. YouTube Music (Studio Audio Mode) & YouTube Official Data API v3 Provider
 
 public final class YouTubeMusicProvider: MusicProviderProtocol, @unchecked Sendable {
     public let providerType: MusicProviderType
@@ -170,13 +170,18 @@ public final class YouTubeMusicProvider: MusicProviderProtocol, @unchecked Senda
             return []
         }
 
+        // For YouTube Music, query specifically for official studio audio / Topic tracks
+        let searchQuery = providerType == .youtubeMusic
+            ? "\(query) official audio"
+            : query
+
         var components = URLComponents(string: "https://www.googleapis.com/youtube/v3/search")!
         components.queryItems = [
             URLQueryItem(name: "part", value: "snippet"),
             URLQueryItem(name: "type", value: "video"),
             URLQueryItem(name: "videoCategoryId", value: "10"), // Music category
             URLQueryItem(name: "maxResults", value: String(min(limit, 25))),
-            URLQueryItem(name: "q", value: providerType == .youtubeMusic ? "\(query) official audio" : query),
+            URLQueryItem(name: "q", value: searchQuery),
             URLQueryItem(name: "key", value: apiKey)
         ]
         guard let url = components.url else { return [] }
@@ -186,30 +191,95 @@ public final class YouTubeMusicProvider: MusicProviderProtocol, @unchecked Senda
         }
         let decoded = try JSONDecoder().decode(YouTubeSearchListResponse.self, from: data)
 
+        let videoIDs = decoded.items.compactMap(\.id.videoId)
+        let durationsByID = await fetchVideoDurations(videoIDs: videoIDs, apiKey: apiKey)
+
         return decoded.items.compactMap { item -> UniversalTrack? in
             guard let videoID = item.id.videoId else { return nil }
-            let rawTitle = item.snippet.title
-            let channel = item.snippet.channelTitle
+            let rawTitle = Self.decodeHTMLEntities(item.snippet.title)
+            let cleanTitle = providerType == .youtubeMusic ? Self.cleanStudioTrackTitle(rawTitle) : rawTitle
+            let channel = Self.decodeHTMLEntities(item.snippet.channelTitle)
                 .replacingOccurrences(of: " - Topic", with: "")
+                .replacingOccurrences(of: "VEVO", with: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+
             let deepLinkScheme = providerType == .youtubeMusic
                 ? "youtubemusic://watch?v=\(videoID)"
                 : "https://www.youtube.com/watch?v=\(videoID)"
             let thumb = item.snippet.thumbnails.high?.url ?? item.snippet.thumbnails.medium?.url
+            let exactDuration = durationsByID[videoID] ?? 210
 
             return UniversalTrack(
                 provider: providerType,
                 providerTrackID: videoID,
-                title: rawTitle,
+                title: cleanTitle,
                 artist: channel,
-                album: providerType == .youtubeMusic ? "YouTube Music" : "YouTube Video",
+                album: providerType == .youtubeMusic ? "YouTube Music Audio" : "YouTube Video",
                 artworkURL: thumb.flatMap(URL.init(string:)),
-                duration: 210,
+                duration: exactDuration,
                 externalDeepLink: URL(string: deepLinkScheme),
                 isStreamable: true,
                 isDownloadPermitted: false,
-                audioQualityBadge: providerType == .youtubeMusic ? "YT MUSIC" : "OFFICIAL VIDEO"
+                audioQualityBadge: providerType == .youtubeMusic ? "YT MUSIC AUDIO" : "VIDEO"
             )
         }
+    }
+
+    private func fetchVideoDurations(videoIDs: [String], apiKey: String) async -> [String: TimeInterval] {
+        guard !videoIDs.isEmpty else { return [:] }
+        var components = URLComponents(string: "https://www.googleapis.com/youtube/v3/videos")!
+        components.queryItems = [
+            URLQueryItem(name: "part", value: "contentDetails"),
+            URLQueryItem(name: "id", value: videoIDs.prefix(25).joined(separator: ",")),
+            URLQueryItem(name: "key", value: apiKey)
+        ]
+        guard let url = components.url,
+              let (data, _) = try? await session.data(from: url),
+              let decoded = try? JSONDecoder().decode(YouTubeVideoDetailsResponse.self, from: data) else {
+            return [:]
+        }
+        var map: [String: TimeInterval] = [:]
+        for item in decoded.items {
+            map[item.id] = Self.parseISO8601Duration(item.contentDetails.duration)
+        }
+        return map
+    }
+
+    private static func parseISO8601Duration(_ iso: String) -> TimeInterval {
+        // Parses e.g. "PT3M42S" or "PT1H2M10S"
+        let pattern = "PT(?:(\\d+)H)?(?:(\\d+)M)?(?:(\\d+)S)?"
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: iso, range: NSRange(iso.startIndex..<iso.endIndex, in: iso)) else {
+            return 210
+        }
+        var total: TimeInterval = 0
+        if let r = Range(match.range(at: 1), in: iso), let h = Double(iso[r]) { total += h * 3600 }
+        if let r = Range(match.range(at: 2), in: iso), let m = Double(iso[r]) { total += m * 60 }
+        if let r = Range(match.range(at: 3), in: iso), let s = Double(iso[r]) { total += s }
+        return total > 0 ? total : 210
+    }
+
+    private static func cleanStudioTrackTitle(_ raw: String) -> String {
+        var result = raw
+        let suffixes = [
+            "(Official Audio)", "[Official Audio]",
+            "(Official Music Video)", "[Official Music Video]",
+            "(Official Video)", "[Official Video]",
+            "(Official Lyric Video)", "[Official Lyric Video]",
+            "(Lyric Video)", "[Lyric Video]",
+            "(Audio)", "[Audio]",
+            "(Visualizer)", "[Visualizer]"
+        ]
+        for s in suffixes {
+            result = result.replacingOccurrences(of: s, with: "", options: .caseInsensitive)
+        }
+        return result.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func decodeHTMLEntities(_ text: String) -> String {
+        text.replacingOccurrences(of: "&quot;", with: "\"")
+            .replacingOccurrences(of: "&#39;", with: "'")
+            .replacingOccurrences(of: "&amp;", with: "&")
     }
 
     public func searchAlbums(query: String, limit: Int = 10) async throws -> [UniversalAlbum] { [] }
@@ -245,46 +315,154 @@ private struct YouTubeSearchListResponse: Codable {
     var items: [Item]
 }
 
-// MARK: - Authorized Official YouTube IFrame Embedded Player View (Permitted by YouTube ToS)
+private struct YouTubeVideoDetailsResponse: Codable {
+    struct ContentDetails: Codable {
+        var duration: String
+    }
+    struct Item: Codable {
+        var id: String
+        var contentDetails: ContentDetails
+    }
+    var items: [Item]
+}
+
+// MARK: - Apple Music-Integrated YouTube IFrame JS Audio & Video Engine Bridge
 
 public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
     public let videoID: String
+    @ObservedObject var playerEngine: UniversalAudioPlayerEngine = .shared
 
     public init(videoID: String) {
         self.videoID = videoID
+    }
+
+    public func makeCoordinator() -> Coordinator {
+        Coordinator(playerEngine: playerEngine)
     }
 
     public func makeUIView(context: Context) -> WKWebView {
         let config = WKWebViewConfiguration()
         config.allowsInlineMediaPlayback = true
         config.mediaTypesRequiringUserActionForPlayback = []
+        config.userContentController.add(context.coordinator, name: "auraYT")
+
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.scrollView.isScrollEnabled = false
         webView.isOpaque = false
-        webView.backgroundColor = .black
+        webView.backgroundColor = .clear
+        context.coordinator.webView = webView
+        playerEngine.registerYouTubeWebView(webView)
         return webView
     }
 
     public func updateUIView(_ webView: WKWebView, context: Context) {
-        // Strict alphanumeric/dash/underscore sanitization to prevent HTML/XSS injection in WKWebView
         let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
         let safeVideoID = String(videoID.unicodeScalars.filter { allowed.contains($0) }.prefix(24))
         guard !safeVideoID.isEmpty else { return }
 
-        let embedHTML = """
-        <!DOCTYPE html>
-        <html>
-        <head>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-        <meta http-equiv="Content-Security-Policy" content="default-src 'none'; frame-src https://www.youtube-nocookie.com https://www.youtube.com; style-src 'unsafe-inline';">
-        <style>body, html { margin: 0; padding: 0; width: 100%; height: 100%; background: #000; overflow: hidden; } iframe { width: 100%; height: 100%; border: 0; }</style>
-        </head>
-        <body>
-        <iframe src="https://www.youtube-nocookie.com/embed/\(safeVideoID)?playsinline=1&autoplay=1&rel=0&modestbranding=1" allow="autoplay; encrypted-media; picture-in-picture" allowfullscreen></iframe>
-        </body>
-        </html>
-        """
-        webView.loadHTMLString(embedHTML, baseURL: URL(string: "https://www.youtube-nocookie.com"))
+        if context.coordinator.loadedVideoID != safeVideoID {
+            context.coordinator.loadedVideoID = safeVideoID
+            playerEngine.registerYouTubeWebView(webView)
+
+            let embedHTML = """
+            <!DOCTYPE html>
+            <html>
+            <head>
+            <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+            <style>
+              body, html { margin: 0; padding: 0; width: 100%; height: 100%; background: #000; overflow: hidden; }
+              #player { width: 100%; height: 100%; border: 0; }
+            </style>
+            </head>
+            <body>
+            <div id="player"></div>
+            <script src="https://www.youtube.com/iframe_api"></script>
+            <script>
+              var ytPlayer = null;
+              var timerId = null;
+              function onYouTubeIframeAPIReady() {
+                ytPlayer = new YT.Player('player', {
+                  width: '100%',
+                  height: '100%',
+                  videoId: '\(safeVideoID)',
+                  playerVars: {
+                    'playsinline': 1,
+                    'autoplay': 1,
+                    'controls': 0,
+                    'rel': 0,
+                    'modestbranding': 1,
+                    'fs': 0,
+                    'iv_load_policy': 3
+                  },
+                  events: {
+                    'onReady': function(e) {
+                      e.target.playVideo();
+                      startProgressTimer();
+                    },
+                    'onStateChange': function(e) {
+                      postState(e.data);
+                    }
+                  }
+                });
+              }
+              function startProgressTimer() {
+                if (timerId) clearInterval(timerId);
+                timerId = setInterval(function() {
+                  if (ytPlayer && ytPlayer.getCurrentTime) {
+                    var cur = ytPlayer.getCurrentTime() || 0;
+                    var dur = ytPlayer.getDuration() || 0;
+                    var st = ytPlayer.getPlayerState ? ytPlayer.getPlayerState() : -1;
+                    window.webkit.messageHandlers.auraYT.postMessage({
+                      type: 'tick',
+                      currentTime: cur,
+                      duration: dur,
+                      state: st
+                    });
+                  }
+                }, 150);
+              }
+              function postState(st) {
+                var cur = (ytPlayer && ytPlayer.getCurrentTime) ? ytPlayer.getCurrentTime() : 0;
+                var dur = (ytPlayer && ytPlayer.getDuration) ? ytPlayer.getDuration() : 0;
+                window.webkit.messageHandlers.auraYT.postMessage({
+                  type: 'state',
+                  currentTime: cur,
+                  duration: dur,
+                  state: st
+                });
+              }
+              window.auraControl = {
+                play: function() { if (ytPlayer && ytPlayer.playVideo) ytPlayer.playVideo(); },
+                pause: function() { if (ytPlayer && ytPlayer.pauseVideo) ytPlayer.pauseVideo(); },
+                seek: function(sec) { if (ytPlayer && ytPlayer.seekTo) ytPlayer.seekTo(sec, true); },
+                setVolume: function(vol) { if (ytPlayer && ytPlayer.setVolume) ytPlayer.setVolume(vol); }
+              };
+            </script>
+            </body>
+            </html>
+            """
+            webView.loadHTMLString(embedHTML, baseURL: URL(string: "https://www.youtube.com"))
+        }
+    }
+
+    public final class Coordinator: NSObject, WKScriptMessageHandler {
+        weak var playerEngine: UniversalAudioPlayerEngine?
+        weak var webView: WKWebView?
+        var loadedVideoID: String?
+
+        init(playerEngine: UniversalAudioPlayerEngine) {
+            self.playerEngine = playerEngine
+        }
+
+        public func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+            guard let dict = message.body as? [String: Any] else { return }
+            let cur = (dict["currentTime"] as? Double) ?? 0
+            let dur = (dict["duration"] as? Double) ?? 0
+            let st = (dict["state"] as? Int) ?? -1
+            Task { @MainActor in
+                self.playerEngine?.handleYouTubePlayerEvent(currentTime: cur, duration: dur, stateCode: st)
+            }
+        }
     }
 }
 
@@ -469,7 +647,6 @@ public final class LiveRadioProvider: @unchecked Sendable {
         self.session = session
     }
 
-    /// Directly streamable verified 24/7 Icecast / MP3 / AAC internet radio streams
     public static let featuredStations: [RadioStation] = [
         RadioStation(
             id: "somafm-groovesalad",
