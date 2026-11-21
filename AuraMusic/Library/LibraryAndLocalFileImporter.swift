@@ -1,5 +1,6 @@
 import AVFoundation
 import Foundation
+import PhotosUI
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -1010,15 +1011,21 @@ public struct TrackRowView: View {
     @ObservedObject var downloadManager: OfflineDownloadManager = .shared
     @State private var showPlaylistPicker: Bool = false
     @State private var showShareSheet: Bool = false
+    @State private var showCustomCoverPicker: Bool = false
+    @State private var selectedCoverPhotoItem: PhotosPickerItem?
 
     public init(track: UniversalTrack, queueContext: [UniversalTrack] = []) {
         self.track = track
         self.queueContext = queueContext
     }
 
+    private var effectiveCoverURL: URL? {
+        persistence.effectiveArtworkURL(for: track)
+    }
+
     public var body: some View {
         HStack(spacing: 12) {
-            AuraArtworkView(url: track.artworkURL, size: 50, cornerRadius: 8)
+            AuraArtworkView(url: effectiveCoverURL, size: 50, cornerRadius: 8)
 
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
@@ -1072,6 +1079,20 @@ public struct TrackRowView: View {
         .sheet(isPresented: $showShareSheet) {
             SystemShareSheet(activityItems: ["\(track.title) — \(track.artist) (\(track.provider.displayName))"])
         }
+        .photosPicker(isPresented: $showCustomCoverPicker, selection: $selectedCoverPhotoItem, matching: .images)
+        .onChange(of: selectedCoverPhotoItem) { _, newItem in
+            guard let newItem else { return }
+            Task {
+                if let data = try? await newItem.loadTransferable(type: Data.self) {
+                    let newURL = persistence.setCustomTrackArtwork(
+                        imageData: data,
+                        for: track,
+                        defaultArtworkURL: track.artworkURL
+                    )
+                    player.applyUpdatedArtworkURL(newURL, forTrackID: track.id)
+                }
+            }
+        }
     }
 
     @ViewBuilder
@@ -1086,6 +1107,23 @@ public struct TrackRowView: View {
             player.addToQueue(track)
         } label: {
             Label("Play Last", systemImage: "text.line.last.and.arrowtriangle.forward")
+        }
+
+        Divider()
+
+        Button {
+            showCustomCoverPicker = true
+        } label: {
+            Label("Change Song Cover (Photos)…", systemImage: "photo.badge.plus")
+        }
+
+        if persistence.hasCustomArtwork(for: track.id) {
+            Button {
+                let restoredURL = persistence.setCustomTrackArtwork(imageData: nil, for: track)
+                player.applyUpdatedArtworkURL(restoredURL, forTrackID: track.id)
+            } label: {
+                Label("Reset to Default Album Cover", systemImage: "arrow.counterclockwise")
+            }
         }
 
         Divider()
