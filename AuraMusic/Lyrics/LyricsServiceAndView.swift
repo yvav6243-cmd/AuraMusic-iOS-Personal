@@ -155,7 +155,14 @@ public final class LyricsService: ObservableObject {
 
         // 2. Query LRCLIB Exact Match API (`https://lrclib.net/api/get`)
         do {
-            if let dto = try await fetchExactLRCLIB(track: track) ?? (try await searchLRCLIB(title: track.title, artist: track.artist).first) ?? (try await searchLRCLIB(title: cleanTitle, artist: track.artist).first) {
+            var resolvedDTO = try await fetchExactLRCLIB(track: track)
+            if resolvedDTO == nil {
+                resolvedDTO = try await searchLRCLIB(title: track.title, artist: track.artist).first
+            }
+            if resolvedDTO == nil {
+                resolvedDTO = try await searchLRCLIB(title: cleanTitle, artist: track.artist).first
+            }
+            if let dto = resolvedDTO {
                 cacheLyrics(
                     cacheKey: cacheKey,
                     title: track.title,
