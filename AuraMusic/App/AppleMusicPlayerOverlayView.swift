@@ -20,18 +20,14 @@ public struct AppleMusicPlayerOverlayView: View {
 
     public var body: some View {
         ZStack(alignment: .bottom) {
-            // Single persistent YouTube Music engine instance — never unmounted when opening Lyrics or Mini-Player
+            // Single persistent YouTube Music engine instance — 100% invisible offscreen audio engine
             if let videoID = player.activeYouTubeVideoID {
-                let showVideoInFront = player.isPlayerExpanded && player.activeOverlayTab == .none && player.isYouTubeVideoVisible
                 AuthorizedYouTubeIFramePlayerView(videoID: videoID)
-                    .frame(
-                        width: showVideoInFront ? 330 : 240,
-                        height: showVideoInFront ? 225 : 240
-                    )
-                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                    .offset(y: showVideoInFront ? -215 : 0)
-                    .allowsHitTesting(showVideoInFront)
-                    .zIndex(showVideoInFront ? 30 : -1)
+                    .frame(width: 1, height: 1)
+                    .opacity(0.001)
+                    .offset(x: -2000, y: -2000)
+                    .allowsHitTesting(false)
+                    .zIndex(-10)
             }
 
             if let track = player.currentTrack {
@@ -217,65 +213,21 @@ public struct AppleMusicPlayerOverlayView: View {
         }
     }
 
-    // MARK: - Center Artwork / Apple Music Audio-First Section
+    // MARK: - Center Artwork / Pure Apple Music Square Cover Section
 
     private func standardArtworkCenterSection(track: UniversalTrack) -> some View {
         VStack(spacing: 14) {
-            if player.activeYouTubeVideoID != nil {
-                // Apple Music / YouTube Music style Audio vs Video switch pill (defaults to Audio cover art)
-                HStack(spacing: 0) {
-                    Button {
-                        withAnimation(AuraTheme.springInteractive) {
-                            player.isYouTubeVideoVisible = false
-                        }
-                    } label: {
-                        Text("Song")
-                            .font(.system(size: 12, weight: .bold))
-                            .foregroundStyle(!player.isYouTubeVideoVisible ? .white : .white.opacity(0.6))
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 6)
-                            .background(
-                                Capsule().fill(!player.isYouTubeVideoVisible ? Color.white.opacity(0.24) : Color.clear)
-                            )
-                    }
-                    .buttonStyle(.plain)
+            Spacer(minLength: 6)
 
-                    Button {
-                        withAnimation(AuraTheme.springInteractive) {
-                            player.isYouTubeVideoVisible = true
-                        }
-                    } label: {
-                        Text("Video")
-                            .font(.system(size: 12, weight: .bold))
-                            .foregroundStyle(player.isYouTubeVideoVisible ? .white : .white.opacity(0.6))
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 6)
-                            .background(
-                                Capsule().fill(player.isYouTubeVideoVisible ? Color.white.opacity(0.24) : Color.clear)
-                            )
-                    }
-                    .buttonStyle(.plain)
-                }
-                .padding(3)
-                .background(Capsule().fill(Color.black.opacity(0.28)))
-            }
-
-            Spacer(minLength: 4)
-
-            if player.activeYouTubeVideoID != nil && player.isYouTubeVideoVisible {
-                Color.clear
-                    .frame(width: 330, height: 225)
-            } else {
-                AuraArtworkView(
-                    url: track.artworkURL,
-                    size: 315,
-                    cornerRadius: AuraTheme.expandedArtworkCornerRadius,
-                    isPlayingElevated: player.isPlaying
-                )
-                .matchedGeometryEffect(id: "playerArtwork", in: playerAnimationNamespace)
-                .scaleEffect(player.isPlaying ? 1.0 : 0.84)
-                .animation(AuraTheme.springBouncy, value: player.isPlaying)
-            }
+            AuraArtworkView(
+                url: track.artworkURL,
+                size: 315,
+                cornerRadius: AuraTheme.expandedArtworkCornerRadius,
+                isPlayingElevated: player.isPlaying
+            )
+            .matchedGeometryEffect(id: "playerArtwork", in: playerAnimationNamespace)
+            .scaleEffect(player.isPlaying ? 1.0 : 0.84)
+            .animation(AuraTheme.springBouncy, value: player.isPlaying)
 
             if let banner = player.playbackStatusBanner {
                 Text(banner)
