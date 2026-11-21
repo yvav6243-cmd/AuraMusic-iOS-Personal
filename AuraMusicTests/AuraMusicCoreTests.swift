@@ -526,7 +526,7 @@ final class AuraMusicCoreTests: XCTestCase {
             )
         }
 
-        // Wait up to 3s for atDocumentEnd bridge script to finalize if needed
+        // Verify production auraControl bridge installed cleanly AND MSE/ManagedMediaSource disabled so YouTube serves direct HLS/MP4 URLs for native AVPlayer handoff
         var bridgeReady = false
         for _ in 0..<15 {
             if let ready = try? await webView.evaluateJavaScript("typeof window.auraControl === 'object' && typeof window.auraControl.pauseInBackground === 'function' && typeof window.auraControl.resume === 'function'") as? Bool,
@@ -537,6 +537,9 @@ final class AuraMusicCoreTests: XCTestCase {
             try await Task.sleep(nanoseconds: 200_000_000)
         }
         XCTAssertTrue(bridgeReady, "Production window.auraControl bridge must be installed in WKWebView")
+
+        let mseDisabled = try await webView.evaluateJavaScript("typeof window.ManagedMediaSource === 'undefined' && typeof window.MediaSource === 'undefined'") as? Bool
+        XCTAssertEqual(mseDisabled, true, "MSE/ManagedMediaSource must be disabled so YouTube mobile serves direct HLS/MP4 streams for native AVPlayer handoff")
 
         // 1. Enter background and trigger pauseInBackground() -> MUST natively mute & mark soft-paused
         let pauseState = try await webView.evaluateJavaScript("""

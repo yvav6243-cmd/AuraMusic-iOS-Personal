@@ -66,6 +66,8 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     private var youtubeClockInterpolatorTask: Task<Void, Never>?
     private var backgroundProtectTask: Task<Void, Never>?
     private var delayedKeepAliveStopTask: Task<Void, Never>?
+    private var nativeHandoffTask: Task<Void, Never>?
+    private var attemptedNativeHandoffVideoID: String?
     private var isUserPaused: Bool = false
     private var lastUserPauseWallTime: TimeInterval = 0
     private var lastYouTubeJSTickWallTime: TimeInterval = 0
@@ -267,12 +269,139 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         }
     }
 
+    /// Pre-buffers the poToken-signed HLS/MP4 URL from WKWebView inside native AVPlayer silently at volume 0.
+    /// Once AVPlayer proves HTTP 200 segment playback (>= 0.35s decoded), hands off completely to native Apple AVPlayer
+    /// and unloads WKWebView — delivering 100% native Apple Music Lock Screen Play/Pause/Scrub/AirPods reliability!
+    public func attemptSeamlessNativeAVPlayerHandoff(
+        streamURL: URL,
+        cookies: [HTTPCookie],
+        userAgent: String,
+        forVideoID videoID: String,
+        resumeTime: TimeInterval,
+        duration streamDuration: TimeInterval
+    ) {
+        capturedYouTubeAudioStreamURLs[videoID] = streamURL
+
+        guard activeYouTubeVideoID == videoID,
+              attemptedNativeHandoffVideoID != videoID,
+              !isUserPaused,
+              isPlaying else {
+            return
+        }
+        attemptedNativeHandoffVideoID = videoID
+        nativeHandoffTask?.cancel()
+
+        var headers: [String: String] = [
+            "User-Agent": userAgent,
+            "Referer": "https://m.youtube.com/",
+            "Origin": "https://m.youtube.com"
+        ]
+        let relevantCookies = cookies.filter {
+            let d = $0.domain.lowercased()
+            return d.contains("youtube.com") || d.contains("googlevideo.com") || d.contains("google.com")
+        }
+        if !relevantCookies.isEmpty {
+            let cookieHeader = relevantCookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
+            headers["Cookie"] = cookieHeader
+        }
+
+        let asset = AVURLAsset(url: streamURL, options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
+        let handoffItem = AVPlayerItem(asset: asset)
+
+        primaryPlayer.pause()
+        primaryPlayer.volume = 0.0
+        primaryPlayer.automaticallyWaitsToMinimizeStalling = true
+        primaryPlayer.replaceCurrentItem(with: handoffItem)
+
+        let targetStart = max(0, max(self.currentTime, resumeTime) + 0.35)
+        let seekTarget = CMTime(seconds: targetStart, preferredTimescale: 600)
+        primaryPlayer.seek(to: seekTarget, toleranceBefore: .zero, toleranceAfter: .zero)
+        primaryPlayer.play()
+
+        nativeHandoffTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            var playingBaselineTime: TimeInterval? = nil
+
+            for _ in 0..<60 {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                guard !Task.isCancelled,
+                      self.activeYouTubeVideoID == videoID,
+                      !self.isUserPaused,
+                      self.primaryPlayer.currentItem === handoffItem else {
+                    if self.primaryPlayer.currentItem === handoffItem {
+                        self.primaryPlayer.pause()
+                        self.primaryPlayer.replaceCurrentItem(with: nil)
+                    }
+                    return
+                }
+
+                if handoffItem.status == .failed {
+                    self.primaryPlayer.pause()
+                    self.primaryPlayer.replaceCurrentItem(with: nil)
+                    return
+                }
+
+                if handoffItem.status == .readyToPlay && self.primaryPlayer.timeControlStatus == .playing {
+                    let avNow = self.primaryPlayer.currentTime().seconds
+                    if avNow.isFinite && avNow >= 0 {
+                        if playingBaselineTime == nil {
+                            playingBaselineTime = avNow
+                        } else if let base = playingBaselineTime, avNow >= base + 0.35 {
+                            // Native AVPlayer is verified streaming & decoding smoothly! Perform seamless audio swap.
+                            let exactSyncTime = max(0, self.currentTime)
+                            let syncCM = CMTime(seconds: exactSyncTime, preferredTimescale: 600)
+                            self.primaryPlayer.seek(to: syncCM, toleranceBefore: .zero, toleranceAfter: .zero)
+                            self.primaryPlayer.volume = self.volume
+
+                            self.endOfTrackCancellable?.cancel()
+                            self.endOfTrackCancellable = NotificationCenter.default.publisher(
+                                for: .AVPlayerItemDidPlayToEndTime,
+                                object: handoffItem
+                            )
+                            .receive(on: RunLoop.main)
+                            .sink { [weak self] _ in
+                                self?.handleTrackFinished()
+                            }
+
+                            if streamDuration.isFinite && streamDuration > 10 {
+                                self.duration = streamDuration
+                            }
+
+                            // Shut down WKWebView & silent keep-alive — native AVPlayer now owns playback 100%!
+                            self.youtubeClockInterpolatorTask?.cancel()
+                            self.backgroundProtectTask?.cancel()
+                            self.delayedKeepAliveStopTask?.cancel()
+                            self.evaluateYouTubeJS("if(window.auraControl){window.auraControl.pause();}")
+                            self.youtubeWebView?.pauseAllMediaPlayback(completionHandler: nil)
+                            self.activeYouTubeVideoID = nil
+                            self.setBackgroundKeepAliveActive(false)
+                            self.configureAudioSession()
+                            self.isPlaying = true
+                            self.isBuffering = false
+                            self.refreshNowPlayingMetadata()
+                            return
+                        }
+                    }
+                }
+            }
+
+            // Timed out without confirming native playback — cleanly abort and let WKWebView keep playing
+            if self.activeYouTubeVideoID == videoID && self.primaryPlayer.currentItem === handoffItem {
+                self.primaryPlayer.pause()
+                self.primaryPlayer.replaceCurrentItem(with: nil)
+            }
+        }
+    }
+
     private func startFullLengthYouTubeMusicPlayback(videoID: String, for track: UniversalTrack) {
         youtubeWatchdogTask?.cancel()
         youtubeClockInterpolatorTask?.cancel()
         backgroundProtectTask?.cancel()
         delayedKeepAliveStopTask?.cancel()
+        nativeHandoffTask?.cancel()
+        attemptedNativeHandoffVideoID = nil
         primaryPlayer.pause()
+        primaryPlayer.replaceCurrentItem(with: nil)
         ApplicationMusicPlayer.shared.pause()
         fallbackYouTubeVideoIDs = []
         hasReceivedFirstYouTubeProgressTick = false
@@ -493,13 +622,13 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     }
 
     private func attachPeriodicTimeObserver() {
-        let interval = CMTime(seconds: 0.25, preferredTimescale: 600)
+        let interval = CMTime(seconds: 0.10, preferredTimescale: 600)
         timeObserverToken = primaryPlayer.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
             guard let self else { return }
             Task { @MainActor in
                 guard self.activeYouTubeVideoID == nil else { return }
                 let seconds = time.seconds
-                if seconds.isFinite && seconds >= 0 && abs(seconds - self.currentTime) >= 0.20 {
+                if seconds.isFinite && seconds >= 0 && abs(seconds - self.currentTime) >= 0.08 {
                     self.currentTime = seconds
                 }
                 if let item = self.primaryPlayer.currentItem {
@@ -827,6 +956,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     public func pause() {
         backgroundProtectTask?.cancel()
         delayedKeepAliveStopTask?.cancel()
+        nativeHandoffTask?.cancel()
         isUserPaused = true
         lastUserPauseWallTime = CACurrentMediaTime()
         isPlaying = false
@@ -877,7 +1007,15 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
 
     private func reassertNowPlayingOwnershipAfterDelay() {
         Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 180_000_000)
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            if self.activeYouTubeVideoID != nil && !self.isPlaying {
+                // Bounce silent AVAudioPlayer once so iOS mediaremoted hands Lock Screen Play button back to AuraMusic
+                self.backgroundKeepAliveAudioPlayer?.pause()
+                self.configureAudioSession()
+                self.backgroundKeepAliveAudioPlayer?.play()
+            }
+            self.refreshNowPlayingMetadata()
+            try? await Task.sleep(nanoseconds: 550_000_000)
             self.refreshNowPlayingMetadata()
         }
     }
