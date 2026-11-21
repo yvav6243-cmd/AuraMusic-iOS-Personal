@@ -301,14 +301,104 @@ public final class YouTubeMusicProvider: MusicProviderProtocol, @unchecked Senda
             .replacingOccurrences(of: "&amp;", with: "&")
     }
 
+    public static let iosPlayerUserAgent = "com.google.ios.youtube/20.03.02 (iPhone16,2; U; CPU iOS 18_2_1 like Mac OS X;)"
+
     public func searchAlbums(query: String, limit: Int = 10) async throws -> [UniversalAlbum] { [] }
     public func searchArtists(query: String, limit: Int = 10) async throws -> [UniversalArtist] { [] }
     public func fetchTopCharts(limit: Int = 15) async throws -> [UniversalTrack] {
-        try await searchTracks(query: "Top Music Hits", limit: limit)
+        try await searchTracks(query: "Top Music Hits 2026", limit: limit)
     }
     public func resolvePlayableStreamURL(for track: UniversalTrack) async throws -> URL? {
-        track.externalDeepLink
+        if let direct = await resolveDirectYouTubeAudioStream(videoID: track.providerTrackID) {
+            return direct.url
+        }
+        return track.externalDeepLink
     }
+
+    /// Resolves a direct native audio/mp4 (AAC) stream URL for AVPlayer playback
+    public func resolveDirectYouTubeAudioStream(videoID: String) async -> (url: URL, duration: TimeInterval)? {
+        guard let endpoint = URL(string: "https://www.youtube.com/youtubei/v1/player?prettyPrint=false") else {
+            return nil
+        }
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(Self.iosPlayerUserAgent, forHTTPHeaderField: "User-Agent")
+        request.timeoutInterval = 8
+
+        let payload: [String: Any] = [
+            "context": [
+                "client": [
+                    "clientName": "IOS",
+                    "clientVersion": "20.03.02",
+                    "deviceMake": "Apple",
+                    "deviceModel": "iPhone16,2",
+                    "osName": "iPhone",
+                    "osVersion": "18.2.1.22C161"
+                ]
+            ],
+            "videoId": videoID,
+            "contentCheckOk": true,
+            "racyCheckOk": true
+        ]
+
+        guard let bodyData = try? JSONSerialization.data(withJSONObject: payload) else {
+            return nil
+        }
+        request.httpBody = bodyData
+
+        do {
+            let (data, response) = try await session.data(for: request)
+            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                return nil
+            }
+            let decoded = try JSONDecoder().decode(YouTubeIOSPlayerResponse.self, from: data)
+
+            // Prefer audio/mp4 (AAC) adaptive stream for native AVPlayer
+            let audioFormats = (decoded.streamingData?.adaptiveFormats ?? []).filter {
+                $0.mimeType.lowercased().hasPrefix("audio/mp4") && $0.url != nil
+            }
+            let bestAudio = audioFormats.max(by: { ($0.bitrate ?? 0) < ($1.bitrate ?? 0) })
+                ?? (decoded.streamingData?.adaptiveFormats ?? []).first(where: {
+                    $0.mimeType.lowercased().hasPrefix("audio/") && $0.url != nil
+                })
+
+            if let format = bestAudio,
+               let urlStr = format.url,
+               let streamURL = URL(string: urlStr) {
+                let durMs = Double(format.approxDurationMs ?? "") ?? 0
+                let durSec = durMs > 0 ? (durMs / 1000.0) : Double(decoded.videoDetails?.lengthSeconds ?? "") ?? 0
+                return (streamURL, durSec)
+            }
+
+            if let hlsStr = decoded.streamingData?.hlsManifestUrl,
+               let hlsURL = URL(string: hlsStr) {
+                let durSec = Double(decoded.videoDetails?.lengthSeconds ?? "") ?? 0
+                return (hlsURL, durSec)
+            }
+        } catch {
+            return nil
+        }
+        return nil
+    }
+}
+
+private struct YouTubeIOSPlayerResponse: Codable {
+    struct AdaptiveFormat: Codable {
+        var url: String?
+        var mimeType: String
+        var bitrate: Int?
+        var approxDurationMs: String?
+    }
+    struct StreamingData: Codable {
+        var hlsManifestUrl: String?
+        var adaptiveFormats: [AdaptiveFormat]?
+    }
+    struct VideoDetails: Codable {
+        var lengthSeconds: String?
+    }
+    var streamingData: StreamingData?
+    var videoDetails: VideoDetails?
 }
 
 private struct YouTubeSearchListResponse: Codable {
