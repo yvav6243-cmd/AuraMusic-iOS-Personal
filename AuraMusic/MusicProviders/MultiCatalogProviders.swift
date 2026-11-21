@@ -49,7 +49,10 @@ public final class AudiusProvider: MusicProviderProtocol, @unchecked Sendable {
         guard let url = components.url else { return [] }
         let (data, _) = try await session.data(from: url)
         let decoded = try JSONDecoder().decode(AudiusTracksResponse.self, from: data)
-        return decoded.data.prefix(limit).map { mapTrack($0, host: host) }
+        return decoded.data
+            .filter { $0.is_streamable != false }
+            .prefix(limit)
+            .map { mapTrack($0, host: host) }
     }
 
     public func searchAlbums(query: String, limit: Int = 10) async throws -> [UniversalAlbum] {
@@ -93,7 +96,10 @@ public final class AudiusProvider: MusicProviderProtocol, @unchecked Sendable {
         guard let url = components.url else { return [] }
         let (data, _) = try await session.data(from: url)
         let decoded = try JSONDecoder().decode(AudiusTracksResponse.self, from: data)
-        return decoded.data.prefix(limit).map { mapTrack($0, host: host) }
+        return decoded.data
+            .filter { $0.is_streamable != false }
+            .prefix(limit)
+            .map { mapTrack($0, host: host) }
     }
 
     public func resolvePlayableStreamURL(for track: UniversalTrack) async throws -> URL? {
@@ -145,6 +151,7 @@ private struct AudiusTracksResponse: Codable {
         var duration: Int?
         var genre: String?
         var artwork: Artwork?
+        var is_streamable: Bool?
     }
     var data: [TrackItem]
 }
