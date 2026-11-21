@@ -61,15 +61,16 @@ public final class UnifiedSearchViewModel: ObservableObject {
         isSearching = true
         PersistenceController.shared.addSearchQuery(trimmed)
 
+        let creds = ProviderCredentialsStore.shared
         let localMatches = PersistenceController.shared.libraryTracks
             .filter {
-                $0.title.localizedCaseInsensitiveContains(trimmed) ||
-                $0.artist.localizedCaseInsensitiveContains(trimmed) ||
-                $0.album.localizedCaseInsensitiveContains(trimmed)
+                ($0.title.localizedCaseInsensitiveContains(trimmed) ||
+                 $0.artist.localizedCaseInsensitiveContains(trimmed) ||
+                 $0.album.localizedCaseInsensitiveContains(trimmed))
             }
             .map { $0.toUniversalTrack() }
+            .filter { creds.hasConfiguredAPI(for: $0.provider) || $0.provider == .localFile }
 
-        let creds = ProviderCredentialsStore.shared
         let useAppleTracks = creds.hasConfiguredAPI(for: .appleMusic)
         let useAudiusTracks = creds.hasConfiguredAPI(for: .audius)
         let useYTMusic = creds.hasConfiguredAPI(for: .youtubeMusic)
