@@ -350,7 +350,8 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
                             // Native AVPlayer is verified streaming & decoding smoothly! Perform seamless audio swap.
                             let exactSyncTime = max(0, self.currentTime)
                             let syncCM = CMTime(seconds: exactSyncTime, preferredTimescale: 600)
-                            self.primaryPlayer.seek(to: syncCM, toleranceBefore: .zero, toleranceAfter: .zero)
+                            _ = await self.primaryPlayer.seek(to: syncCM, toleranceBefore: .zero, toleranceAfter: .zero)
+                            guard !Task.isCancelled, self.activeYouTubeVideoID == videoID, !self.isUserPaused else { return }
                             self.primaryPlayer.volume = self.volume
 
                             self.endOfTrackCancellable?.cancel()
