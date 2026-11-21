@@ -201,11 +201,13 @@ public final class YouTubeMusicProvider: MusicProviderProtocol, @unchecked Senda
         let videoIDs = decoded.items.compactMap(\.id.videoId)
         let durationsByID = await fetchVideoDurations(videoIDs: videoIDs, apiKey: apiKey)
 
-        return decoded.items.compactMap { item -> UniversalTrack? in
+        let tracks = decoded.items.compactMap { item -> UniversalTrack? in
             guard let videoID = item.id.videoId else { return nil }
             let rawTitle = Self.decodeHTMLEntities(item.snippet.title)
             let cleanTitle = providerType == .youtubeMusic ? Self.cleanStudioTrackTitle(rawTitle) : rawTitle
-            let channel = Self.decodeHTMLEntities(item.snippet.channelTitle)
+            let rawChannel = Self.decodeHTMLEntities(item.snippet.channelTitle)
+            let isTopicOrAudio = rawChannel.contains("- Topic") || rawTitle.localizedCaseInsensitiveContains("Audio") || rawTitle.localizedCaseInsensitiveContains("Lyrics")
+            let channel = rawChannel
                 .replacingOccurrences(of: " - Topic", with: "")
                 .replacingOccurrences(of: "VEVO", with: "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -221,15 +223,25 @@ public final class YouTubeMusicProvider: MusicProviderProtocol, @unchecked Senda
                 providerTrackID: videoID,
                 title: cleanTitle,
                 artist: channel,
-                album: providerType == .youtubeMusic ? "YouTube Music Audio" : "YouTube Video",
+                album: isTopicOrAudio ? "YouTube Music Studio Audio" : (providerType == .youtubeMusic ? "YouTube Music" : "YouTube Video"),
                 artworkURL: thumb.flatMap(URL.init(string:)),
                 duration: exactDuration,
                 externalDeepLink: URL(string: deepLinkScheme),
                 isStreamable: true,
                 isDownloadPermitted: false,
-                audioQualityBadge: providerType == .youtubeMusic ? "YT MUSIC AUDIO" : "VIDEO"
+                audioQualityBadge: isTopicOrAudio ? "STUDIO AUDIO" : (providerType == .youtubeMusic ? "YT MUSIC" : "VIDEO")
             )
         }
+
+        // Prioritize studio "- Topic" / Audio tracks over VEVO music videos for reliable playback
+        if providerType == .youtubeMusic {
+            return tracks.sorted { lhs, rhs in
+                let lhsScore = (lhs.audioQualityBadge == "STUDIO AUDIO") ? 1 : 0
+                let rhsScore = (rhs.audioQualityBadge == "STUDIO AUDIO") ? 1 : 0
+                return lhsScore > rhsScore
+            }
+        }
+        return tracks
     }
 
     private func fetchVideoDurations(videoIDs: [String], apiKey: String) async -> [String: TimeInterval] {
@@ -399,7 +411,8 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
                     'rel': 0,
                     'modestbranding': 1,
                     'fs': 0,
-                    'iv_load_policy': 3
+                    'iv_load_policy': 3,
+                    'origin': 'https://www.youtube.com'
                   },
                   events: {
                     'onReady': function(e) {
@@ -408,6 +421,14 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
                     },
                     'onStateChange': function(e) {
                       postState(e.data);
+                    },
+                    'onError': function(e) {
+                      window.webkit.messageHandlers.auraYT.postMessage({
+                        type: 'error',
+                        currentTime: 0,
+                        duration: 0,
+                        state: -99
+                      });
                     }
                   }
                 });
