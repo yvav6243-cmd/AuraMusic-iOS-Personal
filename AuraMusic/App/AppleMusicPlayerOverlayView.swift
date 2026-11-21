@@ -20,13 +20,18 @@ public struct AppleMusicPlayerOverlayView: View {
 
     public var body: some View {
         ZStack(alignment: .bottom) {
-            // Keep YouTube Music audio bridge alive at full opacity (behind the opaque UI) so iOS WebKit never suspends playback
-            if let videoID = player.activeYouTubeVideoID,
-               (!player.isPlayerExpanded || !player.isYouTubeVideoVisible || player.activeOverlayTab != .none) {
+            // Single persistent YouTube Music engine instance — never unmounted when opening Lyrics or Mini-Player
+            if let videoID = player.activeYouTubeVideoID {
+                let showVideoInFront = player.isPlayerExpanded && player.activeOverlayTab == .none && player.isYouTubeVideoVisible
                 AuthorizedYouTubeIFramePlayerView(videoID: videoID)
-                    .frame(width: 220, height: 220)
-                    .allowsHitTesting(false)
-                    .zIndex(-1)
+                    .frame(
+                        width: showVideoInFront ? 330 : 240,
+                        height: showVideoInFront ? 225 : 240
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    .offset(y: showVideoInFront ? -215 : 0)
+                    .allowsHitTesting(showVideoInFront)
+                    .zIndex(showVideoInFront ? 30 : -1)
             }
 
             if let track = player.currentTrack {
@@ -257,12 +262,9 @@ public struct AppleMusicPlayerOverlayView: View {
 
             Spacer(minLength: 4)
 
-            if let videoID = player.activeYouTubeVideoID, player.isYouTubeVideoVisible {
-                AuthorizedYouTubeIFramePlayerView(videoID: videoID)
-                    .frame(height: 235)
-                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                    .shadow(color: .black.opacity(0.45), radius: 20, y: 10)
-                    .padding(.horizontal, 24)
+            if player.activeYouTubeVideoID != nil && player.isYouTubeVideoVisible {
+                Color.clear
+                    .frame(width: 330, height: 225)
             } else {
                 AuraArtworkView(
                     url: track.artworkURL,
