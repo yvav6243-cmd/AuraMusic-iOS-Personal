@@ -527,16 +527,39 @@ public struct AppleMusicPlayerOverlayView: View {
 
     private var volumeAndOutputSlider: some View {
         HStack(spacing: 12) {
-            Image(systemName: "speaker.fill")
-                .font(.system(size: 13))
-                .foregroundStyle(.white.opacity(0.65))
+            Button {
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                SystemVolumeController.shared.stepVolume(by: -0.10)
+            } label: {
+                Image(systemName: "speaker.fill")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.75))
+                    .frame(width: 26, height: 28)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(AuraTactileTransportButtonStyle())
+            .accessibilityLabel("Decrease Volume")
 
+            #if targetEnvironment(simulator)
             Slider(value: $player.volume, in: 0...1)
                 .tint(.white)
+            #else
+            HardwareVolumeSliderBridge()
+                .frame(height: 30)
+            #endif
 
-            Image(systemName: "speaker.wave.3.fill")
-                .font(.system(size: 13))
-                .foregroundStyle(.white.opacity(0.65))
+            Button {
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                SystemVolumeController.shared.stepVolume(by: 0.10)
+            } label: {
+                Image(systemName: "speaker.wave.3.fill")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.75))
+                    .frame(width: 26, height: 28)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(AuraTactileTransportButtonStyle())
+            .accessibilityLabel("Increase Volume")
         }
     }
 

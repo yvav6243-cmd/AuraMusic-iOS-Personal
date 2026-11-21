@@ -1444,4 +1444,66 @@ final class AuraMusicCoreTests: XCTestCase {
         XCTAssertEqual(inPlaceSwitch?["userPaused"] as? Bool, false)
         XCTAssertEqual(inPlaceSwitch?["softPaused"] as? Bool, false)
     }
+
+    // MARK: - Hardware System Volume Slider Tests
+
+    @MainActor
+    func testSystemVolumeControllerClampsAndStepsVolumeCleanly() {
+        XCTAssertEqual(SystemVolumeController.clampedVolume(-0.4), 0.0, accuracy: 0.0001)
+        XCTAssertEqual(SystemVolumeController.clampedVolume(1.8), 1.0, accuracy: 0.0001)
+        XCTAssertEqual(SystemVolumeController.clampedVolume(.nan), 0.5, accuracy: 0.0001)
+
+        let mockSlider = UISlider(frame: CGRect(x: 0, y: 0, width: 200, height: 28))
+        mockSlider.minimumValue = 0
+        mockSlider.maximumValue = 1
+        mockSlider.value = 0.5
+
+        let controller = SystemVolumeController.shared
+        controller.registerSlider(mockSlider)
+
+        let raised = controller.stepVolume(by: 0.15)
+        XCTAssertEqual(raised, 0.65, accuracy: 0.001)
+        XCTAssertEqual(mockSlider.value, 0.65, accuracy: 0.001)
+        XCTAssertEqual(UniversalAudioPlayerEngine.shared.volume, 0.65, accuracy: 0.001)
+
+        let lowered = controller.stepVolume(by: -0.25)
+        XCTAssertEqual(lowered, 0.40, accuracy: 0.001)
+        XCTAssertEqual(mockSlider.value, 0.40, accuracy: 0.001)
+
+        // Clamping at boundaries
+        XCTAssertEqual(controller.stepVolume(by: 5.0), 1.0, accuracy: 0.001)
+        XCTAssertEqual(controller.stepVolume(by: -5.0), 0.0, accuracy: 0.001)
+
+        // Restore clean level
+        _ = controller.setSystemVolume(0.8)
+    }
+
+    @MainActor
+    func testHardwareVolumeSliderContainerLayoutsMPVolumeViewWithCustomTrackAndThumb() {
+        let container = AuraSystemVolumeContainerView(frame: CGRect(x: 0, y: 0, width: 280, height: 30))
+        container.layoutIfNeeded()
+
+        XCTAssertTrue(container.volumeView.showsVolumeSlider, "MPVolumeView must show the hardware volume slider")
+        XCTAssertEqual(container.volumeView.frame.width, 280, accuracy: 0.5)
+        XCTAssertEqual(container.volumeView.frame.height, 28, accuracy: 0.5)
+        XCTAssertNotNil(container.volumeView.minimumVolumeSliderImage(for: .normal))
+        XCTAssertNotNil(container.volumeView.maximumVolumeSliderImage(for: .normal))
+        XCTAssertNotNil(container.volumeView.volumeThumbImage(for: .normal))
+        XCTAssertNotNil(container.volumeView.volumeThumbImage(for: .highlighted))
+    }
+
+    @MainActor
+    func testEngineSyncsObservedHardwareVolumeCleanly() {
+        let engine = UniversalAudioPlayerEngine.shared
+        engine.syncObservedHardwareVolume(0.35)
+        XCTAssertEqual(engine.volume, 0.35, accuracy: 0.001)
+
+        engine.syncObservedHardwareVolume(1.5)
+        XCTAssertEqual(engine.volume, 1.0, accuracy: 0.001)
+
+        engine.syncObservedHardwareVolume(-0.2)
+        XCTAssertEqual(engine.volume, 0.0, accuracy: 0.001)
+
+        engine.syncObservedHardwareVolume(0.85)
+    }
 }

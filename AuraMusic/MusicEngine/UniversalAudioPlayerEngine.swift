@@ -75,9 +75,15 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
             }
         }
     }
-    @Published public var volume: Float = 0.85 {
+    @Published public var volume: Float = 1.0 {
         didSet {
+            #if targetEnvironment(simulator)
             primaryPlayer.volume = volume
+            #else
+            // On real iOS hardware, master volume is controlled natively by iOS hardware volume (MPVolumeView + side buttons)
+            // so AVPlayer stays at full 1.0 headroom matching WKWebView with zero double-attenuation!
+            primaryPlayer.volume = 1.0
+            #endif
             let ytPercent = Int((volume * 100).rounded())
             evaluateYouTubeJS("if(window.auraControl){window.auraControl.setVolume(\(ytPercent));}")
         }
@@ -116,6 +122,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     private var timeObserverToken: Any?
     private var endOfTrackCancellable: AnyCancellable?
     private var itemStatusObservation: NSKeyValueObservation?
+    private var outputVolumeObservation: NSKeyValueObservation?
     private var sleepTimerTask: Task<Void, Never>?
     private var youtubeWatchdogTask: Task<Void, Never>?
     private var youtubeClockInterpolatorTask: Task<Void, Never>?
@@ -143,10 +150,32 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
 
     private init() {
         configureAudioSession()
+        let hwVol = AVAudioSession.sharedInstance().outputVolume
+        if hwVol.isFinite && hwVol > 0 {
+            self.volume = hwVol
+        }
+        observeSystemHardwareVolume()
         prepareSilentBackgroundKeepAlivePlayer()
         configureRemoteCommandCenter()
         configureAudioNotifications()
         attachPeriodicTimeObserver()
+    }
+
+    public func syncObservedHardwareVolume(_ hardwareVolume: Float) {
+        let clamped = max(0.0, min(1.0, hardwareVolume))
+        if abs(self.volume - clamped) > 0.005 {
+            self.volume = clamped
+        }
+    }
+
+    private func observeSystemHardwareVolume() {
+        outputVolumeObservation?.invalidate()
+        outputVolumeObservation = AVAudioSession.sharedInstance().observe(\.outputVolume, options: [.new]) { [weak self] session, _ in
+            let latest = session.outputVolume
+            Task { @MainActor [weak self] in
+                self?.syncObservedHardwareVolume(latest)
+            }
+        }
     }
 
     private static let safariMobileUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"
@@ -285,7 +314,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
                 self.itemStatusObservation = nil
                 self.primaryPlayer.automaticallyWaitsToMinimizeStalling = true
                 self.primaryPlayer.isMuted = false
-                self.primaryPlayer.volume = self.volume
+                self.primaryPlayer.volume = 1.0
                 self.primaryPlayer.play()
 
                 if loadedDuration.seconds > self.duration {
@@ -1202,7 +1231,11 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         primaryPlayer.automaticallyWaitsToMinimizeStalling = true
         primaryPlayer.isMuted = false
         primaryPlayer.replaceCurrentItem(with: playerItem)
+        #if targetEnvironment(simulator)
         primaryPlayer.volume = volume
+        #else
+        primaryPlayer.volume = 1.0
+        #endif
         primaryPlayer.play()
 
         isPlaying = true
@@ -1414,7 +1447,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         crossfadeTriggeredForCurrentItem = true
         let steps = 10
         let stepInterval = crossfadeSeconds / Double(steps)
-        let originalVolume = volume
+        let originalVolume = max(primaryPlayer.volume, 0.05)
 
         Task { @MainActor in
             for step in 1...steps {
