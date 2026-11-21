@@ -202,6 +202,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
             self.volume = hwVol
         }
         observeSystemHardwareVolume()
+        YouTubeAdBlockerRuleManager.shared.preloadRules()
         prepareSilentBackgroundKeepAlivePlayer()
         configureRemoteCommandCenter()
         configureAudioNotifications()

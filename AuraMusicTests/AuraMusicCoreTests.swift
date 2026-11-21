@@ -1575,4 +1575,163 @@ final class AuraMusicCoreTests: XCTestCase {
         XCTAssertEqual(engineInvalidations, 0, "Smooth scrubber interpolation must cause ZERO engine invalidations")
         XCTAssertEqual(clockInvalidations, 0, "Smooth scrubber interpolation must cause ZERO clock invalidations")
     }
+
+    // MARK: - 3-Layer YouTube Ad Blocker Tests (WKContentRuleList + JSON Strip + Live Ad Handler)
+
+    @MainActor
+    func testYouTubeContentBlockerRulesCompileSuccessfullyInWebKit() async throws {
+        // Verify JSON is valid and never blocks song audio endpoints (googlevideo.com / youtubei/v1/player)
+        let data = try XCTUnwrap(YouTubeAdBlockerRuleManager.contentBlockerRulesJSON.data(using: .utf8))
+        let rules = try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [[String: Any]])
+        XCTAssertGreaterThanOrEqual(rules.count, 10)
+        XCTAssertFalse(YouTubeAdBlockerRuleManager.contentBlockerRulesJSON.contains("googlevideo"), "Must never block googlevideo song audio streams")
+
+        // Actually compile via Apple's native WebKit WKContentRuleListStore on iOS Simulator!
+        let compiled = await YouTubeAdBlockerRuleManager.shared.ensureCompiledRuleList()
+        XCTAssertNotNil(compiled, "Apple WebKit WKContentRuleListStore MUST compile YouTube ad-blocker rules cleanly with zero errors")
+    }
+
+    @MainActor
+    func testWebKitStripsYouTubeAdPlacementsFromInitialResponseAndJSONParse() async throws {
+        let playerView = AuthorizedYouTubeIFramePlayerView(videoID: "YkY4X_OaF6o")
+        let coordinator = playerView.makeCoordinator()
+        let webView = AuthorizedYouTubeIFramePlayerView.makeConfiguredWebView(coordinator: coordinator)
+        let navWaiter = TestWKNavigationWaiter()
+        webView.navigationDelegate = navWaiter
+        defer {
+            webView.navigationDelegate = nil
+            webView.configuration.userContentController.removeScriptMessageHandler(forName: "auraYT")
+        }
+
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            navWaiter.continuation = cont
+            webView.loadHTMLString(
+                """
+                <!doctype html><html><head><title>AdStripTest</title></head><body>
+                <script>
+                var ytInitialPlayerResponse = {
+                  videoDetails: { title: "Starboy", videoId: "34Na4j8AVgA" },
+                  adPlacements: [{ adPlacementRenderer: { config: "preroll" } }],
+                  playerAds: [{ playerLegacyDesktopWatchAdsRenderer: {} }],
+                  adSlots: [{ adSlotRenderer: { slot: "midroll" } }],
+                  adBreakHeartbeatParams: "secret-ad-token"
+                };
+                </script>
+                <div id='movie_player'></div>
+                <video id='v' playsinline></video>
+                </body></html>
+                """,
+                baseURL: URL(string: "https://m.youtube.com/watch?v=YkY4X_OaF6o")
+            )
+        }
+
+        let result = try await webView.evaluateJavaScript("""
+        (function() {
+          var parsed = JSON.parse('{"videoDetails":{"title":"Blinding Lights"},"adPlacements":[{"id":1}],"playerAds":[{"id":2}],"adSlots":[{"id":3}],"adBreakHeartbeatParams":"abc"}');
+          return {
+            initTitle: window.ytInitialPlayerResponse && window.ytInitialPlayerResponse.videoDetails ? window.ytInitialPlayerResponse.videoDetails.title : '',
+            initAdPlacements: window.ytInitialPlayerResponse && window.ytInitialPlayerResponse.adPlacements ? window.ytInitialPlayerResponse.adPlacements.length : -1,
+            initPlayerAds: window.ytInitialPlayerResponse && window.ytInitialPlayerResponse.playerAds ? window.ytInitialPlayerResponse.playerAds.length : -1,
+            initAdSlots: window.ytInitialPlayerResponse && window.ytInitialPlayerResponse.adSlots ? window.ytInitialPlayerResponse.adSlots.length : -1,
+            initHasHeartbeat: !!(window.ytInitialPlayerResponse && window.ytInitialPlayerResponse.adBreakHeartbeatParams),
+            parsedTitle: parsed.videoDetails ? parsed.videoDetails.title : '',
+            parsedAdPlacements: parsed.adPlacements ? parsed.adPlacements.length : -1,
+            parsedPlayerAds: parsed.playerAds ? parsed.playerAds.length : -1,
+            parsedAdSlots: parsed.adSlots ? parsed.adSlots.length : -1,
+            parsedHasHeartbeat: !!parsed.adBreakHeartbeatParams
+          };
+        })()
+        """) as? [String: Any]
+
+        XCTAssertEqual(result?["initTitle"] as? String, "Starboy", "Real song metadata must remain intact")
+        XCTAssertEqual(result?["initAdPlacements"] as? Int, 0)
+        XCTAssertEqual(result?["initPlayerAds"] as? Int, 0)
+        XCTAssertEqual(result?["initAdSlots"] as? Int, 0)
+        XCTAssertEqual(result?["initHasHeartbeat"] as? Bool, false)
+
+        XCTAssertEqual(result?["parsedTitle"] as? String, "Blinding Lights")
+        XCTAssertEqual(result?["parsedAdPlacements"] as? Int, 0)
+        XCTAssertEqual(result?["parsedPlayerAds"] as? Int, 0)
+        XCTAssertEqual(result?["parsedAdSlots"] as? Int, 0)
+        XCTAssertEqual(result?["parsedHasHeartbeat"] as? Bool, false)
+    }
+
+    @MainActor
+    func testWebKitLiveAdDetectorMutesFastForwardsSkipsAndRestoresSongCleanly() async throws {
+        let playerView = AuthorizedYouTubeIFramePlayerView(videoID: "YkY4X_OaF6o")
+        let coordinator = playerView.makeCoordinator()
+        let webView = AuthorizedYouTubeIFramePlayerView.makeConfiguredWebView(coordinator: coordinator)
+        let navWaiter = TestWKNavigationWaiter()
+        webView.navigationDelegate = navWaiter
+        defer {
+            webView.navigationDelegate = nil
+            webView.configuration.userContentController.removeScriptMessageHandler(forName: "auraYT")
+        }
+
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            navWaiter.continuation = cont
+            webView.loadHTMLString(
+                """
+                <!doctype html><html><head><title>LiveAdTest</title></head><body>
+                <div id='movie_player' class='ad-showing'>
+                  <button class='ytp-ad-skip-button-modern' onclick='window._skipClicked = true;'>Skip</button>
+                </div>
+                <video id='v' playsinline></video>
+                </body></html>
+                """,
+                baseURL: URL(string: "https://m.youtube.com/watch?v=YkY4X_OaF6o")
+            )
+        }
+
+        var ready = false
+        for _ in 0..<15 {
+            if let ok = try? await webView.evaluateJavaScript("typeof window._auraHandleActiveAd === 'function'") as? Bool, ok {
+                ready = true
+                break
+            }
+            try await Task.sleep(nanoseconds: 200_000_000)
+        }
+        XCTAssertTrue(ready)
+
+        // 1. Trigger live ad handler while `ad-showing` is active -> MUST mute natively, click Skip, and accelerate to 16x!
+        let duringAd = try await webView.evaluateJavaScript("""
+        (function() {
+          var v = document.querySelector('video');
+          var handled = window._auraHandleActiveAd(v);
+          return {
+            handled: handled === true,
+            inAd: window._auraInAd === true,
+            skipClicked: window._skipClicked === true,
+            realMuted: window._auraOrigMutedDesc ? window._auraOrigMutedDesc.get.call(v) : false,
+            rate: v ? v.playbackRate : -1
+          };
+        })()
+        """) as? [String: Any]
+        XCTAssertEqual(duringAd?["handled"] as? Bool, true)
+        XCTAssertEqual(duringAd?["inAd"] as? Bool, true)
+        XCTAssertEqual(duringAd?["skipClicked"] as? Bool, true, "Skip ad button must be auto-clicked")
+        XCTAssertEqual(duringAd?["realMuted"] as? Bool, true, "Ad audio must be natively muted immediately")
+        XCTAssertEqual(duringAd?["rate"] as? Double ?? -1, 16.0, accuracy: 0.01, "Ad must be fast-forwarded at 16x")
+
+        // 2. Ad ends (`ad-showing` & skip button removed) -> MUST immediately unmute and restore 1.0x speed for the real song!
+        let afterAd = try await webView.evaluateJavaScript("""
+        (function() {
+          var mp = document.getElementById('movie_player');
+          mp.classList.remove('ad-showing');
+          mp.innerHTML = '';
+          var v = document.querySelector('video');
+          var handled = window._auraHandleActiveAd(v);
+          return {
+            handled: handled === true,
+            inAd: window._auraInAd === true,
+            realMuted: window._auraOrigMutedDesc ? window._auraOrigMutedDesc.get.call(v) : true,
+            rate: v ? v.playbackRate : -1
+          };
+        })()
+        """) as? [String: Any]
+        XCTAssertEqual(afterAd?["handled"] as? Bool, false)
+        XCTAssertEqual(afterAd?["inAd"] as? Bool, false)
+        XCTAssertEqual(afterAd?["realMuted"] as? Bool, false, "Real song must be unmuted immediately once ad finishes")
+        XCTAssertEqual(afterAd?["rate"] as? Double ?? -1, 1.0, accuracy: 0.01, "Real song playback rate must return to 1.0x")
+    }
 }

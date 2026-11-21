@@ -763,6 +763,64 @@ private struct YouTubeFullVideoListResponse: Codable {
     var items: [Item]
 }
 
+// MARK: - Native WebKit Content Blocker for YouTube Ad Domains (Safari WKContentRuleList)
+
+@MainActor
+public final class YouTubeAdBlockerRuleManager {
+    public static let shared = YouTubeAdBlockerRuleManager()
+    public static let ruleListIdentifier = "AuraMusicYouTubeAdBlockerV1"
+
+    /// Apple Safari Content Blocker JSON rules blocking ad-serving & ad-telemetry domains at the native WebKit C++ network layer.
+    /// Never blocks `googlevideo.com` song streams or `/youtubei/v1/player` track metadata.
+    public static let contentBlockerRulesJSON: String = """
+    [
+      { "trigger": { "url-filter": "^https?://([^/]+\\\\.)?doubleclick\\\\.net/" }, "action": { "type": "block" } },
+      { "trigger": { "url-filter": "^https?://([^/]+\\\\.)?googlesyndication\\\\.com/" }, "action": { "type": "block" } },
+      { "trigger": { "url-filter": "^https?://([^/]+\\\\.)?googleadservices\\\\.com/" }, "action": { "type": "block" } },
+      { "trigger": { "url-filter": "^https?://([^/]+\\\\.)?google-analytics\\\\.com/" }, "action": { "type": "block" } },
+      { "trigger": { "url-filter": "^https?://([^/]+\\\\.)?youtube\\\\.com/pagead/" }, "action": { "type": "block" } },
+      { "trigger": { "url-filter": "^https?://([^/]+\\\\.)?youtube\\\\.com/ptracking" }, "action": { "type": "block" } },
+      { "trigger": { "url-filter": "^https?://([^/]+\\\\.)?youtube\\\\.com/api/stats/ads" }, "action": { "type": "block" } },
+      { "trigger": { "url-filter": "^https?://([^/]+\\\\.)?youtube\\\\.com/get_midroll_info" }, "action": { "type": "block" } },
+      { "trigger": { "url-filter": "^https?://([^/]+\\\\.)?youtube\\\\.com/youtubei/v1/log_event" }, "action": { "type": "block" } },
+      { "trigger": { "url-filter": "^https?://([^/]+\\\\.)?youtube\\\\.com/youtubei/v1/player/ad_break" }, "action": { "type": "block" } }
+    ]
+    """
+
+    public private(set) var compiledRuleList: WKContentRuleList?
+    private var isCompiling = false
+
+    private init() {}
+
+    public func preloadRules() {
+        guard compiledRuleList == nil, !isCompiling else { return }
+        isCompiling = true
+        Task { @MainActor in
+            _ = await ensureCompiledRuleList()
+        }
+    }
+
+    public func ensureCompiledRuleList() async -> WKContentRuleList? {
+        if let existing = compiledRuleList {
+            return existing
+        }
+        return await withCheckedContinuation { continuation in
+            WKContentRuleListStore.default().compileContentRuleList(
+                forIdentifier: Self.ruleListIdentifier,
+                encodedContentRuleList: Self.contentBlockerRulesJSON
+            ) { [weak self] ruleList, _ in
+                Task { @MainActor in
+                    self?.isCompiling = false
+                    if let ruleList {
+                        self?.compiledRuleList = ruleList
+                    }
+                    continuation.resume(returning: ruleList)
+                }
+            }
+        }
+    }
+}
+
 // MARK: - Full-Length Mobile YouTube Music WebKit Audio/Video Engine Bridge
 
 public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
@@ -787,18 +845,68 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
         let config = WKWebViewConfiguration()
         config.allowsInlineMediaPlayback = true
         config.mediaTypesRequiringUserActionForPlayback = []
+        if let compiledRules = YouTubeAdBlockerRuleManager.shared.compiledRuleList {
+            config.userContentController.add(compiledRules)
+        }
 
-        // 1. Early script at document start: lock unmuted autoplay, block background visibility pause, and intercept audio stream URLs
+        // 1. Early script at document start: strip ad payloads, lock unmuted autoplay, block background visibility pause, and intercept audio stream URLs
         let unmuteLockScriptSource = """
         (function() {
           try {
+            // Layer 2 Ad Filter: O(1) strip of YouTube adPlacements / playerAds / adSlots from player JSON responses
+            function pruneYouTubeAdFields(obj) {
+              if (!obj || typeof obj !== 'object') return obj;
+              if (obj.adPlacements) obj.adPlacements = [];
+              if (obj.playerAds) obj.playerAds = [];
+              if (obj.adSlots) obj.adSlots = [];
+              if (obj.adBreakHeartbeatParams) delete obj.adBreakHeartbeatParams;
+              if (obj.playerResponse && typeof obj.playerResponse === 'object') {
+                pruneYouTubeAdFields(obj.playerResponse);
+              }
+              return obj;
+            }
+            window._auraPruneYouTubeAds = pruneYouTubeAdFields;
+
+            // Hook window.ytInitialPlayerResponse before YouTube's player script parses it
+            var _auraInitialPlayerResp = undefined;
+            try {
+              Object.defineProperty(window, 'ytInitialPlayerResponse', {
+                get: function() { return _auraInitialPlayerResp; },
+                set: function(val) { _auraInitialPlayerResp = pruneYouTubeAdFields(val); },
+                configurable: true
+              });
+            } catch(e) {}
+
+            // Strip ad arrays from JSON.parse payloads (covers /youtubei/v1/player, loadVideoById & SPA switches)
+            var origJSONParse = JSON.parse;
+            JSON.parse = function() {
+              var parsed = origJSONParse.apply(this, arguments);
+              try {
+                if (parsed && typeof parsed === 'object' &&
+                    (parsed.adPlacements || parsed.playerAds || parsed.adSlots || parsed.adBreakHeartbeatParams || parsed.playerResponse)) {
+                  pruneYouTubeAdFields(parsed);
+                }
+              } catch(e) {}
+              return parsed;
+            };
+
+            if (typeof Response !== 'undefined' && Response.prototype && Response.prototype.json) {
+              var origResponseJson = Response.prototype.json;
+              Response.prototype.json = function() {
+                return origResponseJson.apply(this, arguments).then(function(data) {
+                  try { pruneYouTubeAdFields(data); } catch(e) {}
+                  return data;
+                });
+              };
+            }
+
             var origMutedDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'muted');
             window._auraOrigMutedDesc = origMutedDesc;
             Object.defineProperty(HTMLMediaElement.prototype, 'muted', {
-              get: function() { return window._auraSoftPaused === true; },
+              get: function() { return window._auraSoftPaused === true || window._auraInAd === true; },
               set: function(v) {
                 try {
-                  if (window._auraSoftPaused === true) return;
+                  if (window._auraSoftPaused === true || window._auraInAd === true) return;
                   this.removeAttribute('muted');
                   if (origMutedDesc && origMutedDesc.set) { origMutedDesc.set.call(this, false); }
                 } catch(e) {}
@@ -953,9 +1061,59 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
             });
           }
 
+          function isAdCurrentlyShowing() {
+            try {
+              var mp = document.getElementById('movie_player');
+              if (mp && (mp.classList.contains('ad-showing') || mp.classList.contains('ad-interrupting'))) {
+                return true;
+              }
+              if (document.querySelector('.ytp-ad-player-overlay, .ytp-ad-player-overlay-layout, .ytp-ad-skip-button, .ytp-ad-skip-button-modern, .ytp-skip-ad-button, .ytp-ad-skip-button-slot button, button[id^="skip-button"]')) {
+                return true;
+              }
+            } catch(e) {}
+            return false;
+          }
+
+          function handleActiveAdIfShowing(v) {
+            if (!isAdCurrentlyShowing()) {
+              if (window._auraWasInAd === true) {
+                window._auraInAd = false;
+                window._auraWasInAd = false;
+                if (v) {
+                  try { v.playbackRate = 1.0; } catch(e) {}
+                  if (!window._auraUserPaused && !window._auraSoftPaused) {
+                    applyNativeMute(v, false);
+                    v._auraUnmutedOnce = false;
+                  }
+                }
+              }
+              return false;
+            }
+            window._auraInAd = true;
+            window._auraWasInAd = true;
+            window._auraHandledAdCount = (window._auraHandledAdCount || 0) + 1;
+            var skipButtons = document.querySelectorAll('.ytp-ad-skip-button, .ytp-ad-skip-button-modern, .ytp-skip-ad-button, .ytp-ad-skip-button-slot button, button[id^="skip-button"]');
+            for (var i = 0; i < skipButtons.length; i++) {
+              try { skipButtons[i].click(); } catch(e) {}
+            }
+            if (v) {
+              applyNativeMute(v, true);
+              try { v.playbackRate = 16.0; } catch(e) {}
+              if (isFinite(v.duration) && v.duration > 0 && v.duration < 180) {
+                try { v.currentTime = Math.max(0, v.duration - 0.05); } catch(e) {}
+              }
+              if (v.paused && !v.ended) {
+                try { v.play().catch(function(){}); } catch(e) {}
+              }
+            }
+            return true;
+          }
+          window._auraHandleActiveAd = handleActiveAdIfShowing;
+
           function forceUnmuteAndPlayIfNeeded(v, forceUnmute) {
             try {
-              // Respect user pause and background soft-pause strictly
+              // Respect ad-silencing, user pause, and background soft-pause strictly
+              if (isAdCurrentlyShowing() || window._auraInAd === true) return;
               if (window._auraUserPaused === true || window._auraSoftPaused === true) return;
               v.setAttribute('playsinline', '');
               v.setAttribute('webkit-playsinline', '');
@@ -1305,6 +1463,8 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
 
           function postCurrentVideoTick(v, extraFlags) {
             if (!v) return;
+            // Never leak ad duration/progress/ended events into AuraMusic's scrubber, lyrics, or skipToNext()!
+            if (isAdCurrentlyShowing() || window._auraInAd === true) return;
             var dur = v.duration || 0;
             var nowMs = Date.now();
             if (window._auraSoftPaused === true) {
@@ -1367,16 +1527,15 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
               installMediaSessionHandlers();
             }
 
-            var skipBtn = document.querySelector('.ytp-ad-skip-button, .ytp-ad-skip-button-modern, .ytp-skip-ad-button');
-            if (skipBtn) { try { skipBtn.click(); } catch(e) {} }
-
+            var v = document.querySelector('video');
+            if (handleActiveAdIfShowing(v)) {
+              return;
+            }
             var errBox = document.querySelector('.player-error-message-container, ytm-playability-error-supported-renderers');
             if (errBox && errBox.offsetParent !== null && errBox.innerText && errBox.innerText.trim().length > 3) {
               postMessageToSwift({ type: 'error', currentTime: 0, duration: 0, state: -99 });
               return;
             }
-
-            var v = document.querySelector('video');
             if (!v) {
               ticksWithoutVideo++;
               if (ticksWithoutVideo > 40) {
@@ -1448,6 +1607,9 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
                 }
               });
               v.addEventListener('ended', function() {
+                if (isAdCurrentlyShowing() || window._auraInAd === true) {
+                  return;
+                }
                 if (window._auraSoftPaused === true) {
                   try { v.currentTime = window._auraSoftPauseTime || 0; v.play().catch(function(){}); } catch(e) {}
                   return;
@@ -1498,6 +1660,14 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
         webView.isOpaque = false
         webView.backgroundColor = .clear
         coordinator.webView = webView
+        if YouTubeAdBlockerRuleManager.shared.compiledRuleList == nil {
+            Task { @MainActor [weak webView] in
+                if let compiled = await YouTubeAdBlockerRuleManager.shared.ensureCompiledRuleList(),
+                   let webView {
+                    webView.configuration.userContentController.add(compiled)
+                }
+            }
+        }
         return webView
     }
 
