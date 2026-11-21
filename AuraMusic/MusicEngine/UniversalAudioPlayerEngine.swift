@@ -5,6 +5,7 @@ import MediaPlayer
 import MusicKit
 import SwiftUI
 import UIKit
+import WebKit
 
 @MainActor
 public final class UniversalAudioPlayerEngine: ObservableObject {
@@ -22,6 +23,8 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     @Published public var volume: Float = 0.85 {
         didSet {
             primaryPlayer.volume = volume
+            let ytPercent = Int((volume * 100).rounded())
+            evaluateYouTubeJS("if(window.auraControl){window.auraControl.setVolume(\(ytPercent));}")
         }
     }
     @Published public var isShuffled: Bool = false
@@ -29,6 +32,8 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     @Published public var isPlayerExpanded: Bool = false
     @Published public var activeOverlayTab: ExpandedOverlayTab = .none
     @Published public var activeYouTubeVideoID: String? = nil
+    /// False by default so YouTube Music plays in pure Apple Music square-artwork Audio mode; user can toggle Video Clip mode if desired.
+    @Published public var isYouTubeVideoVisible: Bool = false
     @Published public var playbackStatusBanner: String? = nil
 
     // MARK: - Audio Enhancement Settings
@@ -50,6 +55,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
 
     private var primaryPlayer = AVPlayer()
     private var crossfadeSecondaryPlayer: AVPlayer?
+    private weak var youtubeWebView: WKWebView?
     private var timeObserverToken: Any?
     private var endOfTrackCancellable: AnyCancellable?
     private var sleepTimerTask: Task<Void, Never>?
@@ -57,6 +63,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
 
     private let appleProvider = AppleMusicProvider()
     private let audiusProvider = AudiusProvider()
+    private let ytMusicProvider = YouTubeMusicProvider(providerType: .youtubeMusic)
     private let soundCloudProvider = SoundCloudProvider()
     private let matcher = TrackMatchingEngine()
 
@@ -65,6 +72,43 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         configureRemoteCommandCenter()
         configureAudioNotifications()
         attachPeriodicTimeObserver()
+    }
+
+    // MARK: - YouTube IFrame JS Bridge Handlers
+
+    public func registerYouTubeWebView(_ webView: WKWebView) {
+        self.youtubeWebView = webView
+    }
+
+    public func handleYouTubePlayerEvent(currentTime: Double, duration: Double, stateCode: Int) {
+        guard activeYouTubeVideoID != nil else { return }
+        if currentTime.isFinite && currentTime >= 0 {
+            self.currentTime = currentTime
+        }
+        if duration.isFinite && duration > 0 {
+            self.duration = duration
+        }
+        // YT.PlayerState: -1 unstarted, 0 ended, 1 playing, 2 paused, 3 buffering
+        switch stateCode {
+        case 1: // PLAYING
+            self.isPlaying = true
+            self.isBuffering = false
+            updateNowPlayingElapsedTime()
+        case 2: // PAUSED
+            self.isPlaying = false
+            self.isBuffering = false
+            updateNowPlayingElapsedTime()
+        case 3: // BUFFERING
+            self.isBuffering = true
+        case 0: // ENDED
+            handleTrackFinished()
+        default:
+            break
+        }
+    }
+
+    private func evaluateYouTubeJS(_ script: String) {
+        youtubeWebView?.evaluateJavaScript(script, completionHandler: nil)
     }
 
     // MARK: - Audio Session & System Notifications
@@ -185,6 +229,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         timeObserverToken = primaryPlayer.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
             guard let self else { return }
             Task { @MainActor in
+                guard self.activeYouTubeVideoID == nil else { return }
                 let seconds = time.seconds
                 if seconds.isFinite && seconds >= 0 {
                     self.currentTime = seconds
@@ -226,9 +271,16 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         isBuffering = true
         playbackStatusBanner = nil
         activeYouTubeVideoID = nil
+        // Default to pure Apple Music square-artwork audio view; only show video automatically if user explicitly tapped a raw YouTube video
+        isYouTubeVideoVisible = (track.provider == .youtube)
         crossfadeTriggeredForCurrentItem = false
 
         PersistenceController.shared.recordPlayback(of: track)
+        ProviderCredentialsStore.shared.refreshActiveProviderPriority()
+
+        Task {
+            await LyricsService.shared.loadLyrics(for: track)
+        }
 
         Task {
             await loadAndStartPlayback(for: track)
@@ -242,7 +294,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         if let localRelative = track.localFileRelativePath,
            let fileURL = resolveLocalFileURL(relativePath: localRelative),
            FileManager.default.fileExists(atPath: fileURL.path) {
-            startAVPlayer(with: fileURL, for: track, banner: "Playing Offline Audio File")
+            startAVPlayer(with: fileURL, for: track, banner: nil)
             return
         }
 
@@ -250,7 +302,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         switch track.provider {
         case .localFile:
             if let stream = track.streamURL {
-                startAVPlayer(with: stream, for: track, banner: "Playing Local Audio")
+                startAVPlayer(with: stream, for: track, banner: nil)
             }
 
         case .audius, .radio:
@@ -264,7 +316,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
             // Try native MusicKit full playback if user is subscribed & authorized
             if MusicAuthorization.currentStatus == .authorized {
                 do {
-                    var request = MusicCatalogResourceRequest<MusicKit.Song>(
+                    let request = MusicCatalogResourceRequest<MusicKit.Song>(
                         matching: \.id,
                         equalTo: MusicItemID(track.providerTrackID)
                     )
@@ -274,41 +326,55 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
                         try await ApplicationMusicPlayer.shared.play()
                         isPlaying = true
                         isBuffering = false
-                        playbackStatusBanner = "Playing via Apple MusicKit"
+                        playbackStatusBanner = nil
                         refreshNowPlayingMetadata()
                         return
                     }
                 } catch {
-                    // Fall back to official 30s AAC preview or matched full stream
+                    // Fall through to full-length cross-provider match
                 }
+            }
+
+            // Before settling for a 30s preview, automatically check for a full-length studio track
+            // from YouTube Music or Audius Open Catalog while keeping Apple Music's square cover & metadata!
+            if await tryUpgradeToFullLengthStream(for: track) {
+                return
             }
 
             if let previewURL = try? await appleProvider.resolvePlayableStreamURL(for: track) {
                 startAVPlayer(
                     with: previewURL,
                     for: track,
-                    banner: "Apple Music 30s AAC Preview (Authorize MusicKit or switch provider badge for full stream)"
+                    banner: "30s Preview • Add YouTube API Key in Settings for automatic full-length song playback"
                 )
             } else {
                 await attemptCrossProviderFallback(for: track)
             }
 
         case .youtubeMusic, .youtube:
-            // Authorized YouTube IFrame Player + option to cross-match audio
+            primaryPlayer.pause()
+            ApplicationMusicPlayer.shared.pause()
             activeYouTubeVideoID = track.providerTrackID
             isBuffering = false
             isPlaying = true
-            playbackStatusBanner = "Playing via Official YouTube IFrame Player"
+            playbackStatusBanner = nil
+            // Upgrade thumbnail to crisp 600x600 square Apple Music album cover in the background
+            Task {
+                await upgradeToSquareAppleMusicCoverIfNeeded(for: track)
+            }
             refreshNowPlayingMetadata()
 
         case .soundCloud:
             if let streamURL = track.streamURL, track.isStreamable {
-                startAVPlayer(with: streamURL, for: track, banner: "Streaming via SoundCloud")
+                startAVPlayer(with: streamURL, for: track, banner: nil)
             } else {
                 await attemptCrossProviderFallback(for: track)
             }
 
         case .spotify:
+            if await tryUpgradeToFullLengthStream(for: track) {
+                return
+            }
             if let preview = track.previewURL {
                 startAVPlayer(with: preview, for: track, banner: "Spotify 30s Preview")
             } else {
@@ -317,18 +383,85 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         }
     }
 
-    private func attemptCrossProviderFallback(for track: UniversalTrack) async {
+    /// Automatically inspects which APIs are configured and working right now,
+    /// and selects the best available full-length stream while preserving the Apple Music square album cover and metadata.
+    private func tryUpgradeToFullLengthStream(for track: UniversalTrack) async -> Bool {
         let query = "\(track.title) \(track.artist)"
-        if let openMatches = try? await audiusProvider.searchTracks(query: query, limit: 3),
-           let best = openMatches.first,
-           let stream = try? await audiusProvider.resolvePlayableStreamURL(for: best) {
-            startAVPlayer(
-                with: stream,
-                for: track,
-                banner: "Matched Full Stream via Audius Open Catalog"
-            )
+        let priorityProviders = ProviderCredentialsStore.shared.activePriorityProviders
+
+        for provider in priorityProviders {
+            switch provider {
+            case .youtubeMusic:
+                if ytMusicProvider.isConfigured,
+                   let ytCandidates = try? await ytMusicProvider.searchTracks(query: query, limit: 3),
+                   let bestYT = ytCandidates.first {
+                    primaryPlayer.pause()
+                    ApplicationMusicPlayer.shared.pause()
+                    if bestYT.duration > 35 {
+                        self.duration = bestYT.duration
+                    }
+                    self.isYouTubeVideoVisible = false
+                    self.activeYouTubeVideoID = bestYT.providerTrackID
+                    self.isBuffering = false
+                    self.isPlaying = true
+                    self.playbackStatusBanner = nil
+                    refreshNowPlayingMetadata()
+                    return true
+                }
+
+            case .soundCloud:
+                if soundCloudProvider.isConfigured,
+                   let scCandidates = try? await soundCloudProvider.searchTracks(query: query, limit: 3),
+                   let bestSC = scCandidates.first(where: { $0.streamURL != nil && $0.isStreamable }),
+                   let streamURL = bestSC.streamURL {
+                    if bestSC.duration > 35 {
+                        self.duration = bestSC.duration
+                    }
+                    startAVPlayer(with: streamURL, for: track, banner: nil)
+                    return true
+                }
+
+            case .audius:
+                if let openCandidates = try? await audiusProvider.searchTracks(query: query, limit: 4),
+                   let matchedOpen = openCandidates.first(where: { matcher.isSameSong(track, $0) }) ?? openCandidates.first,
+                   let fullStreamURL = try? await audiusProvider.resolvePlayableStreamURL(for: matchedOpen) {
+                    if matchedOpen.duration > 35 {
+                        self.duration = matchedOpen.duration
+                    }
+                    startAVPlayer(with: fullStreamURL, for: track, banner: nil)
+                    return true
+                }
+
+            default:
+                continue
+            }
+        }
+
+        return false
+    }
+
+    private func upgradeToSquareAppleMusicCoverIfNeeded(for track: UniversalTrack) async {
+        let query = "\(track.title) \(track.artist)"
+        guard let appleMatches = try? await appleProvider.searchTracks(query: query, limit: 2),
+              let firstMatch = appleMatches.first,
+              let squareArtwork = firstMatch.artworkURL,
+              currentTrack?.id == track.id else {
             return
         }
+        var updated = track
+        updated.artworkURL = squareArtwork
+        if firstMatch.album != "Single" {
+            updated.album = firstMatch.album
+        }
+        self.currentTrack = updated
+        refreshNowPlayingMetadata()
+    }
+
+    private func attemptCrossProviderFallback(for track: UniversalTrack) async {
+        if await tryUpgradeToFullLengthStream(for: track) {
+            return
+        }
+        let query = "\(track.title) \(track.artist)"
         if let appleMatches = try? await appleProvider.searchTracks(query: query, limit: 2),
            let first = appleMatches.first,
            let preview = first.previewURL {
@@ -341,7 +474,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         }
         isBuffering = false
         isPlaying = false
-        playbackStatusBanner = "Direct stream restricted by \(track.provider.displayName). Tap Open in \(track.provider.displayName) to play externally."
+        playbackStatusBanner = "Direct stream restricted by \(track.provider.displayName)."
     }
 
     private func startAVPlayer(with url: URL, for track: UniversalTrack, banner: String?) {
@@ -381,6 +514,9 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     }
 
     public func pause() {
+        if activeYouTubeVideoID != nil {
+            evaluateYouTubeJS("if(window.auraControl){window.auraControl.pause();}")
+        }
         primaryPlayer.pause()
         crossfadeSecondaryPlayer?.pause()
         ApplicationMusicPlayer.shared.pause()
@@ -392,6 +528,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         guard currentTrack != nil else { return }
         configureAudioSession()
         if activeYouTubeVideoID != nil {
+            evaluateYouTubeJS("if(window.auraControl){window.auraControl.play();}")
             isPlaying = true
         } else {
             primaryPlayer.play()
@@ -402,6 +539,12 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
 
     public func seek(to seconds: TimeInterval) {
         let clamped = max(0, min(seconds, max(duration, seconds)))
+        if activeYouTubeVideoID != nil {
+            evaluateYouTubeJS("if(window.auraControl){window.auraControl.seek(\(clamped));}")
+            currentTime = clamped
+            updateNowPlayingElapsedTime()
+            return
+        }
         let targetTime = CMTime(seconds: clamped, preferredTimescale: 600)
         primaryPlayer.seek(to: targetTime, toleranceBefore: .zero, toleranceAfter: .zero)
         currentTime = clamped
@@ -490,7 +633,8 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     // MARK: - Crossfade Transition
 
     private func checkCrossfadeTrigger() {
-        guard crossfadeSeconds > 0.5,
+        guard activeYouTubeVideoID == nil,
+              crossfadeSeconds > 0.5,
               !crossfadeTriggeredForCurrentItem,
               duration > crossfadeSeconds + 4,
               currentTime >= duration - crossfadeSeconds,
