@@ -268,18 +268,18 @@ public struct TrackVariantGroup: Identifiable, Hashable, Sendable {
         switch track.provider {
         case .localFile:
             return 100
-        case .youtubeMusic:
-            return hasYouTubeKey ? 95 : 40
         case .audius, .radio:
-            return 92
+            return 96
         case .soundCloud:
-            return (hasSoundCloudKey && track.isStreamable) ? 90 : 35
+            return (hasSoundCloudKey && track.isStreamable) ? 94 : 35
         case .appleMusic:
-            return track.isStreamable ? 96 : 60
+            return track.isStreamable ? 98 : 90
+        case .youtubeMusic:
+            return hasYouTubeKey ? 88 : 40
         case .youtube:
             return hasYouTubeKey ? 85 : 30
         case .spotify:
-            return track.previewURL != nil ? 55 : 20
+            return track.previewURL != nil ? 75 : 20
         }
     }
 }
