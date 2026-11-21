@@ -157,12 +157,13 @@ public final class LyricsService: ObservableObject {
         isLoading = true
         errorMessage = nil
 
-        // 1. Check SwiftData local lyrics cache first
+        // 1. Check SwiftData local lyrics cache first (only if it has synchronized LRC)
         let context = PersistenceController.shared.context
         let descriptor = FetchDescriptor<PersistedCachedLyricsEntity>(
             predicate: #Predicate { $0.cacheKey == cacheKey }
         )
-        if let cached = try? context.fetch(descriptor).first {
+        if let cached = try? context.fetch(descriptor).first,
+           !(cached.syncedLRC ?? "").isEmpty {
             self.currentDocument = buildDocument(
                 title: track.title,
                 artist: track.artist,
@@ -487,6 +488,7 @@ public struct SynchronizedLyricsView: View {
     @ObservedObject var lyricsService: LyricsService = .shared
 
     @State private var isUserManualScrolling: Bool = false
+    @State private var highlightedLineIndex: Int? = nil
     @State private var showTranslationOverlay: Bool = false
     @State private var showManualSearchSheet: Bool = false
     @State private var manualSongQuery: String = ""
@@ -498,11 +500,9 @@ public struct SynchronizedLyricsView: View {
         self.player = player
     }
 
-    private var activeLineIndex: Int? {
-        guard let doc = lyricsService.currentDocument, doc.isSynchronized else {
-            return nil
-        }
-        let current = player.currentTime + 0.15
+    private func computeActiveLineIndex(at time: TimeInterval, in doc: TrackLyricsDocument) -> Int? {
+        guard doc.isSynchronized else { return nil }
+        let current = time + 0.18
         var matched: Int? = nil
         for line in doc.syncedLines {
             if current >= line.timestamp {
@@ -512,6 +512,12 @@ public struct SynchronizedLyricsView: View {
             }
         }
         return matched
+    }
+
+    private var activeLineIndex: Int? {
+        if let highlightedLineIndex { return highlightedLineIndex }
+        guard let doc = lyricsService.currentDocument else { return nil }
+        return computeActiveLineIndex(at: player.currentTime, in: doc)
     }
 
     private var isInIntroBeforeFirstLine: Bool {
@@ -682,13 +688,29 @@ public struct SynchronizedLyricsView: View {
                             )
                             : 0
 
-                        EquatableSyncedLyricRowView(
-                            line: line,
-                            isCurrent: isCurrent,
-                            showTranslationOverlay: showTranslationOverlay,
-                            litDotsCount: dotStage
+                        VStack(alignment: .leading, spacing: 6) {
+                            if line.text == "•••" {
+                                AppleMusicInstrumentalDotsView(litDotsCount: isCurrent ? dotStage : 0)
+                            } else {
+                                Text(line.text)
+                                    .font(.system(size: isCurrent ? 30 : 23, weight: .bold))
+                                    .foregroundStyle(.white.opacity(isCurrent ? 1.0 : 0.30))
+                            }
+
+                            if showTranslationOverlay, let translated = line.translatedText {
+                                Text(translated)
+                                    .font(.system(size: 15, weight: .semibold))
+                                    .foregroundStyle(.white.opacity(isCurrent ? 0.88 : 0.28))
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.vertical, 6)
+                        .padding(.horizontal, 10)
+                        .background(
+                            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                .fill(isCurrent ? Color.white.opacity(0.10) : Color.clear)
                         )
-                        .equatable()
+                        .contentShape(Rectangle())
                         .id(line.index)
                         .onTapGesture {
                             isUserManualScrolling = false
@@ -696,24 +718,32 @@ public struct SynchronizedLyricsView: View {
                             if !player.isPlaying {
                                 player.resume()
                             }
+                            highlightedLineIndex = line.index
+                            withAnimation(.easeInOut(duration: 0.3)) {
+                                proxy.scrollTo(line.index, anchor: .center)
+                            }
                         }
                     }
 
                     Spacer().frame(height: 150)
                 }
-                .padding(.horizontal, 26)
+                .padding(.horizontal, 20)
             }
-            .simultaneousGesture(
-                DragGesture().onChanged { _ in
-                    if !isUserManualScrolling {
-                        isUserManualScrolling = true
-                    }
+            .onAppear {
+                if let initial = computeActiveLineIndex(at: player.currentTime, in: doc) {
+                    highlightedLineIndex = initial
+                    proxy.scrollTo(initial, anchor: .center)
                 }
-            )
-            .onChange(of: activeLineIndex) { _, newIndex in
-                guard !isUserManualScrolling, let newIndex else { return }
-                withAnimation(.easeInOut(duration: 0.32)) {
-                    proxy.scrollTo(newIndex, anchor: .center)
+            }
+            .onReceive(player.$currentTime) { newTime in
+                let nextIdx = computeActiveLineIndex(at: newTime, in: doc)
+                if nextIdx != highlightedLineIndex {
+                    highlightedLineIndex = nextIdx
+                    if let target = nextIdx {
+                        withAnimation(.easeInOut(duration: 0.35)) {
+                            proxy.scrollTo(target, anchor: .center)
+                        }
+                    }
                 }
             }
         }
