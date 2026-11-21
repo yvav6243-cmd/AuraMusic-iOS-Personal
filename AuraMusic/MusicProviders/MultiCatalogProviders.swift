@@ -778,6 +778,12 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
     }
 
     public func makeUIView(context: Context) -> WKWebView {
+        let webView = Self.makeConfiguredWebView(coordinator: context.coordinator)
+        playerEngine.registerYouTubeWebView(webView)
+        return webView
+    }
+
+    public static func makeConfiguredWebView(coordinator: Coordinator) -> WKWebView {
         let config = WKWebViewConfiguration()
         config.allowsInlineMediaPlayback = true
         config.mediaTypesRequiringUserActionForPlayback = []
@@ -1345,15 +1351,14 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
             forMainFrameOnly: false
         )
         config.userContentController.addUserScript(userScript)
-        config.userContentController.add(context.coordinator, name: "auraYT")
+        config.userContentController.add(coordinator, name: "auraYT")
 
         let webView = WKWebView(frame: .zero, configuration: config)
         webView.customUserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"
         webView.scrollView.isScrollEnabled = false
         webView.isOpaque = false
         webView.backgroundColor = .clear
-        context.coordinator.webView = webView
-        playerEngine.registerYouTubeWebView(webView)
+        coordinator.webView = webView
         return webView
     }
 

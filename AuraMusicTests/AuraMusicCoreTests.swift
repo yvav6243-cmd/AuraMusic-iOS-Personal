@@ -1,3 +1,6 @@
+import AVFoundation
+import MediaPlayer
+import WebKit
 import XCTest
 @testable import AuraMusic
 
@@ -424,5 +427,151 @@ final class AuraMusicCoreTests: XCTestCase {
 
         engine.pause()
         engine.activeYouTubeVideoID = nil
+    }
+
+    @MainActor
+    func testAudioSessionDoesNotUseMixWithOthersAndRemoteCommandsAreEnabled() {
+        // Apple iOS disables MPRemoteCommandCenter & Lock Screen Play button if .mixWithOthers is enabled!
+        XCTAssertFalse(
+            UniversalAudioPlayerEngine.preferredAudioSessionOptions.contains(.mixWithOthers),
+            ".mixWithOthers MUST NOT be set or iOS disables Lock Screen Play/Pause remote controls"
+        )
+        XCTAssertTrue(UniversalAudioPlayerEngine.preferredAudioSessionOptions.contains(.allowAirPlay))
+        XCTAssertTrue(UniversalAudioPlayerEngine.preferredAudioSessionOptions.contains(.allowBluetoothA2DP))
+
+        // Initialize shared engine so remote command center is configured
+        _ = UniversalAudioPlayerEngine.shared
+        let commands = MPRemoteCommandCenter.shared()
+        XCTAssertTrue(commands.playCommand.isEnabled, "Lock Screen Play command MUST be enabled")
+        XCTAssertTrue(commands.pauseCommand.isEnabled, "Lock Screen Pause command MUST be enabled")
+        XCTAssertTrue(commands.togglePlayPauseCommand.isEnabled, "Toggle Play/Pause command MUST be enabled")
+        XCTAssertTrue(commands.nextTrackCommand.isEnabled, "Next Track command MUST be enabled")
+        XCTAssertTrue(commands.previousTrackCommand.isEnabled, "Previous Track command MUST be enabled")
+        XCTAssertTrue(commands.changePlaybackPositionCommand.isEnabled, "Lock Screen Scrubber command MUST be enabled")
+    }
+
+    @MainActor
+    func testLockScreenNowPlayingPlaybackStateAndRepeatedPauseResumeCycles() {
+        let engine = UniversalAudioPlayerEngine.shared
+        let track = UniversalTrack(
+            provider: .youtubeMusic,
+            providerTrackID: "YkY4X_OaF6o",
+            title: "I Got Love",
+            artist: "Miyagi & Эндшпиль",
+            album: "I Got Love",
+            duration: 277.0,
+            isStreamable: true
+        )
+
+        engine.play(track)
+        engine.activeYouTubeVideoID = track.providerTrackID
+        engine.handleYouTubePlayerEvent(currentTime: 42.0, duration: 277.0, stateCode: 1, userPaused: false, userResumed: true)
+
+        XCTAssertTrue(engine.isPlaying)
+        XCTAssertEqual(MPNowPlayingInfoCenter.default().playbackState, .playing)
+        XCTAssertEqual(MPNowPlayingInfoCenter.default().nowPlayingInfo?[MPNowPlayingInfoPropertyPlaybackRate] as? Double, 1.0)
+
+        // Repeatedly cycle Pause -> Play 5 times (simulating Lock Screen / Control Center / AirPods taps)
+        for cycle in 1...5 {
+            engine.pause()
+            XCTAssertFalse(engine.isPlaying, "Cycle \(cycle): pause() must set isPlaying = false")
+            XCTAssertEqual(MPNowPlayingInfoCenter.default().playbackState, .paused, "Cycle \(cycle): Lock Screen playbackState must be .paused so Play button is enabled")
+            XCTAssertEqual(MPNowPlayingInfoCenter.default().nowPlayingInfo?[MPNowPlayingInfoPropertyPlaybackRate] as? Double, 0.0)
+
+            engine.resume()
+            XCTAssertTrue(engine.isPlaying, "Cycle \(cycle): resume() must set isPlaying = true")
+            XCTAssertEqual(MPNowPlayingInfoCenter.default().playbackState, .playing, "Cycle \(cycle): Lock Screen playbackState must flip back to .playing")
+            XCTAssertEqual(MPNowPlayingInfoCenter.default().nowPlayingInfo?[MPNowPlayingInfoPropertyPlaybackRate] as? Double, 1.0)
+        }
+
+        // Verify togglePlayPause() also works cleanly in both directions
+        engine.togglePlayPause()
+        XCTAssertFalse(engine.isPlaying)
+        XCTAssertEqual(MPNowPlayingInfoCenter.default().playbackState, .paused)
+
+        engine.togglePlayPause()
+        XCTAssertTrue(engine.isPlaying)
+        XCTAssertEqual(MPNowPlayingInfoCenter.default().playbackState, .playing)
+
+        engine.pause()
+        engine.activeYouTubeVideoID = nil
+    }
+
+    @MainActor
+    func testBackgroundSoftPauseAndResumeWebKitJSRuntime() async throws {
+        // Test the ACTUAL production WKWebView configuration & injected JS bridge on a live iOS Simulator WebView!
+        let playerView = AuthorizedYouTubeIFramePlayerView(videoID: "YkY4X_OaF6o")
+        let coordinator = playerView.makeCoordinator()
+        let webView = AuthorizedYouTubeIFramePlayerView.makeConfiguredWebView(coordinator: coordinator)
+        defer {
+            webView.configuration.userContentController.removeScriptMessageHandler(forName: "auraYT")
+        }
+
+        webView.loadHTMLString("<!doctype html><html><body><video id='v' playsinline></video></body></html>", baseURL: URL(string: "https://m.youtube.com/watch?v=YkY4X_OaF6o"))
+        try await Task.sleep(nanoseconds: 600_000_000)
+
+        // Verify production auraControl bridge installed cleanly
+        let bridgeReady = try await webView.evaluateJavaScript("typeof window.auraControl === 'object' && typeof window.auraControl.pauseInBackground === 'function' && typeof window.auraControl.resume === 'function'") as? Bool
+        XCTAssertEqual(bridgeReady, true, "Production window.auraControl bridge must be installed in WKWebView")
+
+        // 1. Enter background and trigger pauseInBackground() -> MUST natively mute & mark soft-paused
+        let pauseState = try await webView.evaluateJavaScript("""
+        (function() {
+          window.auraControl.enterBackground(1200);
+          window.auraControl.pauseInBackground();
+          var v = document.querySelector('video');
+          return {
+            inBg: window._auraAppInBackground === true,
+            softPaused: window._auraSoftPaused === true,
+            userPaused: window._auraUserPaused === true,
+            realMuted: window._auraOrigMutedDesc ? window._auraOrigMutedDesc.get.call(v) : false,
+            rate: v ? v.playbackRate : -1
+          };
+        })()
+        """) as? [String: Any]
+        XCTAssertEqual(pauseState?["inBg"] as? Bool, true)
+        XCTAssertEqual(pauseState?["softPaused"] as? Bool, true)
+        XCTAssertEqual(pauseState?["userPaused"] as? Bool, true)
+        XCTAssertEqual(pauseState?["realMuted"] as? Bool, true, "pauseInBackground MUST silence <video> natively via origMutedDesc")
+        XCTAssertEqual(pauseState?["rate"] as? Double ?? -1, 0.25, accuracy: 0.01)
+
+        // 2. Trigger resume() while still in background -> MUST unmute, restore 1.0x playbackRate, and clear soft-pause!
+        let resumeState = try await webView.evaluateJavaScript("""
+        (function() {
+          window.auraControl.resume();
+          var v = document.querySelector('video');
+          return {
+            softPaused: window._auraSoftPaused === true,
+            userPaused: window._auraUserPaused === true,
+            realMuted: window._auraOrigMutedDesc ? window._auraOrigMutedDesc.get.call(v) : true,
+            rate: v ? v.playbackRate : -1
+          };
+        })()
+        """) as? [String: Any]
+        XCTAssertEqual(resumeState?["softPaused"] as? Bool, false)
+        XCTAssertEqual(resumeState?["userPaused"] as? Bool, false)
+        XCTAssertEqual(resumeState?["realMuted"] as? Bool, false, "resume() MUST unmute <video> natively")
+        XCTAssertEqual(resumeState?["rate"] as? Double ?? -1, 1.0, accuracy: 0.01)
+
+        // 3. Pause again in background, then return to foreground -> MUST cleanly exit soft-pause while staying paused!
+        let fgState = try await webView.evaluateJavaScript("""
+        (function() {
+          window.auraControl.pauseInBackground();
+          window.auraControl.enterForeground();
+          var v = document.querySelector('video');
+          return {
+            inBg: window._auraAppInBackground === true,
+            softPaused: window._auraSoftPaused === true,
+            userPaused: window._auraUserPaused === true,
+            realMuted: window._auraOrigMutedDesc ? window._auraOrigMutedDesc.get.call(v) : true,
+            rate: v ? v.playbackRate : -1
+          };
+        })()
+        """) as? [String: Any]
+        XCTAssertEqual(fgState?["inBg"] as? Bool, false)
+        XCTAssertEqual(fgState?["softPaused"] as? Bool, false)
+        XCTAssertEqual(fgState?["userPaused"] as? Bool, true)
+        XCTAssertEqual(fgState?["realMuted"] as? Bool, false)
+        XCTAssertEqual(fgState?["rate"] as? Double ?? -1, 1.0, accuracy: 0.01)
     }
 }

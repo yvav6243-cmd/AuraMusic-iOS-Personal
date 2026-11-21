@@ -124,7 +124,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     private func setBackgroundKeepAliveActive(_ active: Bool) {
         if active {
             if !(backgroundKeepAliveAudioPlayer?.isPlaying ?? false) {
-                configureAudioSession(mixWithWebKit: activeYouTubeVideoID != nil)
+                configureAudioSession()
                 backgroundKeepAliveAudioPlayer?.play()
             }
             if backgroundTaskID == .invalid {
@@ -327,13 +327,17 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
 
     // MARK: - Audio Session & System Notifications
 
-    private func configureAudioSession(mixWithWebKit: Bool = true) {
+    /// Non-mixing `.playback` options are REQUIRED on iOS so AuraMusic owns MPNowPlayingInfoCenter and MPRemoteCommandCenter
+    /// (`.mixWithOthers` disables Lock Screen Play/Pause remote commands on iOS).
+    public static let preferredAudioSessionOptions: AVAudioSession.CategoryOptions = [
+        .allowAirPlay,
+        .allowBluetoothA2DP
+    ]
+
+    private func configureAudioSession() {
         do {
             let session = AVAudioSession.sharedInstance()
-            let options: AVAudioSession.CategoryOptions = mixWithWebKit
-                ? [.mixWithOthers, .allowAirPlay, .allowBluetoothA2DP]
-                : [.allowAirPlay, .allowBluetoothA2DP]
-            try session.setCategory(.playback, mode: .default, options: options)
+            try session.setCategory(.playback, mode: .default, options: Self.preferredAudioSessionOptions)
             try session.setActive(true)
         } catch {
             // Simulator or restricted audio environment
@@ -341,6 +345,18 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     }
 
     private func configureAudioNotifications() {
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.willResignActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in
+                if self.activeYouTubeVideoID != nil {
+                    self.evaluateYouTubeJS("window._auraAppInBackground = true;")
+                }
+            }
+        }
         NotificationCenter.default.addObserver(
             forName: UIApplication.didEnterBackgroundNotification,
             object: nil,
@@ -353,6 +369,18 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         }
         NotificationCenter.default.addObserver(
             forName: UIApplication.willEnterForegroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in
+                if self.activeYouTubeVideoID != nil {
+                    self.evaluateYouTubeJS("if(window.auraControl){window.auraControl.enterForeground();}")
+                }
+            }
+        }
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didBecomeActiveNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
@@ -413,6 +441,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     // MARK: - Lock Screen & Control Center Remote Commands
 
     private func configureRemoteCommandCenter() {
+        UIApplication.shared.beginReceivingRemoteControlEvents()
         let commandCenter = MPRemoteCommandCenter.shared()
 
         commandCenter.playCommand.isEnabled = true
@@ -824,6 +853,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
             setBackgroundKeepAliveActive(false)
         }
         refreshNowPlayingMetadata()
+        reassertNowPlayingOwnershipAfterDelay()
     }
 
     public func resume() {
@@ -842,6 +872,14 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
             isPlaying = true
         }
         refreshNowPlayingMetadata()
+        reassertNowPlayingOwnershipAfterDelay()
+    }
+
+    private func reassertNowPlayingOwnershipAfterDelay() {
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 180_000_000)
+            self.refreshNowPlayingMetadata()
+        }
     }
 
     public func seek(to seconds: TimeInterval) {
@@ -986,8 +1024,10 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     // MARK: - Lock Screen / MPNowPlayingInfoCenter & Dynamic Island Update
 
     private func refreshNowPlayingMetadata() {
+        let center = MPNowPlayingInfoCenter.default()
         guard let track = currentTrack else {
-            MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+            center.nowPlayingInfo = nil
+            center.playbackState = .stopped
             DynamicIslandNowPlayingCoordinator.shared.updateLiveActivity(
                 track: nil,
                 isPlaying: false,
@@ -997,23 +1037,31 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
             return
         }
 
-        var info: [String: Any] = [
+        let info: [String: Any] = [
             MPMediaItemPropertyTitle: track.title,
             MPMediaItemPropertyArtist: track.artist,
             MPMediaItemPropertyAlbumTitle: track.album,
             MPMediaItemPropertyPlaybackDuration: duration > 0 ? duration : track.duration,
             MPNowPlayingInfoPropertyElapsedPlaybackTime: currentTime,
-            MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? 1.0 : 0.0
+            MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? 1.0 : 0.0,
+            MPNowPlayingInfoPropertyDefaultPlaybackRate: 1.0
         ]
 
-        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+        center.nowPlayingInfo = info
+        center.playbackState = isPlaying ? .playing : .paused
 
         if let artworkURL = track.artworkURL {
-            Task {
-                if let image = await ArtworkCacheManager.shared.image(for: artworkURL) {
+            let targetTrackID = track.id
+            Task { @MainActor in
+                if let image = await ArtworkCacheManager.shared.image(for: artworkURL),
+                   self.currentTrack?.id == targetTrackID {
                     let artwork = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
-                    info[MPMediaItemPropertyArtwork] = artwork
-                    MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+                    var latest = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? info
+                    latest[MPMediaItemPropertyArtwork] = artwork
+                    latest[MPNowPlayingInfoPropertyPlaybackRate] = self.isPlaying ? 1.0 : 0.0
+                    latest[MPNowPlayingInfoPropertyElapsedPlaybackTime] = self.currentTime
+                    MPNowPlayingInfoCenter.default().nowPlayingInfo = latest
+                    MPNowPlayingInfoCenter.default().playbackState = self.isPlaying ? .playing : .paused
                 }
             }
         }
@@ -1027,11 +1075,13 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     }
 
     private func updateNowPlayingElapsedTime() {
-        guard var info = MPNowPlayingInfoCenter.default().nowPlayingInfo else { return }
+        let center = MPNowPlayingInfoCenter.default()
+        guard var info = center.nowPlayingInfo else { return }
         info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = currentTime
         info[MPMediaItemPropertyPlaybackDuration] = duration
         info[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying ? 1.0 : 0.0
-        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+        center.nowPlayingInfo = info
+        center.playbackState = isPlaying ? .playing : .paused
     }
 
     private func resolveLocalFileURL(relativePath: String) -> URL? {
