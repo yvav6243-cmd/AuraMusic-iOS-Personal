@@ -69,12 +69,9 @@ public enum MusicProviderType: String, Codable, CaseIterable, Identifiable, Send
 
     public var supportsLegalOfflineDownload: Bool {
         switch self {
-        case .audius, .localFile:
+        case .audius, .localFile, .youtubeMusic, .youtube, .soundCloud:
             return true
-        case .soundCloud:
-            // Only tracks explicitly marked downloadable by the creator
-            return true
-        case .appleMusic, .youtubeMusic, .youtube, .spotify, .radio:
+        case .appleMusic, .spotify, .radio:
             return false
         }
     }
