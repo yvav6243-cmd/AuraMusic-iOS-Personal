@@ -325,7 +325,7 @@ public final class SpotifyProvider: MusicProviderProtocol, @unchecked Sendable {
 
         return decoded.tracks.items.map { item in
             let artistName = item.artists.map(\.name).joined(separator: ", ")
-            let artURL = item.album.images.first?.url.flatMap(URL.init(string:))
+            let artURL = item.album.images.first.flatMap { URL(string: $0.url) }
             let previewURL = item.preview_url.flatMap(URL.init(string:))
             let deepLink = URL(string: "spotify:track:\(item.id)") ?? URL(string: "https://open.spotify.com/track/\(item.id)")
             return UniversalTrack(
