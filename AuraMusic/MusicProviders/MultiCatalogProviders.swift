@@ -566,6 +566,21 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
             }
           };
 
+          function postCurrentVideoTick(v) {
+            if (!v) return;
+            var cur = v.currentTime || 0;
+            var dur = v.duration || 0;
+            var st = v.ended ? 0 : (v.paused ? 2 : 1);
+            if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.auraYT) {
+              window.webkit.messageHandlers.auraYT.postMessage({
+                type: 'tick',
+                currentTime: cur,
+                duration: (isFinite(dur) && dur > 0) ? dur : 0,
+                state: st
+              });
+            }
+          }
+
           var ticksWithoutVideo = 0;
           setInterval(function() {
             var skipBtn = document.querySelector('.ytp-ad-skip-button, .ytp-ad-skip-button-modern, .ytp-skip-ad-button');
@@ -590,23 +605,21 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
             }
             ticksWithoutVideo = 0;
 
+            if (!v._auraListenersAttached) {
+              v._auraListenersAttached = true;
+              v.addEventListener('timeupdate', function() { postCurrentVideoTick(v); });
+              v.addEventListener('playing', function() { postCurrentVideoTick(v); });
+              v.addEventListener('pause', function() { postCurrentVideoTick(v); });
+              v.addEventListener('ended', function() { postCurrentVideoTick(v); });
+            }
+
             forceUnmuteAndPlay(v);
 
             if (!window._auraUserPaused && v.paused && !v.ended && v.readyState >= 1) {
               v.play().catch(function(){});
             }
 
-            var cur = v.currentTime || 0;
-            var dur = v.duration || 0;
-            var st = v.ended ? 0 : (v.paused ? 2 : 1);
-            if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.auraYT) {
-              window.webkit.messageHandlers.auraYT.postMessage({
-                type: 'tick',
-                currentTime: cur,
-                duration: (isFinite(dur) && dur > 0) ? dur : 0,
-                state: st
-              });
-            }
+            postCurrentVideoTick(v);
           }, 180);
         })();
         """
