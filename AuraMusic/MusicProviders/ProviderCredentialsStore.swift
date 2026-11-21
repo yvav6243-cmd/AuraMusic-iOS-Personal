@@ -60,57 +60,49 @@ public final class ProviderCredentialsStore: ObservableObject {
         refreshActiveProviderPriority()
     }
 
-    /// Inspects all available API keys & authorizations and automatically ranks the active providers
+    /// Returns true ONLY if this provider has an active, configured API ready for full playback
+    public func hasConfiguredAPI(for provider: MusicProviderType) -> Bool {
+        switch provider {
+        case .localFile, .radio:
+            return true
+        case .youtubeMusic, .youtube:
+            return !youtubeAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        case .appleMusic:
+            return MusicAuthorization.currentStatus == .authorized ||
+                   !appleMusicDeveloperToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        case .soundCloud:
+            return !soundCloudClientID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        case .spotify:
+            return !spotifyAccessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        case .audius:
+            // Show Audius automatically only if no mainstream API (YouTube / Apple MusicKit / SoundCloud / Spotify) is configured
+            let hasMainstreamAPI = hasConfiguredAPI(for: .youtubeMusic) ||
+                                   hasConfiguredAPI(for: .appleMusic) ||
+                                   hasConfiguredAPI(for: .soundCloud) ||
+                                   hasConfiguredAPI(for: .spotify)
+            return !hasMainstreamAPI
+        }
+    }
+
+    public var configuredCatalogProviders: [MusicProviderType] {
+        var result: [MusicProviderType] = []
+        for provider in [MusicProviderType.youtubeMusic, .youtube, .appleMusic, .soundCloud, .spotify, .audius] {
+            if enabledProviders.contains(provider) && hasConfiguredAPI(for: provider) {
+                result.append(provider)
+            }
+        }
+        if result.isEmpty {
+            result.append(.audius)
+        }
+        return result
+    }
+
+    /// Inspects all available API keys & authorizations and automatically ranks ONLY the configured providers
     public func refreshActiveProviderPriority() {
-        var ranked: [MusicProviderType] = []
-
-        // 1. Local files are always highest priority if present
-        ranked.append(.localFile)
-
-        // 2. If Apple MusicKit is authorized with subscription, prioritize native Apple MusicKit
-        if MusicAuthorization.currentStatus == .authorized && enabledProviders.contains(.appleMusic) {
-            ranked.append(.appleMusic)
-        }
-
-        // 3. If YouTube Data API v3 key is present, prioritize YouTube Music full studio audio
-        if !youtubeAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            if enabledProviders.contains(.youtubeMusic) {
-                ranked.append(.youtubeMusic)
-            }
-            if enabledProviders.contains(.youtube) {
-                ranked.append(.youtube)
-            }
-        }
-
-        // 4. If SoundCloud OAuth token is present, include SoundCloud full streams
-        if !soundCloudClientID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-           enabledProviders.contains(.soundCloud) {
-            ranked.append(.soundCloud)
-        }
-
-        // 5. Audius Open Hi-Fi Catalog is always available 100% key-free for full 320kbps streams
-        if enabledProviders.contains(.audius) {
-            ranked.append(.audius)
-        }
-
-        // 6. If Spotify token is present, include Spotify catalog
-        if !spotifyAccessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-           enabledProviders.contains(.spotify) {
-            ranked.append(.spotify)
-        }
-
-        // 7. Apple Music Public Catalog (for metadata, charts, 600x600 artwork & AAC preview fallback)
-        if !ranked.contains(.appleMusic) && enabledProviders.contains(.appleMusic) {
-            ranked.append(.appleMusic)
-        }
-
-        // 8. Live Internet Radio
-        if enabledProviders.contains(.radio) {
-            ranked.append(.radio)
-        }
-
+        var ranked: [MusicProviderType] = [.localFile]
+        ranked.append(contentsOf: configuredCatalogProviders)
         self.activePriorityProviders = ranked
-        self.primaryAutoSelectedProvider = ranked.first { $0 != .localFile } ?? .audius
+        self.primaryAutoSelectedProvider = configuredCatalogProviders.first ?? .youtubeMusic
     }
 
     public func isProviderReadyForFullPlayback(_ provider: MusicProviderType) -> Bool {
