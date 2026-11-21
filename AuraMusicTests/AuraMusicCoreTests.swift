@@ -1506,4 +1506,73 @@ final class AuraMusicCoreTests: XCTestCase {
 
         engine.syncObservedHardwareVolume(0.85)
     }
+
+    // MARK: - Smooth Zero-Load Scrubber Interpolation Tests
+
+    func testPlaybackClockSmoothInterpolationAdvancesLinearlyAndCapsStallExtrapolation() {
+        // Between 250ms ticks, 30 FPS interpolation advances smoothly and linearly
+        let t0 = PlaybackClock.computeInterpolatedTime(anchorTime: 42.0, anchorWallTime: 100.0, nowWallTime: 100.00, duration: 200.0, isPlaying: true, isBuffering: false)
+        let t1 = PlaybackClock.computeInterpolatedTime(anchorTime: 42.0, anchorWallTime: 100.0, nowWallTime: 100.05, duration: 200.0, isPlaying: true, isBuffering: false)
+        let t2 = PlaybackClock.computeInterpolatedTime(anchorTime: 42.0, anchorWallTime: 100.0, nowWallTime: 100.15, duration: 200.0, isPlaying: true, isBuffering: false)
+        let t3 = PlaybackClock.computeInterpolatedTime(anchorTime: 42.0, anchorWallTime: 100.0, nowWallTime: 100.25, duration: 200.0, isPlaying: true, isBuffering: false)
+
+        XCTAssertEqual(t0, 42.00, accuracy: 0.0001)
+        XCTAssertEqual(t1, 42.05, accuracy: 0.0001)
+        XCTAssertEqual(t2, 42.15, accuracy: 0.0001)
+        XCTAssertEqual(t3, 42.25, accuracy: 0.0001)
+
+        // Caps stall extrapolation at +0.65s so bar never runs away on slow network
+        let stalled = PlaybackClock.computeInterpolatedTime(anchorTime: 42.0, anchorWallTime: 100.0, nowWallTime: 105.0, duration: 200.0, isPlaying: true, isBuffering: false)
+        XCTAssertEqual(stalled, 42.65, accuracy: 0.0001)
+
+        // Clamps cleanly at song duration
+        let endClamped = PlaybackClock.computeInterpolatedTime(anchorTime: 199.8, anchorWallTime: 100.0, nowWallTime: 100.5, duration: 200.0, isPlaying: true, isBuffering: false)
+        XCTAssertEqual(endClamped, 200.0, accuracy: 0.0001)
+
+        // Freezes immediately when paused or buffering
+        let paused = PlaybackClock.computeInterpolatedTime(anchorTime: 42.0, anchorWallTime: 100.0, nowWallTime: 100.5, duration: 200.0, isPlaying: false, isBuffering: false)
+        XCTAssertEqual(paused, 42.0, accuracy: 0.0001)
+        let buffering = PlaybackClock.computeInterpolatedTime(anchorTime: 42.0, anchorWallTime: 100.0, nowWallTime: 100.5, duration: 200.0, isPlaying: true, isBuffering: true)
+        XCTAssertEqual(buffering, 42.0, accuracy: 0.0001)
+    }
+
+    @MainActor
+    func testPlaybackClockRefreshSyncAnchorPreventsJumpAfterLongPause() {
+        let clock = PlaybackClock.shared
+        clock.duration = 200.0
+        clock.currentTime = 50.0
+        // Simulate 15 seconds elapsing while paused, then refreshSyncAnchor on resume
+        let resumeWall = clock.lastSyncWallTime + 15.0
+        clock.refreshSyncAnchor(at: resumeWall)
+
+        let immediateDisplay = clock.interpolatedTime(at: resumeWall + 0.01, isPlaying: true, isBuffering: false)
+        XCTAssertEqual(immediateDisplay, 50.01, accuracy: 0.001, "Refreshing sync anchor on resume must prevent any forward jump after long pause")
+    }
+
+    @MainActor
+    func testPlaybackClockInterpolationProducesZeroObjectWillChangeInvalidations() {
+        let engine = UniversalAudioPlayerEngine.shared
+        let clock = PlaybackClock.shared
+        clock.duration = 240.0
+        clock.currentTime = 30.0
+        let anchor = clock.lastSyncWallTime
+
+        var engineInvalidations = 0
+        var clockInvalidations = 0
+        let subEngine = engine.objectWillChange.sink { _ in engineInvalidations += 1 }
+        let subClock = clock.objectWillChange.sink { _ in clockInvalidations += 1 }
+        defer {
+            subEngine.cancel()
+            subClock.cancel()
+        }
+
+        // Simulate 10 seconds of 30 FPS scrubber rendering (300 frames)
+        for frame in 0..<300 {
+            let t = anchor + Double(frame) / 30.0
+            _ = clock.interpolatedTime(at: t, isPlaying: true, isBuffering: false)
+        }
+
+        XCTAssertEqual(engineInvalidations, 0, "Smooth scrubber interpolation must cause ZERO engine invalidations")
+        XCTAssertEqual(clockInvalidations, 0, "Smooth scrubber interpolation must cause ZERO clock invalidations")
+    }
 }

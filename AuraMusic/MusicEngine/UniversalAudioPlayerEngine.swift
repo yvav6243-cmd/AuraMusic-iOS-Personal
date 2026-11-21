@@ -34,14 +34,61 @@ public struct PlayPauseCooldownGate: Sendable {
     }
 }
 
-/// High-frequency playback clock isolated from `UniversalAudioPlayerEngine` so 5–10Hz timer ticks
+/// High-frequency playback clock isolated from `UniversalAudioPlayerEngine` so 4–5Hz timer ticks
 /// ONLY update the tiny scrubber & lyrics driver instead of re-rendering the entire SwiftUI app tree!
+/// Between ticks, the scrubber interpolates linearly in O(1) with zero objectWillChange overhead.
 @MainActor
 public final class PlaybackClock: ObservableObject {
     public static let shared = PlaybackClock()
-    @Published public var currentTime: TimeInterval = 0
+    @Published public var currentTime: TimeInterval = 0 {
+        didSet {
+            lastSyncWallTime = CACurrentMediaTime()
+        }
+    }
     @Published public var duration: TimeInterval = 0
+    public private(set) var lastSyncWallTime: TimeInterval = CACurrentMediaTime()
     private init() {}
+
+    /// Resets the interpolation wall-clock anchor (e.g., right on resume) so the bar glides forward from 0ms without jumping.
+    public func refreshSyncAnchor(at wallTime: TimeInterval = CACurrentMediaTime()) {
+        lastSyncWallTime = wallTime
+    }
+
+    /// Pure O(1) interpolated playback time between engine ticks — zero timers, zero allocations, zero SwiftUI invalidations.
+    public func interpolatedTime(
+        at nowWallTime: TimeInterval = CACurrentMediaTime(),
+        isPlaying: Bool,
+        isBuffering: Bool,
+        fallbackDuration: TimeInterval = 0
+    ) -> TimeInterval {
+        let total = max(duration, fallbackDuration, 0)
+        return Self.computeInterpolatedTime(
+            anchorTime: currentTime,
+            anchorWallTime: lastSyncWallTime,
+            nowWallTime: nowWallTime,
+            duration: total,
+            isPlaying: isPlaying,
+            isBuffering: isBuffering
+        )
+    }
+
+    public nonisolated static func computeInterpolatedTime(
+        anchorTime: TimeInterval,
+        anchorWallTime: TimeInterval,
+        nowWallTime: TimeInterval,
+        duration: TimeInterval,
+        isPlaying: Bool,
+        isBuffering: Bool
+    ) -> TimeInterval {
+        let clampedBase = max(0, duration > 0 ? min(anchorTime, duration) : anchorTime)
+        guard isPlaying, !isBuffering else {
+            return clampedBase
+        }
+        // Cap extrapolation at 0.65s so if audio briefly stalls on slow network, the scrubber never runs away past real audio
+        let elapsed = max(0, min(nowWallTime - anchorWallTime, 0.65))
+        let predicted = clampedBase + elapsed
+        return duration > 0 ? min(predicted, duration) : predicted
+    }
 }
 
 @MainActor
@@ -921,6 +968,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         }
 
         currentTime = 0
+        clock.refreshSyncAnchor()
         duration = max(track.duration, 0)
         isUserPaused = false
         isPlaying = true
@@ -1313,6 +1361,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         delayedKeepAliveStopTask?.cancel()
         isUserPaused = false
         let now = CACurrentMediaTime()
+        clock.refreshSyncAnchor(at: now)
         lastUserResumeWallTime = now
         lastTrackStartWallTime = now
         if activeYouTubeVideoID != nil {
