@@ -175,6 +175,11 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
                 updateNowPlayingElapsedTime()
             }
         case 2: // PAUSED
+            // Ignore transient initial paused state before playback has started so UI doesn't flicker or abort autoplay
+            guard hasReceivedFirstYouTubeProgressTick || currentTime > 0.05 else {
+                if !self.isBuffering { self.isBuffering = true }
+                return
+            }
             if self.isPlaying || self.isBuffering {
                 self.isPlaying = false
                 self.isBuffering = false
@@ -276,6 +281,10 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
                 self.setBackgroundKeepAliveActive(true)
                 if self.activeYouTubeVideoID != nil {
                     self.evaluateYouTubeJS("if(window.auraControl){window.auraControl.resume();}")
+                    try? await Task.sleep(nanoseconds: 350_000_000)
+                    if self.isPlaying && self.activeYouTubeVideoID != nil {
+                        self.evaluateYouTubeJS("if(window.auraControl){window.auraControl.resume();}")
+                    }
                 }
             }
         }
@@ -446,7 +455,9 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     }
 
     private func loadAndStartPlayback(for track: UniversalTrack) async {
-        configureAudioSession()
+        if !(backgroundKeepAliveAudioPlayer?.isPlaying ?? false) {
+            configureAudioSession()
+        }
 
         // 1. Check if downloaded offline or imported as a local file first (works 100% offline in Airplane Mode)
         let offlinePath = track.localFileRelativePath

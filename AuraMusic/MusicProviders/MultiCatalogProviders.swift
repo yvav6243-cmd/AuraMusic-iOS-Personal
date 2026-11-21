@@ -172,6 +172,17 @@ public final class YouTubeMusicProvider: MusicProviderProtocol, @unchecked Senda
     }
 
     public func searchTracks(query: String, limit: Int = 15) async throws -> [UniversalTrack] {
+        // 1. Primary: Unlimited YouTube Music InnerTube catalog search (zero daily quota limit, authentic studio audio + 600x600 square covers)
+        let preferVideos = (providerType == .youtube)
+        var innerTubeResults = await searchYouTubeMusicInnerTube(query: query, limit: limit, videosOnly: preferVideos)
+        if innerTubeResults.isEmpty && !preferVideos {
+            innerTubeResults = await searchYouTubeMusicInnerTube(query: query, limit: limit, videosOnly: true)
+        }
+        if !innerTubeResults.isEmpty {
+            return innerTubeResults
+        }
+
+        // 2. Fallback: Official YouTube Data API v3 search if InnerTube is unavailable
         guard let apiKey = ProviderCredentialsStore.readKeychain(key: "aura.token.youtube"),
               !apiKey.isEmpty else {
             return []
@@ -242,6 +253,202 @@ public final class YouTubeMusicProvider: MusicProviderProtocol, @unchecked Senda
             }
         }
         return tracks
+    }
+
+    /// Queries YouTube Music's native search endpoint directly (no daily API quota limit, returns studio songs + 600x600 artwork + exact durations)
+    private func searchYouTubeMusicInnerTube(query: String, limit: Int, videosOnly: Bool) async -> [UniversalTrack] {
+        guard let endpoint = URL(string: "https://music.youtube.com/youtubei/v1/search?prettyPrint=false") else {
+            return []
+        }
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "POST"
+        request.setValue("application/json; charset=utf-8", forHTTPHeaderField: "Content-Type")
+        request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1", forHTTPHeaderField: "User-Agent")
+        request.setValue("https://music.youtube.com", forHTTPHeaderField: "Origin")
+        request.timeoutInterval = 10
+
+        // EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D = Songs filter, EgWKAQIQAWoKEAkQBRAKEAMQBA%3D%3D = Videos filter
+        let filterParams = videosOnly
+            ? "EgWKAQIQAWoKEAkQBRAKEAMQBA%3D%3D"
+            : "EgWKAQIIAWoKEAkQBRAKEAMQBA%3D%3D"
+
+        let payload: [String: Any] = [
+            "context": [
+                "client": [
+                    "clientName": "WEB_REMIX",
+                    "clientVersion": "1.20250101.01.00",
+                    "hl": "en",
+                    "gl": "US"
+                ]
+            ],
+            "query": query,
+            "params": filterParams
+        ]
+
+        guard let bodyData = try? JSONSerialization.data(withJSONObject: payload) else {
+            return []
+        }
+        request.httpBody = bodyData
+
+        guard let (data, response) = try? await session.data(for: request),
+              let http = response as? HTTPURLResponse,
+              (200..<300).contains(http.statusCode),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let contents = root["contents"] as? [String: Any],
+              let tabbed = contents["tabbedSearchResultsRenderer"] as? [String: Any],
+              let tabs = tabbed["tabs"] as? [[String: Any]] else {
+            return []
+        }
+
+        var results: [UniversalTrack] = []
+        var seenVideoIDs = Set<String>()
+
+        for tab in tabs {
+            guard let tabRenderer = tab["tabRenderer"] as? [String: Any],
+                  let tabContent = tabRenderer["content"] as? [String: Any],
+                  let sectionList = tabContent["sectionListRenderer"] as? [String: Any],
+                  let sections = sectionList["contents"] as? [[String: Any]] else {
+                continue
+            }
+
+            for section in sections {
+                guard let shelf = section["musicShelfRenderer"] as? [String: Any],
+                      let items = shelf["contents"] as? [[String: Any]] else {
+                    continue
+                }
+
+                for itemDict in items {
+                    guard let renderer = itemDict["musicResponsiveListItemRenderer"] as? [String: Any] else {
+                        continue
+                    }
+                    guard let videoID = Self.extractInnerTubeVideoID(from: renderer),
+                          !videoID.isEmpty,
+                          !seenVideoIDs.contains(videoID) else {
+                        continue
+                    }
+
+                    guard let flexColumns = renderer["flexColumns"] as? [[String: Any]], !flexColumns.isEmpty else {
+                        continue
+                    }
+
+                    let title = Self.extractFlexColumnText(flexColumns[0]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !title.isEmpty else { continue }
+
+                    let subtitle = flexColumns.count > 1 ? Self.extractFlexColumnText(flexColumns[1]) : ""
+                    let meta = Self.parseYouTubeMusicSubtitle(subtitle)
+
+                    // Upgrade square Google thumbnail URL to 600x600 high resolution
+                    var thumbURL: URL? = URL(string: "https://i.ytimg.com/vi/\(videoID)/hqdefault.jpg")
+                    if let thumbObj = renderer["thumbnail"] as? [String: Any],
+                       let musicThumb = thumbObj["musicThumbnailRenderer"] as? [String: Any],
+                       let innerThumb = musicThumb["thumbnail"] as? [String: Any],
+                       let thumbs = innerThumb["thumbnails"] as? [[String: Any]],
+                       let lastThumbStr = thumbs.last?["url"] as? String {
+                        let hiResStr = Self.upgradeGoogleThumbTo600(lastThumbStr)
+                        thumbURL = URL(string: hiResStr) ?? URL(string: lastThumbStr)
+                    }
+
+                    let deepLinkScheme = providerType == .youtubeMusic
+                        ? "youtubemusic://watch?v=\(videoID)"
+                        : "https://www.youtube.com/watch?v=\(videoID)"
+
+                    seenVideoIDs.insert(videoID)
+                    results.append(
+                        UniversalTrack(
+                            provider: providerType,
+                            providerTrackID: videoID,
+                            title: videosOnly ? Self.cleanStudioTrackTitle(title) : title,
+                            artist: meta.artist.isEmpty ? "YouTube Music" : meta.artist,
+                            album: meta.album.isEmpty ? (videosOnly ? "YouTube Video" : "YouTube Music") : meta.album,
+                            artworkURL: thumbURL,
+                            duration: meta.duration > 0 ? meta.duration : 210,
+                            externalDeepLink: URL(string: deepLinkScheme),
+                            isStreamable: true,
+                            isDownloadPermitted: true,
+                            audioQualityBadge: videosOnly ? "VIDEO" : "STUDIO AUDIO"
+                        )
+                    )
+
+                    if results.count >= limit {
+                        return results
+                    }
+                }
+            }
+        }
+        return results
+    }
+
+    private static func extractInnerTubeVideoID(from renderer: [String: Any]) -> String? {
+        if let playlistData = renderer["playlistItemData"] as? [String: Any],
+           let vid = playlistData["videoId"] as? String,
+           !vid.isEmpty {
+            return vid
+        }
+        if let overlay = renderer["overlay"] as? [String: Any],
+           let thumbOverlay = overlay["musicItemThumbnailOverlayRenderer"] as? [String: Any],
+           let content = thumbOverlay["content"] as? [String: Any],
+           let playBtn = content["musicPlayButtonRenderer"] as? [String: Any],
+           let nav = playBtn["playNavigationEndpoint"] as? [String: Any],
+           let watch = nav["watchEndpoint"] as? [String: Any],
+           let vid = watch["videoId"] as? String,
+           !vid.isEmpty {
+            return vid
+        }
+        return nil
+    }
+
+    private static func extractFlexColumnText(_ col: [String: Any]) -> String {
+        guard let renderer = col["musicResponsiveListItemFlexColumnRenderer"] as? [String: Any],
+              let textObj = renderer["text"] as? [String: Any],
+              let runs = textObj["runs"] as? [[String: Any]] else {
+            return ""
+        }
+        return runs.compactMap { $0["text"] as? String }.joined()
+    }
+
+    private static func parseYouTubeMusicSubtitle(_ subtitle: String) -> (artist: String, album: String, duration: TimeInterval) {
+        let parts = subtitle
+            .components(separatedBy: " • ")
+            .flatMap { $0.components(separatedBy: " · ") }
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        var duration: TimeInterval = 210
+        var metadataParts: [String] = []
+
+        for part in parts {
+            if let parsedDur = parseColonDuration(part) {
+                duration = parsedDur
+                continue
+            }
+            let lower = part.lowercased()
+            if lower == "song" || lower == "video" || lower == "single" || lower == "episode" ||
+                lower.contains(" views") || lower.contains(" plays") {
+                continue
+            }
+            metadataParts.append(part)
+        }
+
+        let artist = metadataParts.first ?? "YouTube Music"
+        let album = metadataParts.count >= 2 ? metadataParts[1] : "YouTube Music"
+        return (artist, album, duration)
+    }
+
+    private static func parseColonDuration(_ text: String) -> TimeInterval? {
+        let comps = text.split(separator: ":").compactMap { Double($0) }
+        guard comps.count == 2 || comps.count == 3 else { return nil }
+        if comps.count == 2 {
+            return comps[0] * 60 + comps[1]
+        }
+        return comps[0] * 3600 + comps[1] * 60 + comps[2]
+    }
+
+    private static func upgradeGoogleThumbTo600(_ urlString: String) -> String {
+        guard let regex = try? NSRegularExpression(pattern: "=w\\d+-h\\d+") else {
+            return urlString
+        }
+        let range = NSRange(urlString.startIndex..<urlString.endIndex, in: urlString)
+        return regex.stringByReplacingMatches(in: urlString, range: range, withTemplate: "=w600-h600")
     }
 
     private func fetchVideoDurations(videoIDs: [String], apiKey: String) async -> [String: TimeInterval] {
@@ -579,13 +786,22 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
         let unmuteLockScriptSource = """
         (function() {
           try {
+            var origMutedDesc = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, 'muted');
+            window._auraOrigMutedDesc = origMutedDesc;
             Object.defineProperty(HTMLMediaElement.prototype, 'muted', {
               get: function() { return false; },
-              set: function(v) { try { this.removeAttribute('muted'); } catch(e) {} }
+              set: function(v) {
+                try {
+                  this.removeAttribute('muted');
+                  if (origMutedDesc && origMutedDesc.set) { origMutedDesc.set.call(this, false); }
+                } catch(e) {}
+              },
+              configurable: true
             });
             Object.defineProperty(HTMLMediaElement.prototype, 'defaultMuted', {
               get: function() { return false; },
-              set: function(v) {}
+              set: function(v) {},
+              configurable: true
             });
             Object.defineProperty(document, 'hidden', { get: function() { return false; }, configurable: true });
             Object.defineProperty(document, 'webkitHidden', { get: function() { return false; }, configurable: true });
@@ -679,19 +895,46 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
             });
           }
 
-          function ensureUnmutedIfNeeded(v) {
+          function forceUnmuteAndPlayIfNeeded(v, forceUnmute) {
             try {
               v.setAttribute('playsinline', '');
               v.setAttribute('webkit-playsinline', '');
-              if (v.muted || v.volume === 0) {
+              var mp = document.getElementById('movie_player');
+              var realMuted = (window._auraOrigMutedDesc && window._auraOrigMutedDesc.get)
+                ? window._auraOrigMutedDesc.get.call(v)
+                : false;
+              var mpMuted = (mp && typeof mp.isMuted === 'function') ? mp.isMuted() : false;
+              var unmuteBtn = document.querySelector('.ytp-unmute, button[aria-label*="Unmute"], button[aria-label*="unmute"], button[aria-label*="Включить звук"], button[aria-label*="включить звук"], button[aria-label*="Tap to unmute"]');
+
+              if (forceUnmute || !v._auraUnmutedOnce || realMuted || mpMuted || v.hasAttribute('muted') || v.volume === 0 || unmuteBtn) {
+                v._auraUnmutedOnce = true;
                 v.muted = false;
                 v.defaultMuted = false;
                 v.removeAttribute('muted');
-                v.volume = (window._auraTargetVol !== undefined) ? Math.max(0.05, window._auraTargetVol / 100.0) : 1.0;
-                var mp = document.getElementById('movie_player');
-                if (mp && mp.unMute) mp.unMute();
-                var unmuteBtn = document.querySelector('.ytp-unmute, button[aria-label*="Unmute"], button[aria-label*="unmute"], button[aria-label*="Звук"]');
-                if (unmuteBtn) { unmuteBtn.click(); }
+                if (window._auraOrigMutedDesc && window._auraOrigMutedDesc.set) {
+                  window._auraOrigMutedDesc.set.call(v, false);
+                }
+                var targetVol = (window._auraTargetVol !== undefined) ? window._auraTargetVol : 100;
+                if (v.volume === 0) v.volume = Math.max(0.05, targetVol / 100.0);
+                if (mp) {
+                  if (mp.unMute) mp.unMute();
+                  if (mp.setVolume) mp.setVolume(targetVol);
+                }
+                if (unmuteBtn) { try { unmuteBtn.click(); } catch(e) {} }
+              }
+
+              // Start playback if not yet playing; once actively playing (!v.paused && currentTime > 0.15 && readyState >= 2), skip playVideo()/play() so audio never stutters
+              if (!window._auraUserPaused && !v.ended) {
+                var isActuallyPlaying = (!v.paused && v.currentTime > 0.15 && v.readyState >= 2);
+                if (!isActuallyPlaying) {
+                  v._auraStartAttempts = (v._auraStartAttempts || 0) + 1;
+                  if (mp && mp.playVideo) { try { mp.playVideo(); } catch(e) {} }
+                  try { v.play().catch(function(){}); } catch(e) {}
+                  if (v.paused && v.currentTime === 0 && v._auraStartAttempts >= 4) {
+                    var bigPlayBtn = document.querySelector('.ytp-large-play-button');
+                    if (bigPlayBtn) { try { bigPlayBtn.click(); } catch(e) {} }
+                  }
+                }
               }
             } catch(e) {}
           }
@@ -702,8 +945,7 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
               window._auraAllowPause = false;
               var v = document.querySelector('video');
               if (v) {
-                ensureUnmutedIfNeeded(v);
-                if (v.paused) { v.play().catch(function(){}); }
+                forceUnmuteAndPlayIfNeeded(v, true);
               }
             },
             pause: function() {
@@ -720,11 +962,7 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
               window._auraAllowPause = false;
               var v = document.querySelector('video');
               if (v) {
-                ensureUnmutedIfNeeded(v);
-                // Only call play() if actually paused — prevents audio buffer hitch during background/foreground transitions
-                if (v.paused && !v.ended) {
-                  v.play().catch(function(){});
-                }
+                forceUnmuteAndPlayIfNeeded(v, false);
               }
             },
             seek: function(sec) {
@@ -732,8 +970,7 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
               if (v) {
                 v.currentTime = sec;
                 if (!window._auraUserPaused && v.paused) {
-                  ensureUnmutedIfNeeded(v);
-                  v.play().catch(function(){});
+                  forceUnmuteAndPlayIfNeeded(v, false);
                 }
               }
             },
@@ -752,7 +989,12 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
             if (!v) return;
             var cur = v.currentTime || 0;
             var dur = v.duration || 0;
-            var st = v.ended ? 0 : (v.paused ? 2 : 1);
+            var st = 1;
+            if (v.ended) {
+              st = 0;
+            } else if (v.paused) {
+              st = (!window._auraUserPaused && (cur <= 0.05 || v.readyState < 3)) ? 3 : 2;
+            }
             if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.auraYT) {
               window.webkit.messageHandlers.auraYT.postMessage({
                 type: 'tick',
@@ -769,7 +1011,7 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
             if (skipBtn) { try { skipBtn.click(); } catch(e) {} }
 
             var errBox = document.querySelector('.player-error-message-container, ytm-playability-error-supported-renderers');
-            if (errBox && errBox.innerText && errBox.innerText.length > 3) {
+            if (errBox && errBox.offsetParent !== null && errBox.innerText && errBox.innerText.trim().length > 3) {
               if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.auraYT) {
                 window.webkit.messageHandlers.auraYT.postMessage({ type: 'error', currentTime: 0, duration: 0, state: -99 });
                 return;
@@ -779,7 +1021,7 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
             var v = document.querySelector('video');
             if (!v) {
               ticksWithoutVideo++;
-              if (ticksWithoutVideo > 28 && window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.auraYT) {
+              if (ticksWithoutVideo > 40 && window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.auraYT) {
                 ticksWithoutVideo = 0;
                 window.webkit.messageHandlers.auraYT.postMessage({ type: 'error', currentTime: 0, duration: 0, state: -99 });
               }
@@ -795,12 +1037,7 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
               v.addEventListener('ended', function() { postCurrentVideoTick(v); });
             }
 
-            ensureUnmutedIfNeeded(v);
-
-            if (!window._auraUserPaused && v.paused && !v.ended && v.readyState >= 1) {
-              v.play().catch(function(){});
-            }
-
+            forceUnmuteAndPlayIfNeeded(v, false);
             postCurrentVideoTick(v);
           }, 180);
         })();
