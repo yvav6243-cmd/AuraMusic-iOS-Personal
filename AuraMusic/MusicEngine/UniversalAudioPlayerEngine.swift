@@ -119,8 +119,8 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
 
     private func setBackgroundKeepAliveActive(_ active: Bool) {
         if active {
-            configureAudioSession(mixWithWebKit: activeYouTubeVideoID != nil)
             if !(backgroundKeepAliveAudioPlayer?.isPlaying ?? false) {
+                configureAudioSession(mixWithWebKit: activeYouTubeVideoID != nil)
                 backgroundKeepAliveAudioPlayer?.play()
             }
             if backgroundTaskID == .invalid {
@@ -139,6 +139,13 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
                 backgroundTaskID = .invalid
             }
         }
+    }
+
+    public func applyUpdatedArtworkURL(_ newURL: URL?, forTrackID trackID: String) {
+        guard var current = currentTrack, current.id == trackID else { return }
+        current.artworkURL = newURL
+        self.currentTrack = current
+        refreshNowPlayingMetadata()
     }
 
     // MARK: - YouTube IFrame JS Bridge Handlers
@@ -269,14 +276,6 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
                 self.setBackgroundKeepAliveActive(true)
                 if self.activeYouTubeVideoID != nil {
                     self.evaluateYouTubeJS("if(window.auraControl){window.auraControl.resume();}")
-                    try? await Task.sleep(nanoseconds: 250_000_000)
-                    if self.isPlaying {
-                        self.evaluateYouTubeJS("if(window.auraControl){window.auraControl.resume();}")
-                    }
-                    try? await Task.sleep(nanoseconds: 500_000_000)
-                    if self.isPlaying {
-                        self.evaluateYouTubeJS("if(window.auraControl){window.auraControl.resume();}")
-                    }
                 }
             }
         }
@@ -411,7 +410,11 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
             }
         }
 
-        currentTrack = track
+        var trackWithCustomArt = track
+        if let customURL = PersistenceController.shared.effectiveArtworkURL(for: track) {
+            trackWithCustomArt.artworkURL = customURL
+        }
+        currentTrack = trackWithCustomArt
         if !queue.isEmpty {
             if let idx = queue.firstIndex(where: { $0.id == track.id }) {
                 let tail = Array(queue.suffix(from: queue.index(after: idx)))
@@ -586,6 +589,16 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     }
 
     private func upgradeToSquareAppleMusicCoverIfNeeded(for track: UniversalTrack) async {
+        // Never overwrite a custom cover photo chosen by the user
+        if PersistenceController.shared.hasCustomArtwork(for: track.id) {
+            if let customURL = PersistenceController.shared.effectiveArtworkURL(for: track),
+               currentTrack?.id == track.id {
+                var updated = track
+                updated.artworkURL = customURL
+                self.currentTrack = updated
+            }
+            return
+        }
         let query = "\(track.title) \(track.artist)"
         guard let appleMatches = try? await appleProvider.searchTracks(query: query, limit: 2),
               let firstMatch = appleMatches.first,
