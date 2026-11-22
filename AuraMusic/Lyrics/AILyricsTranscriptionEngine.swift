@@ -1042,9 +1042,12 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
             let secClean = sec.text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !secClean.isEmpty, sec.confidence >= 0.52 else { continue }
 
-            // Find overlapping primary token within ±0.42s
-            if let matchIdx = result.firstIndex(where: { abs($0.timestamp - sec.timestamp) <= 0.42 }) {
-                let existing = result[matchIdx]
+            // Find the CLOSEST primary token within ±0.35s so rapid consecutive words never collide with an earlier neighbor
+            let nearest = result.enumerated()
+                .filter { abs($0.element.timestamp - sec.timestamp) <= 0.35 }
+                .min { abs($0.element.timestamp - sec.timestamp) < abs($1.element.timestamp - sec.timestamp) }
+
+            if let (matchIdx, existing) = nearest {
                 // Only substitute if primary had weak confidence AND secondary is clearly stronger
                 if existing.confidence < primaryConfidenceThreshold && sec.confidence >= existing.confidence + 0.12 {
                     result[matchIdx] = sec
@@ -1052,7 +1055,7 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
                 }
             } else {
                 // Fill a vocal gap where primary recognizer missed a foreign word completely
-                let tooClose = result.contains { abs($0.timestamp - sec.timestamp) < 0.30 }
+                let tooClose = result.contains { abs($0.timestamp - sec.timestamp) < 0.24 }
                 if !tooClose && sec.confidence >= 0.68 {
                     result.append(sec)
                     replacedCount += 1
@@ -1065,22 +1068,66 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
     }
 
     /// Passes 7–8 cross-pass consensus engine: deduplicates overlapping window boundaries and selects
-    /// the highest-confidence / majority-agreed token at each timestamp bucket.
+    /// the highest-confidence / majority-agreed token at each acoustic span WITHOUT ever erasing adjacent short words from the same pass.
     public nonisolated static func reconcileMultiPassTokens(passes: [[AIWordToken]]) -> [AIWordToken] {
-        let all = passes.flatMap { $0 }
-            .filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-            .sorted { $0.timestamp < $1.timestamp }
-        guard !all.isEmpty else { return [] }
+        struct TaggedToken {
+            let passIndex: Int
+            let token: AIWordToken
+            var endTime: TimeInterval { token.timestamp + max(0.08, token.duration) }
+        }
 
-        var buckets: [[AIWordToken]] = []
-        for token in all {
-            if var lastBucket = buckets.last,
-               let anchor = lastBucket.first,
-               abs(token.timestamp - anchor.timestamp) <= 0.28 {
-                lastBucket.append(token)
-                buckets[buckets.count - 1] = lastBucket
+        var tagged: [TaggedToken] = []
+        for (pIdx, passTokens) in passes.enumerated() {
+            for tok in passTokens {
+                let clean = tok.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !clean.isEmpty else { continue }
+                tagged.append(TaggedToken(passIndex: pIdx, token: tok))
+            }
+        }
+        tagged.sort {
+            if abs($0.token.timestamp - $1.token.timestamp) > 0.001 {
+                return $0.token.timestamp < $1.token.timestamp
+            }
+            return $0.passIndex < $1.passIndex
+        }
+        guard !tagged.isEmpty else { return [] }
+
+        var buckets: [[TaggedToken]] = []
+        for item in tagged {
+            // Look backwards through recent buckets to find the closest cross-pass match for this acoustic span
+            var bestBucketIdx: Int? = nil
+            var bestDist = TimeInterval.greatestFiniteMagnitude
+
+            for bIdx in stride(from: buckets.count - 1, through: max(0, buckets.count - 6), by: -1) {
+                let bucket = buckets[bIdx]
+                guard let anchor = bucket.first else { continue }
+                let dist = abs(item.token.timestamp - anchor.token.timestamp)
+                if dist > 0.30 { continue }
+
+                let samePassExists = bucket.contains { $0.passIndex == item.passIndex }
+                let sameWord = bucket.contains { $0.token.text.lowercased() == item.token.text.lowercased() }
+
+                // Never collapse two DIFFERENT consecutive words from the same pass (e.g. "в" followed 0.25s later by "алмазах")
+                if samePassExists && !(sameWord && dist <= 0.18) {
+                    continue
+                }
+
+                // Cross-pass match: either exact word agreement within 0.28s, or genuine acoustic overlap within 0.18s
+                let overlapStart = max(anchor.token.timestamp, item.token.timestamp)
+                let overlapEnd = min(anchor.endTime, item.endTime)
+                let hasAcousticOverlap = (overlapEnd - overlapStart) > 0.02
+                let isMatch = (sameWord && dist <= 0.28) || (dist <= 0.18 && hasAcousticOverlap)
+
+                if isMatch && dist < bestDist {
+                    bestDist = dist
+                    bestBucketIdx = bIdx
+                }
+            }
+
+            if let targetIdx = bestBucketIdx {
+                buckets[targetIdx].append(item)
             } else {
-                buckets.append([token])
+                buckets.append([item])
             }
         }
 
@@ -1089,13 +1136,20 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
 
         for bucket in buckets {
             if bucket.count == 1 {
-                consensus.append(bucket[0])
+                let winner = bucket[0].token
+                if let prev = consensus.last,
+                   prev.text.lowercased() == winner.text.lowercased(),
+                   abs(winner.timestamp - prev.timestamp) < 0.35 {
+                    continue
+                }
+                consensus.append(winner)
                 continue
             }
-            // Score each candidate text by frequency + total confidence
+            // Score each candidate text by cross-pass frequency + total confidence
             var scores: [String: Float] = [:]
             var bestRep: [String: AIWordToken] = [:]
-            for tok in bucket {
+            for taggedItem in bucket {
+                let tok = taggedItem.token
                 let key = tok.text.lowercased()
                 scores[key, default: 0] += (tok.confidence + 0.35)
                 if let prev = bestRep[key] {
@@ -1106,10 +1160,9 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
             }
             if let bestKey = scores.max(by: { $0.value < $1.value })?.key,
                let winner = bestRep[bestKey] {
-                // Avoid immediate duplicate stutters across window seam
                 if let prev = consensus.last,
                    prev.text.lowercased() == winner.text.lowercased(),
-                   abs(winner.timestamp - prev.timestamp) < 0.45 {
+                   abs(winner.timestamp - prev.timestamp) < 0.35 {
                     continue
                 }
                 consensus.append(winner)
