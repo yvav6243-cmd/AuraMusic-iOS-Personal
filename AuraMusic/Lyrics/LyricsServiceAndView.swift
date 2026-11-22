@@ -512,6 +512,66 @@ public final class LyricsService: ObservableObject {
         )
     }
 
+    /// Provides optional reference lyric lines & vocabulary hints (cached or fast <=3.5s lookup) so AI speech recognition
+    /// can bias Apple Speech `contextualStrings` and verify heard words against real audio timestamps without ever stalling.
+    public func fetchReferenceLyricsForAI(
+        for track: UniversalTrack,
+        timeoutSeconds: TimeInterval = 3.5
+    ) async -> (plainLines: [String], syncedLines: [SyncedLyricLine])? {
+        // 1. Instant hit if already loaded for this track
+        if loadedTrackID == track.id, let doc = currentDocument {
+            let cleanPlain = doc.plainLines.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !LRCParser.isInstrumentalMarker($0) }
+            if !cleanPlain.isEmpty {
+                return (cleanPlain, doc.isSynchronized ? doc.syncedLines : [])
+            }
+        }
+        // 2. Instant SwiftData offline cache hit
+        let cacheKey = Self.lyricsCacheKey(for: track)
+        let context = PersistenceController.shared.context
+        let descriptor = FetchDescriptor<PersistedCachedLyricsEntity>(
+            predicate: #Predicate { $0.cacheKey == cacheKey }
+        )
+        if let cached = try? context.fetch(descriptor).first,
+           let doc = buildDocument(
+               title: track.title,
+               artist: track.artist,
+               syncedLRC: cached.syncedLRC,
+               plainLyrics: cached.plainLyrics,
+               trackDuration: track.duration
+           ) {
+            let cleanPlain = doc.plainLines.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !LRCParser.isInstrumentalMarker($0) }
+            if !cleanPlain.isEmpty {
+                return (cleanPlain, doc.isSynchronized ? doc.syncedLines : [])
+            }
+        }
+        // 3. Fast time-capped remote lookup across our 6 databases
+        let candidate: LRCLIBEntryDTO? = await withTaskGroup(of: LRCLIBEntryDTO?.self) { group in
+            group.addTask { @MainActor in
+                await self.fetchBestRemoteLyricsCandidate(for: track)
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: UInt64(max(0.5, timeoutSeconds) * 1_000_000_000))
+                return nil
+            }
+            let first = await group.next() ?? nil
+            group.cancelAll()
+            return first
+        }
+        guard let dto = candidate,
+              let doc = buildDocument(
+                  title: track.title,
+                  artist: track.artist,
+                  syncedLRC: dto.syncedLyrics,
+                  plainLyrics: dto.plainLyrics,
+                  trackDuration: track.duration
+              ) else {
+            return nil
+        }
+        let cleanPlain = doc.plainLines.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !LRCParser.isInstrumentalMarker($0) }
+        guard !cleanPlain.isEmpty else { return nil }
+        return (cleanPlain, doc.isSynchronized ? doc.syncedLines : [])
+    }
+
     public func hasCachedLyrics(for track: UniversalTrack) -> Bool {
         let key = Self.lyricsCacheKey(for: track)
         let context = PersistenceController.shared.context

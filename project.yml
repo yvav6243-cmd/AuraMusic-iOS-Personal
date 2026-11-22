@@ -44,6 +44,7 @@ targets:
       - ActivityKit
       - NaturalLanguage
       - Speech
+      - Accelerate
 
   AuraMusicTests:
     type: bundle.unit-test

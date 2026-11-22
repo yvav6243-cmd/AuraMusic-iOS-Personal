@@ -2572,4 +2572,136 @@ final class AuraMusicCoreTests: XCTestCase {
         XCTAssertNil(result?.localRelativePath, "Failed download must never store a bogus file path")
         XCTAssertFalse(manager.isDownloaded(invalidTrack))
     }
+
+    // MARK: - Studio Vocal Isolation DSP, 100% Chunk Coverage & Audio-Anchored AI Lyrics v2 Tests
+
+    func testVocalIsolationDSPSuppressesSubBassAndWideStereoWhilePreservingCenterVocals() {
+        let sr = 16_000.0
+        let count = Int(sr * 1.0) // 1.0 second
+
+        // 1. Center-panned 1000 Hz vocal tone (L == R)
+        var vocalL = [Float](repeating: 0, count: count)
+        var vocalR = [Float](repeating: 0, count: count)
+        // 2. Heavy 60 Hz 808 sub-bass (L == R)
+        var bassL = [Float](repeating: 0, count: count)
+        var bassR = [Float](repeating: 0, count: count)
+        // 3. Wide stereo out-of-phase synth at 1000 Hz (L = +s, R = -s -> pure Side!)
+        var wideL = [Float](repeating: 0, count: count)
+        var wideR = [Float](repeating: 0, count: count)
+
+        for i in 0..<count {
+            let t = Double(i) / sr
+            let v = Float(sin(2.0 * Double.pi * 1000.0 * t) * 0.5)
+            vocalL[i] = v
+            vocalR[i] = v
+
+            let b = Float(sin(2.0 * Double.pi * 60.0 * t) * 0.8)
+            bassL[i] = b
+            bassR[i] = b
+
+            let w = Float(sin(2.0 * Double.pi * 1000.0 * t) * 0.6)
+            wideL[i] = w
+            wideR[i] = -w
+        }
+
+        let vocalOut = VocalIsolationDSP.processStereoForVocals(left: vocalL, right: vocalR, sampleRate: sr).vocalIsolated
+        let bassOut = VocalIsolationDSP.processStereoForVocals(left: bassL, right: bassR, sampleRate: sr).vocalIsolated
+        let wideOut = VocalIsolationDSP.processStereoForVocals(left: wideL, right: wideR, sampleRate: sr).vocalIsolated
+
+        let vocalRMS = AILyricsTranscriptionEngine.computeRMSEnvelope(samples: vocalOut, sampleRate: sr).reduce(0, +)
+        let bassRMS = AILyricsTranscriptionEngine.computeRMSEnvelope(samples: bassOut, sampleRate: sr).reduce(0, +)
+        let wideRMS = AILyricsTranscriptionEngine.computeRMSEnvelope(samples: wideOut, sampleRate: sr).reduce(0, +)
+
+        XCTAssertGreaterThan(vocalRMS, 0.5, "Center 1000 Hz vocal must pass cleanly at strong level")
+        XCTAssertLessThan(bassRMS, vocalRMS * 0.35, "190 Hz high-pass must heavily suppress 60 Hz 808 sub-bass")
+        XCTAssertLessThan(wideRMS, 0.01, "Mid/Side stereo vocal isolation must cancel wide out-of-phase stereo instruments")
+    }
+
+    func testAILyricsContiguousChunksCover100PercentOfSongWithZeroSkippedSeconds() {
+        let chunks = AILyricsTranscriptionEngine.buildContiguousListeningChunks(
+            start: 8.0,
+            end: 240.0,
+            chunkLength: 24.0,
+            overlap: 1.5
+        )
+        XCTAssertGreaterThanOrEqual(chunks.count, 10)
+        XCTAssertEqual(chunks.first?.start ?? -1, 8.0, accuracy: 0.001)
+        XCTAssertEqual(chunks.last?.end ?? -1, 240.0, accuracy: 0.001)
+        for i in 0..<chunks.count {
+            XCTAssertLessThanOrEqual(chunks[i].end - chunks[i].start, 24.01, "Each chunk must be <= 24s for fast isFinal recognition")
+            if i > 0 {
+                XCTAssertLessThan(chunks[i].start, chunks[i - 1].end, "Adjacent chunks MUST overlap so ZERO seconds of the song are skipped!")
+            }
+        }
+    }
+
+    func testAILyricsLanguageProbeScorePrefersConfidentRussianOverLowConfidenceEnglishGibberish() {
+        let confidentRussian = [
+            AIWordToken(text: "Окутала", timestamp: 10.0, duration: 0.5, confidence: 0.89, languageCode: "ru"),
+            AIWordToken(text: "меня", timestamp: 10.6, duration: 0.4, confidence: 0.87, languageCode: "ru"),
+            AIWordToken(text: "небо", timestamp: 11.4, duration: 0.4, confidence: 0.85, languageCode: "ru"),
+            AIWordToken(text: "алмазах", timestamp: 12.0, duration: 0.6, confidence: 0.91, languageCode: "ru")
+        ]
+        let englishGibberish = [
+            AIWordToken(text: "a", timestamp: 10.0, duration: 0.2, confidence: 0.22, languageCode: "en"),
+            AIWordToken(text: "cool", timestamp: 10.3, duration: 0.3, confidence: 0.28, languageCode: "en"),
+            AIWordToken(text: "la", timestamp: 10.7, duration: 0.2, confidence: 0.24, languageCode: "en"),
+            AIWordToken(text: "men", timestamp: 11.1, duration: 0.3, confidence: 0.31, languageCode: "en"),
+            AIWordToken(text: "yeah", timestamp: 11.6, duration: 0.3, confidence: 0.27, languageCode: "en")
+        ]
+        XCTAssertGreaterThan(
+            AILyricsTranscriptionEngine.scoreLanguageProbe(confidentRussian),
+            AILyricsTranscriptionEngine.scoreLanguageProbe(englishGibberish),
+            "Confidence-weighted probe score MUST select true Russian vocals over low-confidence English hallucinations"
+        )
+    }
+
+    func testAILyricsAudioAnchoredAlignmentFixesSpellingWhilePreservingRealAudioTimestampsAndPauses() {
+        let referenceLines = [
+            "I got love, I got love",
+            "Окутала меня, окутала",
+            "Небо в алмазах - лето",
+            "Свет в темноте горит"
+        ]
+        // Simulated real audio timestamps from a version with a 15-second MV intro & a 10-second instrumental break!
+        // Notice slightly misheard words ("окутал", "алмазы") that Pass 9 must verify & fix while keeping exact audio timestamps!
+        let audioTokens = [
+            AIWordToken(text: "I", timestamp: 15.2, duration: 0.2, confidence: 0.88, languageCode: "en"),
+            AIWordToken(text: "got", timestamp: 15.5, duration: 0.25, confidence: 0.90, languageCode: "en"),
+            AIWordToken(text: "love", timestamp: 15.85, duration: 0.35, confidence: 0.92, languageCode: "en"),
+            AIWordToken(text: "окутал", timestamp: 21.8, duration: 0.5, confidence: 0.68, languageCode: "ru"),
+            AIWordToken(text: "меня", timestamp: 22.4, duration: 0.4, confidence: 0.86, languageCode: "ru"),
+            AIWordToken(text: "небо", timestamp: 38.5, duration: 0.4, confidence: 0.88, languageCode: "ru"),
+            AIWordToken(text: "алмазы", timestamp: 39.1, duration: 0.5, confidence: 0.72, languageCode: "ru"),
+            AIWordToken(text: "свет", timestamp: 44.0, duration: 0.4, confidence: 0.84, languageCode: "ru"),
+            AIWordToken(text: "темноте", timestamp: 44.6, duration: 0.5, confidence: 0.89, languageCode: "ru")
+        ]
+        let pauses = [
+            AIPauseInterval(start: 0.0, end: 14.8),
+            AIPauseInterval(start: 26.0, end: 36.5)
+        ]
+
+        let lrc = AILyricsTranscriptionEngine.alignReferenceLinesToAudioTokens(
+            referenceLines: referenceLines,
+            audioTokens: audioTokens,
+            pauses: pauses,
+            trackDuration: 52.0
+        )
+        let parsed = LRCParser.parseSyncedLRC(lrc, includeIntroDots: true)
+        XCTAssertTrue(parsed.first?.isInstrumental == true, "15s MV intro MUST render as ••• dots")
+        XCTAssertGreaterThanOrEqual(parsed.filter(\.isInstrumental).count, 2, "Both 15s intro and 10.5s mid-song pause MUST render as •••")
+
+        let line1 = parsed.first { $0.text == "I got love, I got love" }
+        let line2 = parsed.first { $0.text == "Окутала меня, окутала" }
+        let line3 = parsed.first { $0.text == "Небо в алмазах - лето" }
+        let line4 = parsed.first { $0.text == "Свет в темноте горит" }
+        XCTAssertNotNil(line1)
+        XCTAssertNotNil(line2)
+        XCTAssertNotNil(line3)
+        XCTAssertNotNil(line4)
+        XCTAssertEqual(line1?.timestamp ?? -1, 15.2, accuracy: 0.15, "Must preserve exact 15.2s audio-heard timestamp")
+        XCTAssertEqual(line2?.timestamp ?? -1, 21.8, accuracy: 0.15, "Must preserve exact 21.8s audio-heard timestamp & fix spelling")
+        XCTAssertEqual(line3?.timestamp ?? -1, 38.5, accuracy: 0.15, "Must preserve exact 38.5s audio-heard timestamp after mid-song pause")
+        XCTAssertEqual(line4?.timestamp ?? -1, 44.0, accuracy: 0.15)
+    }
 }
