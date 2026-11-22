@@ -493,6 +493,38 @@ public final class LyricsService: ObservableObject {
         }
         UserDefaults.standard.set(map, forKey: Self.preferredModeDefaultsKey)
         self.lyricsMode = mode
+        OfflineDownloadManager.shared.notifyLyricsChanged(for: track)
+    }
+
+    /// Computes a stable content fingerprint for the track's currently active lyrics (AI or standard)
+    /// so `OfflineDownloadManager` knows immediately when lyrics changed and offers "Докачать / Обновить лирику".
+    public func activeLyricsFingerprint(for track: UniversalTrack) -> String? {
+        let mode = preferredLyricsMode(for: track)
+        let key = (mode == .aiAudio) ? Self.aiLyricsCacheKey(for: track) : Self.lyricsCacheKey(for: track)
+        let context = PersistenceController.shared.context
+        let descriptor = FetchDescriptor<PersistedCachedLyricsEntity>(
+            predicate: #Predicate { $0.cacheKey == key }
+        )
+        if let entity = try? context.fetch(descriptor).first {
+            let content = (entity.syncedLRC ?? "") + "|" + (entity.plainLyrics ?? "")
+            if !content.replacingOccurrences(of: "|", with: "").isEmpty {
+                return "\(mode.rawValue)::\(content.count)::\(content.prefix(64))::\(content.suffix(32))"
+            }
+        }
+        // Fallback to standard lyrics key if AI mode was selected before finishing
+        if mode == .aiAudio {
+            let stdKey = Self.lyricsCacheKey(for: track)
+            let stdDesc = FetchDescriptor<PersistedCachedLyricsEntity>(
+                predicate: #Predicate { $0.cacheKey == stdKey }
+            )
+            if let entity = try? context.fetch(stdDesc).first {
+                let content = (entity.syncedLRC ?? "") + "|" + (entity.plainLyrics ?? "")
+                if !content.replacingOccurrences(of: "|", with: "").isEmpty {
+                    return "std::\(content.count)::\(content.prefix(64))::\(content.suffix(32))"
+                }
+            }
+        }
+        return nil
     }
 
     public func loadCachedAILyrics(for track: UniversalTrack) -> TrackLyricsDocument? {
@@ -2389,8 +2421,8 @@ public struct SynchronizedLyricsView: View {
                                         .foregroundStyle(.primary)
                                     Text(
                                         lyricsService.aiDocument != nil
-                                            ? "ИИ-текст готов и сохранён для этой песни"
-                                            : "ИИ прослушает песню 10 раз (≤30 сек) и создаст текст"
+                                            ? "ИИ-субтитры созданы и сохранены для этой песни"
+                                            : "ИИ слушает песню 10 раз (≤30 сек) и сам создаёт субтитры по голосу"
                                     )
                                     .font(.system(size: 12))
                                     .foregroundStyle(.secondary)
@@ -2458,10 +2490,30 @@ public struct SynchronizedLyricsView: View {
                             }
                             .padding(.vertical, 3)
                         }
+                        // Option 3: Update / Download Changed Lyrics for Offline Song
+                        if OfflineDownloadManager.shared.isDownloaded(track) {
+                            let needsSync = OfflineDownloadManager.shared.hasLyricsUpdateAvailable(for: track)
+                            Button {
+                                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                Task {
+                                    await OfflineDownloadManager.shared.syncOfflineLyricsForTrack(track)
+                                }
+                                showManualSearchSheet = false
+                            } label: {
+                                Label(
+                                    needsSync
+                                        ? "Докачать обновлённую лирику офлайн"
+                                        : "Обновить офлайн-лирику и обложку",
+                                    systemImage: needsSync ? "arrow.down.circle.fill" : "arrow.triangle.2.circlepath"
+                                )
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundStyle(needsSync ? Color.green : AuraTheme.accentPink)
+                            }
+                        }
                     } header: {
                         Text("Режим лирики для этой песни")
                     } footer: {
-                        Text("Выбор запоминается отдельно для каждой песни: если последний раз вы слушали этот трек в режиме ИИ, при следующем включении откроется ИИ-текст, а для остальных песен останется оригинальная лирика.")
+                        Text("ИИ не ищет текст в интернете — он слушает голос и создаёт субтитры напрямую из аудио (как субтитры YouTube, но точнее и с паузами •••). Выбор режима запоминается отдельно для каждой песни.")
                     }
                 }
 

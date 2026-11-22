@@ -16,6 +16,7 @@ public struct AppleMusicPlayerOverlayView: View {
     @State private var showAddToPlaylistSheet: Bool = false
     @State private var showShareSheet: Bool = false
     @State private var showCustomCoverPicker: Bool = false
+    @State private var showTrackTrimSheet: Bool = false
     @State private var selectedCoverPhotoItem: PhotosPickerItem?
 
     public init() {}
@@ -82,9 +83,13 @@ public struct AppleMusicPlayerOverlayView: View {
                             .font(.system(size: 12))
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
-                        Text("• \(track.provider.shortBadgeName)")
-                            .font(.system(size: 9, weight: .bold))
-                            .foregroundStyle(track.provider.badgeColor)
+                            .truncationMode(.tail)
+                        let isOffline = downloadManager.isDownloaded(track)
+                        Text("• \(isOffline ? "OFFLINE" : track.provider.shortBadgeName)")
+                            .font(.system(size: 9, weight: .bold, design: .rounded))
+                            .foregroundStyle(isOffline ? Color.green : track.provider.badgeColor)
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
                     }
                 }
 
@@ -247,6 +252,9 @@ public struct AppleMusicPlayerOverlayView: View {
         .sheet(isPresented: $showShareSheet) {
             SystemShareSheet(activityItems: ["\(track.title) — \(track.artist) [\(track.provider.displayName)]"])
         }
+        .sheet(isPresented: $showTrackTrimSheet) {
+            TrackTrimEditorSheet(track: track)
+        }
         .photosPicker(isPresented: $showCustomCoverPicker, selection: $selectedCoverPhotoItem, matching: .images)
         .onChange(of: selectedCoverPhotoItem) { _, newItem in
             guard let newItem else { return }
@@ -353,18 +361,30 @@ public struct AppleMusicPlayerOverlayView: View {
                     }
                 }
 
-                HStack(spacing: 8) {
+                HStack(spacing: 6) {
                     Text(track.artist)
-                        .font(.system(size: 18, weight: .medium))
+                        .font(.system(size: 17, weight: .medium))
                         .foregroundStyle(.white.opacity(0.78))
                         .lineLimit(1)
+                        .truncationMode(.tail)
 
-                    Text(track.audioQualityBadge ?? track.provider.shortBadgeName)
-                        .font(.system(size: 9.5, weight: .bold, design: .rounded))
-                        .foregroundStyle(.white.opacity(0.92))
+                    let isOffline = downloadManager.isDownloaded(track)
+                    Text(isOffline ? "OFFLINE" : (track.audioQualityBadge ?? track.provider.shortBadgeName))
+                        .font(.system(size: 9, weight: .bold, design: .rounded))
+                        .foregroundStyle(isOffline ? Color.green : .white.opacity(0.92))
+                        .lineLimit(1)
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2.5)
-                        .background(RoundedRectangle(cornerRadius: 4).fill(.white.opacity(0.18)))
+                        .background(
+                            RoundedRectangle(cornerRadius: 4, style: .continuous)
+                                .fill(isOffline ? Color.green.opacity(0.22) : .white.opacity(0.18))
+                        )
+                        .fixedSize(horizontal: true, vertical: false)
+
+                    if let trim = player.activeTrackTrimRange,
+                       trim.isEffectivelyTrimmed(for: max(player.duration, track.duration)) {
+                        TrimmedBadgePill(rangeText: trim.formattedRange(for: max(player.duration, track.duration)))
+                    }
                 }
             }
 
@@ -404,6 +424,16 @@ public struct AppleMusicPlayerOverlayView: View {
 
             Menu {
                 Button {
+                    showTrackTrimSheet = true
+                } label: {
+                    let trimmed = persistence.hasCustomTrim(for: track)
+                    Label(
+                        trimmed ? "Изменить длину песни (обрезано)…" : "Изменить длину / Обрезать песню…",
+                        systemImage: "scissors"
+                    )
+                }
+
+                Button {
                     showCustomCoverPicker = true
                 } label: {
                     Label("Change Song Cover (Photos)…", systemImage: "photo.badge.plus")
@@ -432,7 +462,19 @@ public struct AppleMusicPlayerOverlayView: View {
                     Label("Add to a Playlist…", systemImage: "text.badge.plus")
                 }
 
-                if track.provider.supportsLegalOfflineDownload && track.isDownloadPermitted {
+                if downloadManager.isDownloaded(track) {
+                    Button {
+                        Task {
+                            await downloadManager.syncOfflineLyricsForTrack(track)
+                        }
+                    } label: {
+                        let needsUpdate = downloadManager.hasLyricsUpdateAvailable(for: track)
+                        Label(
+                            needsUpdate ? "Докачать обновлённую лирику" : "Обновить офлайн-лирику",
+                            systemImage: needsUpdate ? "arrow.down.circle.fill" : "arrow.triangle.2.circlepath"
+                        )
+                    }
+                } else if track.provider.supportsLegalOfflineDownload && track.isDownloadPermitted {
                     Button {
                         downloadManager.enqueueDownload(for: track)
                     } label: {
@@ -765,9 +807,22 @@ private struct ExpandedPlaybackScrubberView: View {
 
                 Spacer()
 
-                Text(track.provider.shortBadgeName)
-                    .font(.system(size: 10, weight: .bold, design: .rounded))
-                    .foregroundStyle(.white.opacity(0.75))
+                let isOffline = OfflineDownloadManager.shared.isDownloaded(track)
+                HStack(spacing: 5) {
+                    if let trim = player.activeTrackTrimRange, trim.isEffectivelyTrimmed(for: total) {
+                        Image(systemName: "scissors")
+                            .font(.system(size: 9, weight: .bold))
+                        Text(trim.formattedRange(for: total))
+                            .font(.system(size: 10, weight: .bold, design: .rounded))
+                            .monospacedDigit()
+                    } else {
+                        Text(isOffline ? "OFFLINE AUDIO" : track.provider.shortBadgeName)
+                            .font(.system(size: 10, weight: .bold, design: .rounded))
+                    }
+                }
+                .foregroundStyle(isOffline ? Color.green.opacity(0.95) : .white.opacity(0.75))
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
 
                 Spacer()
 
@@ -907,6 +962,243 @@ private struct LiveLyricPreviewPillView: View {
             let nextLine = lyricsService.activeLyricLineText(at: newTime)
             if nextLine != displayedLine {
                 displayedLine = nextLine
+            }
+        }
+    }
+}
+
+// MARK: - Persistent Song Length / Trim Editor Sheet (Start & End Cut Settings)
+
+public struct TrackTrimEditorSheet: View {
+    public let track: UniversalTrack
+
+    @ObservedObject private var player: UniversalAudioPlayerEngine = .shared
+    @ObservedObject private var persistence: PersistenceController = .shared
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var startSeconds: Double = 0
+    @State private var endSeconds: Double = 180
+    @State private var totalDuration: Double = 180
+
+    public init(track: UniversalTrack) {
+        self.track = track
+    }
+
+    private var trimmedLength: Double {
+        max(TrackTrimRange.minimumSegmentLength, endSeconds - startSeconds)
+    }
+
+    private var isModified: Bool {
+        startSeconds >= 0.5 || endSeconds < (totalDuration - 0.5)
+    }
+
+    public var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    HStack(spacing: 12) {
+                        AuraArtworkView(url: persistence.effectiveArtworkURL(for: track), size: 54, cornerRadius: 10)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(track.title)
+                                .font(.system(size: 16, weight: .bold))
+                                .lineLimit(1)
+                            Text(track.artist)
+                                .font(.system(size: 13))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                            Text("Оригинал: \(TrackTrimRange.formatClock(totalDuration)) → Новая длина: \(TrackTrimRange.formatClock(trimmedLength))")
+                                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                                .foregroundStyle(AuraTheme.accentPink)
+                                .monospacedDigit()
+                        }
+                    }
+                    .padding(.vertical, 4)
+
+                    // Visual Active Segment Range Bar
+                    GeometryReader { geo in
+                        let w = max(geo.size.width, 1)
+                        let safeTotal = max(totalDuration, 1)
+                        let startFrac = max(0, min(1, startSeconds / safeTotal))
+                        let endFrac = max(startFrac, min(1, endSeconds / safeTotal))
+                        let activeWidth = max(6, w * CGFloat(endFrac - startFrac))
+
+                        ZStack(alignment: .leading) {
+                            Capsule(style: .continuous)
+                                .fill(Color.secondary.opacity(0.22))
+                                .frame(height: 12)
+
+                            Capsule(style: .continuous)
+                                .fill(
+                                    LinearGradient(
+                                        colors: [AuraTheme.accentPink, Color.purple],
+                                        startPoint: .leading,
+                                        endPoint: .trailing
+                                    )
+                                )
+                                .frame(width: activeWidth, height: 12)
+                                .offset(x: w * CGFloat(startFrac))
+                        }
+                    }
+                    .frame(height: 18)
+                } header: {
+                    Text("Длина и обрезка трека")
+                } footer: {
+                    Text("Выбранные границы запоминаются для этой песни навсегда: трек начнётся с «Начала» и автоматически завершится на «Конце».")
+                }
+
+                Section("Начало трека: \(TrackTrimRange.formatClock(startSeconds))") {
+                    Slider(
+                        value: Binding(
+                            get: { startSeconds },
+                            set: { newVal in
+                                let maxAllowed = max(0, endSeconds - TrackTrimRange.minimumSegmentLength)
+                                startSeconds = max(0, min(newVal, maxAllowed))
+                            }
+                        ),
+                        in: 0...max(TrackTrimRange.minimumSegmentLength, totalDuration)
+                    )
+                    .tint(AuraTheme.accentPink)
+
+                    HStack(spacing: 10) {
+                        Button("-1с") {
+                            startSeconds = max(0, startSeconds - 1.0)
+                        }
+                        .buttonStyle(.bordered)
+
+                        Button("+1с") {
+                            let maxAllowed = max(0, endSeconds - TrackTrimRange.minimumSegmentLength)
+                            startSeconds = min(maxAllowed, startSeconds + 1.0)
+                        }
+                        .buttonStyle(.bordered)
+
+                        Spacer()
+
+                        if player.currentTrack?.id == track.id {
+                            Button("Взять текущее (\(TrackTrimRange.formatClock(PlaybackClock.shared.currentTime)))") {
+                                let maxAllowed = max(0, endSeconds - TrackTrimRange.minimumSegmentLength)
+                                startSeconds = max(0, min(PlaybackClock.shared.currentTime, maxAllowed))
+                            }
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(AuraTheme.accentPink)
+                        }
+                    }
+                }
+
+                Section("Конец трека: \(TrackTrimRange.formatClock(endSeconds))") {
+                    Slider(
+                        value: Binding(
+                            get: { endSeconds },
+                            set: { newVal in
+                                let minAllowed = min(totalDuration, startSeconds + TrackTrimRange.minimumSegmentLength)
+                                endSeconds = max(minAllowed, min(newVal, totalDuration))
+                            }
+                        ),
+                        in: 0...max(TrackTrimRange.minimumSegmentLength, totalDuration)
+                    )
+                    .tint(AuraTheme.accentPink)
+
+                    HStack(spacing: 10) {
+                        Button("-1с") {
+                            let minAllowed = min(totalDuration, startSeconds + TrackTrimRange.minimumSegmentLength)
+                            endSeconds = max(minAllowed, endSeconds - 1.0)
+                        }
+                        .buttonStyle(.bordered)
+
+                        Button("+1с") {
+                            endSeconds = min(totalDuration, endSeconds + 1.0)
+                        }
+                        .buttonStyle(.bordered)
+
+                        Spacer()
+
+                        if player.currentTrack?.id == track.id {
+                            Button("Взять текущее (\(TrackTrimRange.formatClock(PlaybackClock.shared.currentTime)))") {
+                                let minAllowed = min(totalDuration, startSeconds + TrackTrimRange.minimumSegmentLength)
+                                endSeconds = max(minAllowed, min(PlaybackClock.shared.currentTime, totalDuration))
+                            }
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(AuraTheme.accentPink)
+                        }
+                    }
+                }
+
+                Section("Предпрослушивание") {
+                    Button {
+                        if player.currentTrack?.id != track.id {
+                            player.play(track)
+                        }
+                        player.seek(to: startSeconds)
+                        if !player.isPlaying { player.resume() }
+                    } label: {
+                        Label("Слушать с нового начала (\(TrackTrimRange.formatClock(startSeconds)))", systemImage: "play.circle.fill")
+                            .foregroundStyle(AuraTheme.accentPink)
+                    }
+
+                    Button {
+                        if player.currentTrack?.id != track.id {
+                            player.play(track)
+                        }
+                        let previewPos = max(startSeconds, endSeconds - 5.0)
+                        player.seek(to: previewPos)
+                        if !player.isPlaying { player.resume() }
+                    } label: {
+                        Label("Проверить концовку (за 5 сек до \(TrackTrimRange.formatClock(endSeconds)))", systemImage: "forward.end.circle.fill")
+                            .foregroundStyle(AuraTheme.accentPink)
+                    }
+                }
+
+                if isModified || persistence.hasCustomTrim(for: track) {
+                    Section {
+                        Button(role: .destructive) {
+                            startSeconds = 0
+                            endSeconds = totalDuration
+                            persistence.setTrimRange(nil, for: track)
+                            player.applyUpdatedTrimRange(nil, for: track)
+                            dismiss()
+                        } label: {
+                            Label("Сбросить к полной длине песни", systemImage: "arrow.counterclockwise")
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Настройки длины песни")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Отмена") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Сохранить") {
+                        let rawRange = TrackTrimRange(
+                            startSeconds: startSeconds,
+                            endSeconds: endSeconds < (totalDuration - 0.5) ? endSeconds : nil
+                        )
+                        let normalized = rawRange.normalized(for: totalDuration)
+                        let toStore: TrackTrimRange? = normalized.isEffectivelyTrimmed(for: totalDuration) ? normalized : nil
+                        persistence.setTrimRange(toStore, for: track)
+                        player.applyUpdatedTrimRange(toStore, for: track)
+                        dismiss()
+                    }
+                    .fontWeight(.bold)
+                    .foregroundStyle(AuraTheme.accentPink)
+                }
+            }
+            .onAppear {
+                let detectedTotal: Double
+                if player.currentTrack?.id == track.id, PlaybackClock.shared.duration > 5 {
+                    detectedTotal = PlaybackClock.shared.duration
+                } else {
+                    detectedTotal = max(track.duration, 30.0)
+                }
+                totalDuration = detectedTotal
+                if let saved = persistence.trimRange(for: track) {
+                    let norm = saved.normalized(for: detectedTotal)
+                    startSeconds = norm.startSeconds
+                    endSeconds = norm.endSeconds ?? detectedTotal
+                } else {
+                    startSeconds = 0
+                    endSeconds = detectedTotal
+                }
             }
         }
     }

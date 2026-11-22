@@ -20,6 +20,8 @@ public struct DownloadTaskItem: Identifiable, Sendable {
     public var localRelativePath: String?
     public var fileSizeBytes: Int64
     public var hasOfflineLyrics: Bool
+    public var syncedLyricsFingerprint: String?
+    public var needsLyricsSync: Bool
     public var errorMessage: String?
 
     public init(
@@ -30,6 +32,8 @@ public struct DownloadTaskItem: Identifiable, Sendable {
         localRelativePath: String? = nil,
         fileSizeBytes: Int64 = 0,
         hasOfflineLyrics: Bool = false,
+        syncedLyricsFingerprint: String? = nil,
+        needsLyricsSync: Bool = false,
         errorMessage: String? = nil
     ) {
         self.id = id
@@ -39,6 +43,8 @@ public struct DownloadTaskItem: Identifiable, Sendable {
         self.localRelativePath = localRelativePath
         self.fileSizeBytes = fileSizeBytes
         self.hasOfflineLyrics = hasOfflineLyrics
+        self.syncedLyricsFingerprint = syncedLyricsFingerprint
+        self.needsLyricsSync = needsLyricsSync
         self.errorMessage = errorMessage
     }
 }
@@ -698,7 +704,8 @@ public final class OfflineDownloadManager: NSObject, ObservableObject {
                 if fileManager.fileExists(atPath: fullURL.path) {
                     let size = (try? fileManager.attributesOfItem(atPath: fullURL.path)[.size] as? Int64) ?? 0
                     let track = entity.toUniversalTrack()
-                    let hasLyrics = LyricsService.shared.hasCachedLyrics(for: track)
+                    let hasLyrics = LyricsService.shared.hasCachedLyrics(for: track) || (LyricsService.shared.loadCachedAILyrics(for: track) != nil)
+                    let fingerprint = LyricsService.shared.activeLyricsFingerprint(for: track)
                     tasks.append(
                         DownloadTaskItem(
                             id: track.id,
@@ -708,6 +715,8 @@ public final class OfflineDownloadManager: NSObject, ObservableObject {
                             localRelativePath: relPath,
                             fileSizeBytes: size,
                             hasOfflineLyrics: hasLyrics,
+                            syncedLyricsFingerprint: fingerprint,
+                            needsLyricsSync: !hasLyrics,
                             errorMessage: nil
                         )
                     )
@@ -725,6 +734,64 @@ public final class OfflineDownloadManager: NSObject, ObservableObject {
 
     public func isDownloaded(_ track: UniversalTrack) -> Bool {
         completedLocalRelativePath(for: track) != nil
+    }
+
+    /// Returns true if a downloaded track has missing or newly changed lyrics (e.g. after switching to AI lyrics or manual LRCLIB pick)
+    /// so the UI can show a 1-tap "Докачать лирику" button without re-downloading audio!
+    public func hasLyricsUpdateAvailable(for track: UniversalTrack) -> Bool {
+        guard let item = matchingCompletedTask(for: track) else { return false }
+        if item.needsLyricsSync || !item.hasOfflineLyrics {
+            return true
+        }
+        let latest = LyricsService.shared.activeLyricsFingerprint(for: track)
+        if let latest, latest != item.syncedLyricsFingerprint {
+            return true
+        }
+        return false
+    }
+
+    /// Called whenever lyrics change for a track (AI lyrics generated, manual LRCLIB pick, or mode switched).
+    public func notifyLyricsChanged(for track: UniversalTrack) {
+        let latest = LyricsService.shared.activeLyricsFingerprint(for: track)
+        for idx in tasks.indices where tasks[idx].state == .completed && taskMatches(tasks[idx], track: track) {
+            if latest != tasks[idx].syncedLyricsFingerprint {
+                tasks[idx].needsLyricsSync = true
+            }
+        }
+    }
+
+    /// Syncs / downloads updated lyrics & latest cover artwork into offline storage for a downloaded song WITHOUT re-downloading audio!
+    /// If the song isn't downloaded yet, enqueues the full offline download (audio + lyrics + cover).
+    public func syncOfflineLyricsForTrack(_ track: UniversalTrack) async {
+        guard isDownloaded(track) else {
+            enqueueDownload(for: track)
+            return
+        }
+        let mode = LyricsService.shared.preferredLyricsMode(for: track)
+        var gotLyrics = false
+        if mode == .aiAudio, LyricsService.shared.loadCachedAILyrics(for: track) != nil {
+            gotLyrics = true
+        } else {
+            gotLyrics = await LyricsService.shared.prefetchAndCacheLyrics(for: track)
+        }
+        await ArtworkCacheManager.shared.prefetchArtwork(for: PersistenceController.shared.effectiveArtworkURL(for: track))
+        let latestFingerprint = LyricsService.shared.activeLyricsFingerprint(for: track)
+
+        for idx in tasks.indices where tasks[idx].state == .completed && taskMatches(tasks[idx], track: track) {
+            tasks[idx].hasOfflineLyrics = gotLyrics || (latestFingerprint != nil)
+            tasks[idx].syncedLyricsFingerprint = latestFingerprint
+            tasks[idx].needsLyricsSync = false
+        }
+    }
+
+    private func taskMatches(_ item: DownloadTaskItem, track: UniversalTrack) -> Bool {
+        if item.id == track.id { return true }
+        if !track.providerTrackID.isEmpty && item.track.providerTrackID == track.providerTrackID { return true }
+        return matcher.isSameSong(item.track, track)
+    }
+
+    private func matchingCompletedTask(for track: UniversalTrack) -> DownloadTaskItem? {
+        tasks.first { $0.state == .completed && taskMatches($0, track: track) }
     }
 
     public func isDownloadingOrQueued(_ track: UniversalTrack) -> Bool {
@@ -825,13 +892,9 @@ public final class OfflineDownloadManager: NSObject, ObservableObject {
 
     public func enqueueDownload(for track: UniversalTrack) {
         if isDownloaded(track) {
-            // Even if audio is already downloaded, ensure offline lyrics & cover artwork are cached too!
+            // Even if audio is already downloaded, sync any updated lyrics (AI or manual) & latest artwork immediately!
             Task {
-                let gotLyrics = await LyricsService.shared.prefetchAndCacheLyrics(for: track)
-                await ArtworkCacheManager.shared.prefetchArtwork(for: track.artworkURL)
-                if gotLyrics {
-                    self.updateTask(id: track.id) { $0.hasOfflineLyrics = true }
-                }
+                await self.syncOfflineLyricsForTrack(track)
             }
             return
         }
@@ -940,12 +1003,15 @@ public final class OfflineDownloadManager: NSObject, ObservableObject {
         guard !Task.isCancelled else { return }
 
         if let relPath = savedRelativePath {
+            let latestFP = LyricsService.shared.activeLyricsFingerprint(for: track)
             updateTask(id: track.id) {
                 $0.state = .completed
                 $0.progress = 1.0
                 $0.localRelativePath = relPath
                 $0.fileSizeBytes = savedFileSize
-                $0.hasOfflineLyrics = cachedLyrics
+                $0.hasOfflineLyrics = cachedLyrics || (latestFP != nil)
+                $0.syncedLyricsFingerprint = latestFP
+                $0.needsLyricsSync = false
                 $0.errorMessage = nil
             }
             var updatedTrack = track
@@ -1348,17 +1414,42 @@ public struct DownloadsManagementView: View {
                                         .lineLimit(2)
                                 } else {
                                     HStack(spacing: 6) {
-                                        ProviderBadgePill(provider: item.track.provider, capability: .offlineFile)
-                                        if item.hasOfflineLyrics {
-                                            Label("Lyrics", systemImage: "quote.bubble.fill")
-                                                .font(.system(size: 10, weight: .semibold))
-                                                .foregroundStyle(.green)
+                                        ProviderBadgePill(provider: item.track.provider)
+                                        OfflineStatusBadgePill()
+                                        if item.hasOfflineLyrics && !downloadManager.hasLyricsUpdateAvailable(for: item.track) {
+                                            HStack(spacing: 3) {
+                                                Image(systemName: "quote.bubble.fill")
+                                                    .font(.system(size: 8.5, weight: .bold))
+                                                Text("LYRICS")
+                                                    .font(.system(size: 8.5, weight: .bold, design: .rounded))
+                                                    .lineLimit(1)
+                                            }
+                                            .foregroundStyle(.green)
+                                            .fixedSize(horizontal: true, vertical: false)
                                         }
                                         if item.fileSizeBytes > 0 {
                                             Text(ByteCountFormatter.string(fromByteCount: item.fileSizeBytes, countStyle: .file))
                                                 .font(.system(size: 11))
                                                 .foregroundStyle(.secondary)
+                                                .lineLimit(1)
+                                                .fixedSize(horizontal: true, vertical: false)
                                         }
+                                    }
+
+                                    if downloadManager.hasLyricsUpdateAvailable(for: item.track) {
+                                        Button {
+                                            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                                            Task {
+                                                await downloadManager.syncOfflineLyricsForTrack(item.track)
+                                            }
+                                        } label: {
+                                            Label("Докачать обновлённую лирику", systemImage: "arrow.down.circle.fill")
+                                                .font(.system(size: 11, weight: .bold))
+                                                .foregroundStyle(AuraTheme.accentPink)
+                                                .lineLimit(1)
+                                        }
+                                        .buttonStyle(.plain)
+                                        .padding(.top, 2)
                                     }
                                 }
                             }

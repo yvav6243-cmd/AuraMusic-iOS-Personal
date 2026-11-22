@@ -259,10 +259,13 @@ public final class PersistenceController: ObservableObject {
     @Published public private(set) var recentHistory: [PersistedListeningHistoryEntity] = []
     @Published public var favoriteAlbumIDs: Set<String> = []
     @Published public var searchHistory: [String] = []
+    @Published public private(set) var trimRangesRevision: Int = 0
 
     private let defaults = UserDefaults.standard
     private let favoriteAlbumsKey = "aura.favoriteAlbums.v1"
     private let searchHistoryKey = "aura.searchHistory.v1"
+    private let trackTrimRangesKey = "aura.trackTrimRanges.v1"
+    private var trimRangeCache: [String: TrackTrimRange] = [:]
 
     // O(1) in-memory lookup caches rebuilt once per reloadAll() to eliminate O(N) SwiftData scans inside ScrollView cells
     private var favoriteTrackIDs: Set<String> = []
@@ -302,6 +305,10 @@ public final class PersistenceController: ObservableObject {
         }
         if let savedSearches = defaults.stringArray(forKey: searchHistoryKey) {
             self.searchHistory = savedSearches
+        }
+        if let trimData = defaults.data(forKey: trackTrimRangesKey),
+           let decoded = try? JSONDecoder().decode([String: TrackTrimRange].self, from: trimData) {
+            self.trimRangeCache = decoded
         }
 
         reloadAll()
@@ -677,5 +684,54 @@ public final class PersistenceController: ObservableObject {
         defaults.set(Array(favoriteAlbumIDs), forKey: favoriteAlbumsKey)
         try? context.save()
         reloadAll()
+    }
+
+    // MARK: - Persistent Custom Track Length / Trim Settings (Start & End Cut)
+
+    private func trimLookupKeys(for track: UniversalTrack) -> [String] {
+        var keys = [track.id]
+        if !track.providerTrackID.isEmpty {
+            keys.append("pid::\(track.providerTrackID)")
+        }
+        let norm = "\(track.artist.lowercased().trimmingCharacters(in: .whitespacesAndNewlines))::\(track.title.lowercased().trimmingCharacters(in: .whitespacesAndNewlines))"
+        if !norm.isEmpty && norm != "::" {
+            keys.append("meta::\(norm)")
+        }
+        return keys
+    }
+
+    public func trimRange(for track: UniversalTrack) -> TrackTrimRange? {
+        for key in trimLookupKeys(for: track) {
+            if let range = trimRangeCache[key] {
+                return range
+            }
+        }
+        return nil
+    }
+
+    public func hasCustomTrim(for track: UniversalTrack) -> Bool {
+        guard let range = trimRange(for: track) else { return false }
+        if track.duration > 0 {
+            return range.isEffectivelyTrimmed(for: track.duration)
+        }
+        return range.startSeconds >= 0.5 || range.endSeconds != nil
+    }
+
+    public func setTrimRange(_ range: TrackTrimRange?, for track: UniversalTrack) {
+        let keys = trimLookupKeys(for: track)
+        if let range {
+            let effective = track.duration > 5 ? range.normalized(for: track.duration) : range
+            if track.duration > 5 && !effective.isEffectivelyTrimmed(for: track.duration) {
+                for key in keys { trimRangeCache.removeValue(forKey: key) }
+            } else {
+                for key in keys { trimRangeCache[key] = effective }
+            }
+        } else {
+            for key in keys { trimRangeCache.removeValue(forKey: key) }
+        }
+        if let encoded = try? JSONEncoder().encode(trimRangeCache) {
+            defaults.set(encoded, forKey: trackTrimRangesKey)
+        }
+        trimRangesRevision += 1
     }
 }

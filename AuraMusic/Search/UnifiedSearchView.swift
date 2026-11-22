@@ -635,8 +635,9 @@ public struct GroupedTrackResultCard: View {
                             HStack(spacing: 4) {
                                 Image(systemName: variant.provider.systemIconName)
                                     .font(.system(size: 9, weight: .bold))
-                                Text("\(variant.provider.shortBadgeName) • \(variant.playbackCapability.rawValue)")
+                                Text(ProviderBadgePill.formattedLabel(provider: variant.provider, capability: variant.playbackCapability))
                                     .font(.system(size: 9.5, weight: .bold, design: .rounded))
+                                    .lineLimit(1)
                             }
                             .foregroundStyle(isSelected ? .white : variant.provider.badgeColor)
                             .padding(.horizontal, 8)
@@ -648,6 +649,7 @@ public struct GroupedTrackResultCard: View {
                                         : variant.provider.badgeColor.opacity(0.14)
                                 )
                             )
+                            .fixedSize(horizontal: true, vertical: false)
                         }
                         .buttonStyle(.plain)
                     }

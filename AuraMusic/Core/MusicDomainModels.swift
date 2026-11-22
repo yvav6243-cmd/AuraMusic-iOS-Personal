@@ -105,6 +105,81 @@ public enum PlaybackCapability: String, Codable, Hashable, Sendable {
     case embeddedVideo = "Inline Video"
     case externalApp = "External App"
     case offlineFile = "Offline"
+
+    /// Concise single-line label for song row badges so pills NEVER wrap vertically or squish artist names.
+    public var shortPillLabel: String? {
+        switch self {
+        case .offlineFile: return "OFFLINE"
+        case .preview30s: return "30S"
+        case .directFullAudio, .appleMusicKit, .embeddedVideo, .externalApp:
+            return nil
+        }
+    }
+}
+
+// MARK: - Persistent Song Trim Range (Custom Start / End Cut)
+
+public struct TrackTrimRange: Codable, Equatable, Hashable, Sendable {
+    public static let minimumSegmentLength: TimeInterval = 5.0
+
+    public var startSeconds: TimeInterval
+    public var endSeconds: TimeInterval?
+
+    public init(startSeconds: TimeInterval = 0, endSeconds: TimeInterval? = nil) {
+        self.startSeconds = max(0, startSeconds)
+        self.endSeconds = endSeconds
+    }
+
+    /// Clamps start & end safely inside `[0, totalDuration]` while preserving at least 5 seconds of playable audio.
+    public func normalized(for totalDuration: TimeInterval) -> TrackTrimRange {
+        let safeTotal = max(0, totalDuration)
+        guard safeTotal > Self.minimumSegmentLength else {
+            return TrackTrimRange(startSeconds: 0, endSeconds: nil)
+        }
+        let maxStart = max(0, safeTotal - Self.minimumSegmentLength)
+        let clampedStart = max(0, min(startSeconds, maxStart))
+        var clampedEnd: TimeInterval? = nil
+        if let rawEnd = endSeconds, rawEnd.isFinite {
+            let minEnd = min(safeTotal, clampedStart + Self.minimumSegmentLength)
+            let bounded = max(minEnd, min(rawEnd, safeTotal))
+            if bounded < safeTotal - 0.5 {
+                clampedEnd = bounded
+            }
+        }
+        return TrackTrimRange(startSeconds: clampedStart, endSeconds: clampedEnd)
+    }
+
+    public func isEffectivelyTrimmed(for totalDuration: TimeInterval) -> Bool {
+        let norm = normalized(for: totalDuration)
+        if norm.startSeconds >= 0.5 { return true }
+        if let end = norm.endSeconds, totalDuration > 0, end < totalDuration - 0.5 {
+            return true
+        }
+        return false
+    }
+
+    public func effectiveEnd(for totalDuration: TimeInterval) -> TimeInterval {
+        let norm = normalized(for: totalDuration)
+        return norm.endSeconds ?? max(0, totalDuration)
+    }
+
+    public func effectiveDuration(for totalDuration: TimeInterval) -> TimeInterval {
+        let norm = normalized(for: totalDuration)
+        let end = norm.endSeconds ?? max(0, totalDuration)
+        return max(0, end - norm.startSeconds)
+    }
+
+    public func formattedRange(for totalDuration: TimeInterval) -> String {
+        let norm = normalized(for: totalDuration)
+        let end = norm.endSeconds ?? max(0, totalDuration)
+        return "\(Self.formatClock(norm.startSeconds))–\(Self.formatClock(end))"
+    }
+
+    public static func formatClock(_ value: TimeInterval) -> String {
+        guard value.isFinite && value >= 0 else { return "0:00" }
+        let total = Int(value.rounded())
+        return String(format: "%d:%02d", total / 60, total % 60)
+    }
 }
 
 // MARK: - Universal Track

@@ -1079,6 +1079,7 @@ public struct TrackRowView: View {
     @State private var showPlaylistPicker: Bool = false
     @State private var showShareSheet: Bool = false
     @State private var showCustomCoverPicker: Bool = false
+    @State private var showTrimSheet: Bool = false
     @State private var selectedCoverPhotoItem: PhotosPickerItem?
 
     public init(
@@ -1120,12 +1121,21 @@ public struct TrackRowView: View {
                     }
                 }
 
-                HStack(spacing: 6) {
-                    ProviderBadgePill(provider: track.provider, capability: track.playbackCapability)
+                HStack(spacing: 5) {
+                    ProviderBadgePill(provider: track.provider)
+                    if isDownloaded {
+                        OfflineStatusBadgePill()
+                    }
+                    if let trim = persistence.trimRange(for: track),
+                       track.duration > 5,
+                       trim.isEffectivelyTrimmed(for: track.duration) {
+                        TrimmedBadgePill(rangeText: trim.formattedRange(for: track.duration))
+                    }
                     Text("\(track.artist) • \(track.formattedDuration)")
                         .font(.system(size: 12))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
+                        .truncationMode(.tail)
                 }
             }
 
@@ -1162,6 +1172,9 @@ public struct TrackRowView: View {
         .sheet(isPresented: $showShareSheet) {
             SystemShareSheet(activityItems: ["\(track.title) — \(track.artist) (\(track.provider.displayName))"])
         }
+        .sheet(isPresented: $showTrimSheet) {
+            TrackTrimEditorSheet(track: track)
+        }
         .photosPicker(isPresented: $showCustomCoverPicker, selection: $selectedCoverPhotoItem, matching: .images)
         .onChange(of: selectedCoverPhotoItem) { _, newItem in
             guard let newItem else { return }
@@ -1194,6 +1207,12 @@ public struct TrackRowView: View {
         }
 
         Divider()
+
+        Button {
+            showTrimSheet = true
+        } label: {
+            Label("Изменить длину / Обрезать песню…", systemImage: "scissors")
+        }
 
         Button {
             showCustomCoverPicker = true
@@ -1234,12 +1253,23 @@ public struct TrackRowView: View {
         }
 
         Button {
-            OfflineDownloadManager.shared.enqueueDownload(for: track)
+            if OfflineDownloadManager.shared.isDownloaded(track) {
+                Task {
+                    await OfflineDownloadManager.shared.syncOfflineLyricsForTrack(track)
+                }
+            } else {
+                OfflineDownloadManager.shared.enqueueDownload(for: track)
+            }
         } label: {
             let downloaded = OfflineDownloadManager.shared.isDownloaded(track)
+            let needsLyricsUpdate = downloaded && OfflineDownloadManager.shared.hasLyricsUpdateAvailable(for: track)
             Label(
-                downloaded ? "Downloaded Offline ✓" : "Download Offline",
-                systemImage: downloaded ? "checkmark.circle.fill" : "arrow.down.circle"
+                needsLyricsUpdate
+                    ? "Докачать обновлённую лирику"
+                    : (downloaded ? "Обновить офлайн-лирику ✓" : "Download Offline"),
+                systemImage: needsLyricsUpdate
+                    ? "arrow.down.circle.fill"
+                    : (downloaded ? "checkmark.circle.fill" : "arrow.down.circle")
             )
         }
 

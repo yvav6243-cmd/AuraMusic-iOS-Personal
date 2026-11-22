@@ -2910,4 +2910,314 @@ final class AuraMusicCoreTests: XCTestCase {
         XCTAssertEqual(preserved.word, "лето")
         XCTAssertEqual(preserved.confidence, 0.91, accuracy: 0.001)
     }
+
+    // MARK: - Badge Layout, Song Trim/Cut Settings, Ad-Free Offline Teardown, Video-ID Ad Catcher & Pure Audio AI Subtitles Tests
+
+    func testProviderBadgeAndCapabilityShortPillLabelsStayCompactSingleLine() {
+        XCTAssertEqual(PlaybackCapability.offlineFile.shortPillLabel, "OFFLINE")
+        XCTAssertEqual(PlaybackCapability.preview30s.shortPillLabel, "30S")
+        XCTAssertNil(PlaybackCapability.directFullAudio.shortPillLabel, "Full Track redundant suffix must be omitted so pills stay compact & single-line")
+        XCTAssertNil(PlaybackCapability.embeddedVideo.shortPillLabel)
+
+        XCTAssertEqual(ProviderBadgePill.formattedLabel(provider: .youtubeMusic, capability: .directFullAudio), "YT MUSIC")
+        XCTAssertEqual(ProviderBadgePill.formattedLabel(provider: .youtubeMusic, capability: .offlineFile), "YT MUSIC • OFFLINE")
+        XCTAssertEqual(ProviderBadgePill.formattedLabel(provider: .appleMusic, capability: .preview30s), "APPLE MUSIC • 30S")
+    }
+
+    @MainActor
+    func testTrackTrimRangeNormalizationValidationPersistenceAndPlayerEnforcement() {
+        // 1. Normalization & minimum 5s segment enforcement
+        let invalidTooShort = TrackTrimRange(startSeconds: 50.0, endSeconds: 52.0).normalized(for: 200.0)
+        XCTAssertEqual(invalidTooShort.startSeconds, 50.0, accuracy: 0.01)
+        XCTAssertEqual(invalidTooShort.endSeconds ?? 0, 55.0, accuracy: 0.01, "Minimum segment length of 5s must be enforced")
+        XCTAssertEqual(invalidTooShort.effectiveDuration(for: 200.0), 5.0, accuracy: 0.01)
+
+        let fullSong = TrackTrimRange(startSeconds: 0.0, endSeconds: 199.8).normalized(for: 200.0)
+        XCTAssertFalse(fullSong.isEffectivelyTrimmed(for: 200.0))
+
+        let customCut = TrackTrimRange(startSeconds: 15.0, endSeconds: 95.0).normalized(for: 200.0)
+        XCTAssertTrue(customCut.isEffectivelyTrimmed(for: 200.0))
+        XCTAssertEqual(customCut.formattedRange(for: 200.0), "0:15–1:35")
+        XCTAssertEqual(customCut.effectiveDuration(for: 200.0), 80.0, accuracy: 0.01)
+
+        // 2. Persistent storage across provider variants & live player start/end enforcement
+        let persistence = PersistenceController.shared
+        let engine = UniversalAudioPlayerEngine.shared
+        let trimmedTrack = UniversalTrack(
+            provider: .youtubeMusic,
+            providerTrackID: "TRIM_TEST_VID_1",
+            title: "Trimmed Song",
+            artist: "Trim Artist",
+            album: "Single",
+            duration: 200.0,
+            isStreamable: true
+        )
+        let sameTrackAppleVariant = UniversalTrack(
+            provider: .appleMusic,
+            providerTrackID: "am-trim-1",
+            title: "Trimmed Song",
+            artist: "Trim Artist",
+            album: "Single",
+            duration: 200.0
+        )
+        let nextTrack = UniversalTrack(
+            provider: .youtubeMusic,
+            providerTrackID: "TRIM_NEXT_VID_2",
+            title: "Next Song After Trim",
+            artist: "Next Artist",
+            album: "Single",
+            duration: 180.0,
+            isStreamable: true
+        )
+
+        defer {
+            persistence.setTrimRange(nil, for: trimmedTrack)
+            engine.pause()
+            engine.activeYouTubeVideoID = nil
+            engine.clearQueue()
+        }
+
+        persistence.setTrimRange(customCut, for: trimmedTrack)
+        XCTAssertTrue(persistence.hasCustomTrim(for: trimmedTrack))
+        XCTAssertEqual(persistence.trimRange(for: trimmedTrack), customCut)
+        XCTAssertEqual(persistence.trimRange(for: sameTrackAppleVariant), customCut, "Saved trim must persist across provider variants of the same song")
+
+        // Play trimmed track -> must load activeTrackTrimRange & start at 15.0s!
+        engine.play(trimmedTrack, queue: [trimmedTrack, nextTrack])
+        XCTAssertEqual(engine.activeTrackTrimRange, customCut)
+        XCTAssertEqual(engine.currentTime, 15.0, accuracy: 0.25, "Trimmed song MUST start at saved startSeconds")
+
+        // Reaching custom endSeconds (95.0s) MUST immediately finish & advance to the next song in queue!
+        engine.evaluateTrimBoundsIfNeeded(at: 95.0)
+        XCTAssertEqual(engine.currentTrack?.id, nextTrack.id, "Reaching saved trim endSeconds MUST cleanly end the song and skip to next")
+
+        // Resetting trim restores full song
+        persistence.setTrimRange(nil, for: trimmedTrack)
+        XCTAssertFalse(persistence.hasCustomTrim(for: trimmedTrack))
+        XCTAssertNil(persistence.trimRange(for: trimmedTrack))
+    }
+
+    @MainActor
+    func testDownloadedOfflineSongCompletelyUnloadsYouTubeWebKitEngineWithZeroAds() throws {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let dlDir = docs.appendingPathComponent("AuraDownloads", isDirectory: true)
+        try FileManager.default.createDirectory(at: dlDir, withIntermediateDirectories: true)
+        let relPath = "AuraDownloads/offline_no_yt_engine_test.wav"
+        let fullURL = docs.appendingPathComponent(relPath)
+        try UniversalAudioPlayerEngine.buildSubAudibleKeepAliveWAVData().write(to: fullURL, options: .atomic)
+
+        let offlineTrack = UniversalTrack(
+            provider: .youtubeMusic,
+            providerTrackID: "OFFLINE_ZERO_YT_01",
+            title: "Offline No WebKit Song",
+            artist: "Test Artist",
+            album: "Test",
+            duration: 210.0,
+            isStreamable: true
+        )
+        let engine = UniversalAudioPlayerEngine.shared
+        defer {
+            engine.pause()
+            engine.teardownYouTubeWebViewCompletely()
+            OfflineDownloadManager.shared.removeDownload(trackID: offlineTrack.id)
+            try? FileManager.default.removeItem(at: fullURL)
+        }
+
+        // First simulate an active online YouTube WebView session
+        let ytView = AuthorizedYouTubeIFramePlayerView(videoID: "OLD_ONLINE_VID")
+        let coord = ytView.makeCoordinator()
+        let webView = AuthorizedYouTubeIFramePlayerView.makeConfiguredWebView(coordinator: coord)
+        engine.registerYouTubeWebView(webView)
+        engine.activeYouTubeVideoID = "OLD_ONLINE_VID"
+        XCTAssertNotNil(engine.activeYouTubeVideoID)
+
+        // Now register offline download and play it -> MUST completely tear down & unmount YouTube WebKit!
+        OfflineDownloadManager.shared.registerCompletedDownloadForTesting(track: offlineTrack, relativePath: relPath)
+        engine.play(offlineTrack)
+
+        XCTAssertNil(engine.activeYouTubeVideoID, "Downloaded offline track MUST completely unmount YouTube WebKit engine")
+        XCTAssertEqual(engine.playbackStatusBanner, "Offline Audio")
+        XCTAssertTrue(engine.isPlaying)
+    }
+
+    @MainActor
+    func testWebKitAdDetectorCatchesServerSideAdByMismatchedVideoID() async throws {
+        let playerView = AuthorizedYouTubeIFramePlayerView(videoID: "YkY4X_OaF6o")
+        let coordinator = playerView.makeCoordinator()
+        let webView = AuthorizedYouTubeIFramePlayerView.makeConfiguredWebView(coordinator: coordinator)
+        let navWaiter = TestWKNavigationWaiter()
+        webView.navigationDelegate = navWaiter
+        defer {
+            webView.navigationDelegate = nil
+            webView.configuration.userContentController.removeScriptMessageHandler(forName: "auraYT")
+        }
+
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            navWaiter.continuation = cont
+            webView.loadHTMLString(
+                "<!doctype html><html><body><div id='movie_player'></div><video id='v' playsinline></video></body></html>",
+                baseURL: URL(string: "https://m.youtube.com/watch?v=YkY4X_OaF6o")
+            )
+        }
+
+        var ready = false
+        for _ in 0..<15 {
+            if let ok = try? await webView.evaluateJavaScript("typeof window._auraHandleActiveAd === 'function'") as? Bool, ok {
+                ready = true
+                break
+            }
+            try await Task.sleep(nanoseconds: 150_000_000)
+        }
+        XCTAssertTrue(ready)
+
+        // Simulate a CSS-less server-side mobile ad (NO .ad-showing class, just a different video_id!)
+        let adCatchResult = try await webView.evaluateJavaScript("""
+        (function() {
+          var mp = document.getElementById('movie_player');
+          var v = document.getElementById('v');
+          window._auraExpectedVideoID = 'YkY4X_OaF6o';
+          mp.getVideoData = function() { return { video_id: 'SECRET_SSAI_AD_123' }; };
+          var caught = window._auraHandleActiveAd(v);
+          var mutedDuringAd = v.hasAttribute('muted');
+          var rateDuringAd = v.playbackRate;
+
+          // Now real song video_id resumes -> must restore normal playback cleanly!
+          mp.getVideoData = function() { return { video_id: 'YkY4X_OaF6o' }; };
+          var stillAd = window._auraHandleActiveAd(v);
+          return {
+            caught: caught === true,
+            mutedDuringAd: mutedDuringAd === true,
+            rateDuringAd: rateDuringAd,
+            stillAd: stillAd === true,
+            restoredRate: v.playbackRate
+          };
+        })()
+        """) as? [String: Any]
+
+        XCTAssertEqual(adCatchResult?["caught"] as? Bool, true, "Ad detector MUST catch CSS-less ad playing with a different video_id")
+        XCTAssertEqual(adCatchResult?["mutedDuringAd"] as? Bool, true, "Mismatched ad video MUST be muted immediately")
+        XCTAssertEqual(adCatchResult?["rateDuringAd"] as? Double ?? 0, 16.0, accuracy: 0.1)
+        XCTAssertEqual(adCatchResult?["stillAd"] as? Bool, false)
+        XCTAssertEqual(adCatchResult?["restoredRate"] as? Double ?? 0, 1.0, accuracy: 0.1)
+    }
+
+    func testAISubtitleGeneratorCreatesCleanYouTubeStyleSubtitlesPurelyFromAudioTokensAndBreathValleys() {
+        // 10 continuous words with a breath-valley energy dip right between word 5 (t=7.0) and word 6 (t=7.25)
+        let tokens: [AIWordToken] = [
+            AIWordToken(text: "uh", timestamp: 4.5, duration: 0.2, confidence: 0.30, languageCode: "en"),
+            AIWordToken(text: "ночной", timestamp: 5.0, duration: 0.35, confidence: 0.90, languageCode: "ru"),
+            AIWordToken(text: "ветер", timestamp: 5.4, duration: 0.35, confidence: 0.88, languageCode: "ru"),
+            AIWordToken(text: "несёт", timestamp: 5.8, duration: 0.35, confidence: 0.91, languageCode: "ru"),
+            AIWordToken(text: "наши", timestamp: 6.2, duration: 0.35, confidence: 0.87, languageCode: "ru"),
+            AIWordToken(text: "голоса", timestamp: 6.6, duration: 0.40, confidence: 0.93, languageCode: "ru"),
+            // Small 0.25s breath valley dip in vocalRMS at t=7.0..7.25 -> should split cleanly into subtitle line 2!
+            AIWordToken(text: "вверх", timestamp: 7.25, duration: 0.35, confidence: 0.89, languageCode: "ru"),
+            AIWordToken(text: "к", timestamp: 7.65, duration: 0.15, confidence: 0.85, languageCode: "ru"),
+            AIWordToken(text: "ярким", timestamp: 7.85, duration: 0.35, confidence: 0.91, languageCode: "ru"),
+            AIWordToken(text: "звёздам", timestamp: 8.25, duration: 0.45, confidence: 0.94, languageCode: "ru"),
+            // Mid-song pause at 9.2..14.0 -> •••
+            AIWordToken(text: "we", timestamp: 14.2, duration: 0.2, confidence: 0.90, languageCode: "en"),
+            AIWordToken(text: "never", timestamp: 14.45, duration: 0.3, confidence: 0.92, languageCode: "en"),
+            AIWordToken(text: "stop", timestamp: 14.8, duration: 0.35, confidence: 0.94, languageCode: "en")
+        ]
+
+        // 200 RMS frames (20.0s @ 0.1s/frame) with clear vocal breath dip at 7.0..7.2s and silence 0..4.8s & 9.0..14.0s
+        var rms = [Float]()
+        for i in 0..<200 {
+            let t = Double(i) * 0.1
+            if (t >= 5.0 && t < 7.0) || (t >= 7.25 && t <= 8.8) || (t >= 14.2 && t <= 15.5) {
+                rms.append(0.35)
+            } else {
+                rms.append(0.005)
+            }
+        }
+        let pauses = AILyricsTranscriptionEngine.detectPauseIntervals(rmsFrames: rms, frameDuration: 0.1, trackDuration: 20.0)
+
+        let lrc = AILyricsTranscriptionEngine.buildSubtitleStyleLRCFromTokens(
+            tokens: tokens,
+            pauses: pauses,
+            vocalRMSFrames: rms,
+            rmsFrameDuration: 0.1,
+            trackDuration: 20.0
+        )
+        let parsed = LRCParser.parseSyncedLRC(lrc, includeIntroDots: true)
+        let sung = parsed.filter { !$0.isInstrumental }
+
+        XCTAssertTrue(parsed.first?.isInstrumental == true, "Intro silence must render as •••")
+        XCTAssertGreaterThanOrEqual(parsed.filter(\.isInstrumental).count, 2, "Both intro and mid-song vocal pause must render as •••")
+        XCTAssertEqual(sung.count, 3, "Breath valley at t=7.0..7.25 must split verse into 2 crisp subtitle lines + 3rd English line")
+        XCTAssertEqual(sung[0].text, "Ночной ветер несёт наши голоса")
+        XCTAssertEqual(sung[1].text, "Вверх к ярким звёздам")
+        XCTAssertEqual(sung[2].text, "We never stop")
+    }
+
+    @MainActor
+    func testOfflineDownloadDetectsChangedLyricsAndUpdatesOfflineCacheWithoutRedownloadingAudio() async throws {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let dlDir = docs.appendingPathComponent("AuraDownloads", isDirectory: true)
+        try FileManager.default.createDirectory(at: dlDir, withIntermediateDirectories: true)
+        let relPath = "AuraDownloads/lyrics_sync_update_test.wav"
+        let fullURL = docs.appendingPathComponent(relPath)
+        try UniversalAudioPlayerEngine.buildSubAudibleKeepAliveWAVData().write(to: fullURL, options: .atomic)
+
+        let track = UniversalTrack(
+            provider: .youtubeMusic,
+            providerTrackID: "LYRICS_SYNC_TEST_01",
+            title: "Lyrics Update Song",
+            artist: "Sync Artist",
+            album: "Single",
+            duration: 200.0
+        )
+        let manager = OfflineDownloadManager.shared
+        let lyrics = LyricsService.shared
+
+        defer {
+            manager.removeDownload(trackID: track.id)
+            lyrics.setPreferredLyricsMode(.standard, for: track)
+            try? FileManager.default.removeItem(at: fullURL)
+        }
+
+        // 1. Register downloaded track initially without synced AI lyrics
+        manager.registerCompletedDownloadForTesting(track: track, relativePath: relPath, hasLyrics: true)
+        XCTAssertTrue(manager.isDownloaded(track))
+
+        // 2. User generates brand-new AI lyrics & switches song to AI mode -> manager MUST flag update available!
+        _ = lyrics.saveAILyrics(syncedLRC: "[00:05.00]Новые ИИ субтитры\n[00:10.00]Вторая строка", for: track)
+        lyrics.setPreferredLyricsMode(.aiAudio, for: track)
+        XCTAssertTrue(manager.hasLyricsUpdateAvailable(for: track), "Changing lyrics on a downloaded song MUST show 'Докачать обновлённую лирику'")
+
+        // 3. User taps "Докачать обновлённую лирику" -> syncs offline lyrics WITHOUT touching audio file!
+        await manager.syncOfflineLyricsForTrack(track)
+        XCTAssertFalse(manager.hasLyricsUpdateAvailable(for: track), "After syncing offline lyrics, update flag must clear cleanly")
+        XCTAssertEqual(manager.completedLocalRelativePath(for: track), relPath, "Audio file must stay intact without re-downloading")
+    }
+
+    func testVocalClarityDSPPreservesHighFrequencyConsonantsWhileSuppressingSubBass() {
+        let sr = 16_000.0
+        let count = Int(sr * 1.0)
+        var sibilantL = [Float](repeating: 0, count: count)
+        var sibilantR = [Float](repeating: 0, count: count)
+        var bassL = [Float](repeating: 0, count: count)
+        var bassR = [Float](repeating: 0, count: count)
+
+        for i in 0..<count {
+            let t = Double(i) / sr
+            let s = Float(sin(2.0 * Double.pi * 5000.0 * t) * 0.45) // 5 kHz consonant sibilant (S/SH/CH/Щ)
+            sibilantL[i] = s
+            sibilantR[i] = s
+
+            let b = Float(sin(2.0 * Double.pi * 55.0 * t) * 0.80) // 55 Hz 808 sub-bass
+            bassL[i] = b
+            bassR[i] = b
+        }
+
+        let sibOut = VocalIsolationDSP.processStereoForVocals(left: sibilantL, right: sibilantR, sampleRate: sr).vocalIsolated
+        let bassOut = VocalIsolationDSP.processStereoForVocals(left: bassL, right: bassR, sampleRate: sr).vocalIsolated
+
+        let sibRMS = AILyricsTranscriptionEngine.computeRMSEnvelope(samples: sibOut, sampleRate: sr).reduce(0, +)
+        let bassRMS = AILyricsTranscriptionEngine.computeRMSEnvelope(samples: bassOut, sampleRate: sr).reduce(0, +)
+
+        XCTAssertGreaterThan(sibRMS, 0.5, "7200 Hz low-pass must preserve 5 kHz vocal sibilants so words stay sharp & recognizable")
+        XCTAssertLessThan(bassRMS, sibRMS * 0.35, "4th-order 140 Hz high-pass must suppress 55 Hz 808 sub-bass cleanly")
+    }
 }

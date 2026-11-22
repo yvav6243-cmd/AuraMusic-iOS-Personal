@@ -133,11 +133,11 @@ public enum VocalIsolationDSP {
         return out
     }
 
-    /// Isolates human lead vocals from full-mix stereo music in < 0.25s:
-    /// 1) Adaptive Mid/Side stereo suppression removes panned synths, guitars & reverb while keeping center vocals.
-    /// 2) 190 Hz High-Pass + 3800 Hz Low-Pass removes 808 sub-bass, kick thump & hi-hat hiss.
-    /// 3) +4.5 dB presence boost @ 2200 Hz sharpens consonants for Apple Speech Recognition.
-    /// 4) Smooth AGC normalization brings quiet verses & loud choruses to uniform studio speech loudness.
+    /// Isolates human lead vocals from full-mix stereo music in < 0.25s while keeping natural sibilants (140–7200 Hz):
+    /// 1) Gentle Mid/Side center focus suppresses wide stereo synths/guitars without hollowing stereo-doubled vocals.
+    /// 2) 4th-order 140 Hz High-Pass + 7200 Hz Low-Pass strips 808 sub-bass & kick thump while preserving crisp S/SH/CH/T consonants.
+    /// 3) +3.5 dB vocal clarity peaking EQ @ 2400 Hz sharpens diction for Apple Speech Recognition.
+    /// 4) Noise-gated smooth AGC levels quiet verses & loud choruses without boosting silent pauses.
     public static func processStereoForVocals(
         left: [Float],
         right: [Float],
@@ -147,11 +147,11 @@ public enum VocalIsolationDSP {
         guard count > 0 else { return ([], []) }
 
         let sr = Float(sampleRate)
-        let hp = highPassCoeffs(cutoffHz: 220.0, sampleRate: sr)
-        let lp = lowPassCoeffs(cutoffHz: 3800.0, sampleRate: sr)
-        let presence = peakingEQCoeffs(centerHz: 2200.0, sampleRate: sr, gainDB: 4.5, q: 1.1)
+        let hp = highPassCoeffs(cutoffHz: 140.0, sampleRate: sr)
+        let lp = lowPassCoeffs(cutoffHz: min(7200.0, sr * 0.45), sampleRate: sr)
+        let presence = peakingEQCoeffs(centerHz: 2400.0, sampleRate: sr, gainDB: 3.5, q: 1.0)
 
-        // Stage 1: Mid / Side decomposition + adaptive stereo instrument suppression
+        // Stage 1: Mid / Side decomposition + gentle stereo instrument suppression
         var mid = [Float](repeating: 0, count: count)
         var side = [Float](repeating: 0, count: count)
         var sideEnergyTotal: Double = 0
@@ -163,8 +163,7 @@ public enum VocalIsolationDSP {
             sideEnergyTotal += Double(s * s)
         }
 
-        // 4th-order (-24 dB/oct) High-Pass @ 220 Hz + Low-Pass @ 3800 Hz + Presence EQ @ 2200 Hz
-        // Eliminates 808 sub-bass & kick rumble by >40 dB so instrumental bass drops never fool Speech AI or pause detection!
+        // 4th-order (-24 dB/oct) High-Pass @ 140 Hz + 7200 Hz Low-Pass + Clarity EQ @ 2400 Hz
         let midHP = applyBiquad(applyBiquad(mid, coeffs: hp), coeffs: hp)
         let midBand = applyBiquad(applyBiquad(midHP, coeffs: lp), coeffs: presence)
         let isTrueStereo = (sideEnergyTotal / Double(count)) > 1e-6
@@ -186,9 +185,9 @@ public enum VocalIsolationDSP {
                     mSum += midBand[i] * midBand[i]
                     sSum += sideBand[i] * sideBand[i]
                 }
-                // Wiener center-voice mask: suppresses frames dominated by wide stereo instruments
-                let rawGain = mSum / (mSum + 1.45 * sSum + 1e-9)
-                frameGains[f] = max(0.16, min(1.0, rawGain))
+                // Gentle center-focus Wiener mask (floor 0.42 keeps stereo-doubled chorus vocals natural while cutting side guitars/synths!)
+                let rawGain = mSum / (mSum + 0.85 * sSum + 1e-9)
+                frameGains[f] = max(0.42, min(1.0, rawGain))
             }
 
             // Smooth gain envelope to prevent clicks between 20ms frames
@@ -431,13 +430,13 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
         guard authStatus == .authorized else {
             failPipeline(
                 for: track,
-                message: "Разрешите «Распознавание речи» в Настройках iOS → AuraMusic, чтобы ИИ мог слушать песни и писать лирику."
+                message: "Разрешите «Распознавание речи» в Настройках iOS → AuraMusic, чтобы ИИ мог слушать песни и создавать субтитры."
             )
             return
         }
 
-        // Launch optional reference vocabulary lookup IN PARALLEL with audio acquisition (never stalls Pass 1!)
-        async let referenceTask = LyricsService.shared.fetchReferenceLyricsForAI(for: track, timeoutSeconds: 3.2)
+        // PURE AUDIO-CREATED SUBTITLES (Zero database lookup — creates lyrics directly from song audio like YouTube Auto-Captions, only cleaner!)
+        let contextualWords = Self.buildContextualStrings(track: track, referenceLines: [])
 
         // 0.5 Acquire local audio file (instant if downloaded offline; fast ANDROID itag=18 ~1.5s otherwise)
         let audioAcquireDeadline = min(hardDeadline, startDate.addingTimeInterval(7.0))
@@ -457,7 +456,7 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
         guard !Task.isCancelled else { return }
 
         // =========================================================================
-        // PASS 1 / 10 — Vocal Isolation DSP, Vocal-Band Pauses & Language Race
+        // PASS 1 / 10 — Natural Vocal Clarity DSP (140-7200Hz), Vocal Pauses & Sequential Language Detection
         // =========================================================================
         updatePass(1, progress: 0.07, primaryLang: nil, secondaryLang: nil, pauseCount: 0, foreignCount: 0)
 
@@ -467,13 +466,7 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
         }
         guard !Task.isCancelled else { return }
 
-        let referenceData = await referenceTask
-        let referencePlainLines = referenceData?.plainLines ?? []
-        let referenceSyncedLines = referenceData?.syncedLines ?? []
-        let contextualWords = Self.buildContextualStrings(track: track, referenceLines: referencePlainLines)
-
         let trackDuration = max(processed.duration, track.duration > 5 ? track.duration : processed.duration)
-        // Compute RMS on the VOCAL-ISOLATED band (190-3800 Hz) so drum/bass-only breaks are accurately detected as pauses!
         let vocalRMS = Self.computeRMSEnvelope(samples: processed.vocalIsolated, sampleRate: Self.targetSampleRate, frameDuration: 0.1)
         let detectedPauses = Self.detectPauseIntervals(
             rmsFrames: vocalRMS,
@@ -481,13 +474,9 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
             trackDuration: trackDuration
         )
 
-        let referenceSample = referencePlainLines.prefix(12).joined(separator: " ")
-        var (primaryLocale, secondaryLocale) = Self.inferCandidateLocales(
-            for: track,
-            detectedSampleText: referenceSample.isEmpty ? nil : referenceSample
-        )
+        var (primaryLocale, secondaryLocale) = Self.inferCandidateLocales(for: track, detectedSampleText: nil)
 
-        // Probe first strong vocal window (~18s right after intro pause) racing BOTH candidate languages in parallel!
+        // Probe first strong vocal window sequentially (1 active Apple Speech request at a time so iOS assistantd NEVER rate-limits!)
         let vocalSpan = Self.detectVocalActiveSpan(
             rmsFrames: vocalRMS,
             frameDuration: 0.1,
@@ -495,54 +484,43 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
         )
         let introEnd = max(vocalSpan.start, detectedPauses.first(where: { $0.start <= 1.2 })?.end ?? 0.0)
         let probeStart = min(max(0, introEnd), max(0, trackDuration - 12.0))
-        let probeEnd = min(vocalSpan.end, probeStart + 18.0)
+        let probeEnd = min(vocalSpan.end, probeStart + 20.0)
 
         var pass1Tokens: [AIWordToken] = []
-        let pass1Timeout = Self.computePassTimeout(hardDeadline: hardDeadline, preferred: 3.4, reserveForLater: 11.0)
+        let pass1Timeout = Self.computePassTimeout(hardDeadline: hardDeadline, preferred: 3.2, reserveForLater: 12.0)
         if pass1Timeout >= 1.0 {
             let (candA, candB) = (primaryLocale, secondaryLocale)
-            let probeResults = await withTaskGroup(of: (Locale, [AIWordToken]).self) { group -> [(Locale, [AIWordToken])] in
-                group.addTask {
-                    let toks = await Self.recognizeSegment(
-                        samples: processed.vocalIsolated,
-                        sampleRate: Self.targetSampleRate,
-                        startTime: probeStart,
-                        endTime: probeEnd,
-                        locale: candA,
-                        contextualStrings: contextualWords,
-                        timeoutSeconds: pass1Timeout
-                    )
-                    return (candA, toks)
-                }
-                // If reference lyrics didn't already definitively confirm the script, race secondaryLocale in parallel!
-                if referenceSample.isEmpty && candA.identifier != candB.identifier {
-                    group.addTask {
-                        let toks = await Self.recognizeSegment(
-                            samples: processed.vocalIsolated,
-                            sampleRate: Self.targetSampleRate,
-                            startTime: probeStart,
-                            endTime: probeEnd,
-                            locale: candB,
-                            contextualStrings: contextualWords,
-                            timeoutSeconds: pass1Timeout
-                        )
-                        return (candB, toks)
-                    }
-                }
-                var out: [(Locale, [AIWordToken])] = []
-                for await pair in group { out.append(pair) }
-                return out
-            }
+            let tokensA = await Self.recognizeSegment(
+                samples: processed.vocalIsolated,
+                sampleRate: Self.targetSampleRate,
+                startTime: probeStart,
+                endTime: probeEnd,
+                locale: candA,
+                contextualStrings: contextualWords,
+                timeoutSeconds: pass1Timeout
+            )
+            let scoreA = Self.scoreLanguageProbe(tokensA)
+            pass1Tokens = tokensA
 
-            if let winner = probeResults.max(by: { Self.scoreLanguageProbe($0.1) < Self.scoreLanguageProbe($1.1) }) {
-                pass1Tokens = winner.1
-                let bestScore = Self.scoreLanguageProbe(winner.1)
-                if referenceSample.isEmpty && bestScore > 0.8 {
-                    primaryLocale = winner.0
-                    secondaryLocale = (winner.0.identifier == candA.identifier) ? candB : candA
-                } else if referenceSample.isEmpty && bestScore < 0.6 && !candA.identifier.hasPrefix("zh") && !candB.identifier.hasPrefix("zh") {
-                    // 3rd-language rescue for Chinese songs with Romanized/English titles (e.g. "Sunny Day", "Mojito")
-                    let zhBudget = Self.computePassTimeout(hardDeadline: hardDeadline, preferred: 1.8, reserveForLater: 10.5)
+            // If primary guess isn't decisively confident yet, sequentially probe secondaryLocale (zero concurrent Apple Speech throttling!)
+            let altTimeout = Self.computePassTimeout(hardDeadline: hardDeadline, preferred: 2.6, reserveForLater: 11.0)
+            if scoreA < 6.0 && candA.identifier != candB.identifier && altTimeout >= 1.0 {
+                let tokensB = await Self.recognizeSegment(
+                    samples: processed.vocalIsolated,
+                    sampleRate: Self.targetSampleRate,
+                    startTime: probeStart,
+                    endTime: probeEnd,
+                    locale: candB,
+                    contextualStrings: contextualWords,
+                    timeoutSeconds: altTimeout
+                )
+                let scoreB = Self.scoreLanguageProbe(tokensB)
+                if scoreB > scoreA + 0.4 {
+                    pass1Tokens = tokensB
+                    primaryLocale = candB
+                    secondaryLocale = candA
+                } else if max(scoreA, scoreB) < 0.7 && !candA.identifier.hasPrefix("zh") && !candB.identifier.hasPrefix("zh") {
+                    let zhBudget = Self.computePassTimeout(hardDeadline: hardDeadline, preferred: 2.0, reserveForLater: 10.5)
                     if zhBudget >= 0.9 {
                         let zhLocale = Locale(identifier: "zh-CN")
                         let zhToks = await Self.recognizeSegment(
@@ -554,7 +532,7 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
                             contextualStrings: contextualWords,
                             timeoutSeconds: zhBudget
                         )
-                        if Self.scoreLanguageProbe(zhToks) > bestScore + 0.4 {
+                        if Self.scoreLanguageProbe(zhToks) > max(scoreA, scoreB) + 0.4 {
                             pass1Tokens = zhToks
                             primaryLocale = zhLocale
                             secondaryLocale = Locale(identifier: "en-US")
@@ -570,18 +548,17 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
         state.detectedPrimaryLanguage = primaryLangName
         state.detectedSecondaryLanguage = secondaryLangName
         state.detectedPauseCount = detectedPauses.count
-        state.progress = 0.13
+        state.progress = 0.14
 
-        // Build 100% CONTIGUOUS vocal-span chunks (~24s each, 1.5s overlap), trimming silent MV credits outros to save budget!
+        // Build 100% CONTIGUOUS vocal-span chunks (~44s each, 1.5s overlap -> only 3–4 clean sequential Apple Speech requests for a whole song!)
         let vocalStart = min(introEnd, max(0, trackDuration - 10.0))
         let vocalEnd = max(vocalStart + 5.0, min(trackDuration, vocalSpan.end))
         let allChunks = Self.buildContiguousListeningChunks(
             start: vocalStart,
             end: vocalEnd,
-            chunkLength: 24.0,
+            chunkLength: 44.0,
             overlap: 1.5
         )
-        // Distribute all chunks evenly across Passes 2, 3, 4, 5 (running 2 chunks in parallel per pass!)
         let chunkBatches = Self.partitionChunks(allChunks, intoBatches: 4)
 
         var collectedPasses: [[AIWordToken]] = []
@@ -590,13 +567,13 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
         }
 
         // =========================================================================
-        // PASSES 2, 3, 4, 5 / 10 — 100% Full-Song Contiguous Parallel Listening
+        // PASSES 2, 3, 4, 5 / 10 — 100% Full-Song Sequential Non-Throttled Subtitle Transcription
         // =========================================================================
         var fullSongPrimaryTokens: [AIWordToken] = []
         for batchIdx in 0..<4 {
             guard !Task.isCancelled else { return }
             let passNumber = batchIdx + 2 // 2, 3, 4, 5
-            let targetProgress = 0.14 + Double(batchIdx + 1) * 0.12 // -> 0.26, 0.38, 0.50, 0.62
+            let targetProgress = 0.14 + Double(batchIdx + 1) * 0.12
             updatePass(
                 passNumber,
                 progress: targetProgress - 0.06,
@@ -606,20 +583,22 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
                 foreignCount: state.detectedForeignWordCount
             )
             let batch = chunkBatches[batchIdx]
-            if !batch.isEmpty {
+            for chunk in batch {
+                guard !Task.isCancelled else { return }
                 let remainingBatchesAfter = Double(3 - batchIdx)
-                let reserve = remainingBatchesAfter * 2.6 + 4.8
-                let timeout = Self.computePassTimeout(hardDeadline: hardDeadline, preferred: 4.4, reserveForLater: reserve)
+                let reserve = remainingBatchesAfter * 2.5 + 4.0
+                let timeout = Self.computePassTimeout(hardDeadline: hardDeadline, preferred: 5.5, reserveForLater: reserve)
                 if timeout >= 1.0 {
-                    let batchTokens = await Self.recognizeChunksInParallel(
-                        chunks: batch,
+                    let segTokens = await Self.recognizeSegment(
                         samples: processed.vocalIsolated,
                         sampleRate: Self.targetSampleRate,
+                        startTime: chunk.start,
+                        endTime: chunk.end,
                         locale: primaryLocale,
                         contextualStrings: contextualWords,
-                        timeoutPerChunk: timeout
+                        timeoutSeconds: timeout
                     )
-                    fullSongPrimaryTokens.append(contentsOf: batchTokens)
+                    fullSongPrimaryTokens.append(contentsOf: segTokens)
                 }
             }
             state.progress = max(state.progress, targetProgress)
@@ -632,7 +611,7 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
         var workingTokens = Self.reconcileMultiPassTokens(passes: collectedPasses)
 
         // =========================================================================
-        // PASS 6 / 10 — Parallel Foreign-Language Code-Switching Re-Listening
+        // PASS 6 / 10 — Sequential Foreign-Language Code-Switching Re-Listening
         // =========================================================================
         updatePass(
             6,
@@ -648,16 +627,23 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
             vocalEnd: vocalEnd,
             maxWindows: 2
         )
-        let foreignTimeout = Self.computePassTimeout(hardDeadline: hardDeadline, preferred: 3.4, reserveForLater: 3.4)
-        if !uncertainWindows.isEmpty && foreignTimeout >= 1.0 {
-            let secondaryTokens = await Self.recognizeChunksInParallel(
-                chunks: uncertainWindows,
+        var secondaryTokens: [AIWordToken] = []
+        for win in uncertainWindows {
+            guard !Task.isCancelled else { return }
+            let foreignTimeout = Self.computePassTimeout(hardDeadline: hardDeadline, preferred: 2.8, reserveForLater: 3.0)
+            guard foreignTimeout >= 1.0 else { break }
+            let toks = await Self.recognizeSegment(
                 samples: processed.vocalIsolated,
                 sampleRate: Self.targetSampleRate,
+                startTime: win.start,
+                endTime: win.end,
                 locale: secondaryLocale,
                 contextualStrings: contextualWords,
-                timeoutPerChunk: foreignTimeout
+                timeoutSeconds: foreignTimeout
             )
+            secondaryTokens.append(contentsOf: toks)
+        }
+        if !secondaryTokens.isEmpty {
             let mergedForeign = Self.mergeForeignLanguageTokens(
                 primaryTokens: workingTokens,
                 secondaryTokens: secondaryTokens
@@ -668,7 +654,7 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
         state.progress = max(state.progress, 0.72)
 
         // =========================================================================
-        // PASS 7 / 10 — Alternate Vocal-Filter Re-Listening (Stereo-Doubled / Loud Chorus Recovery)
+        // PASS 7 / 10 — Natural Clean-Mid Recovery Pass on Weakest Chorus / Unrecognized Gap
         // =========================================================================
         guard !Task.isCancelled else { return }
         updatePass(
@@ -679,16 +665,16 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
             pauseCount: detectedPauses.count,
             foreignCount: state.detectedForeignWordCount
         )
-        let altTimeout = Self.computePassTimeout(hardDeadline: hardDeadline, preferred: 3.0, reserveForLater: 1.6)
-        let recoveryWindows = uncertainWindows.isEmpty ? Array(allChunks.prefix(2)) : uncertainWindows
-        if !recoveryWindows.isEmpty && altTimeout >= 1.0 {
-            let altTokens = await Self.recognizeChunksInParallel(
-                chunks: Array(recoveryWindows.prefix(2)),
-                samples: processed.cleanMid, // Bandpass + Presence EQ WITHOUT aggressive stereo Mid/Side cut!
+        let altTimeout = Self.computePassTimeout(hardDeadline: hardDeadline, preferred: 3.2, reserveForLater: 1.4)
+        if let recoveryWin = uncertainWindows.first ?? allChunks.first, altTimeout >= 1.0 {
+            let altTokens = await Self.recognizeSegment(
+                samples: processed.cleanMid,
                 sampleRate: Self.targetSampleRate,
+                startTime: recoveryWin.start,
+                endTime: recoveryWin.end,
                 locale: primaryLocale,
                 contextualStrings: contextualWords,
-                timeoutPerChunk: altTimeout
+                timeoutSeconds: altTimeout
             )
             if !altTokens.isEmpty {
                 workingTokens = Self.reconcileMultiPassTokens(passes: [workingTokens, altTokens])
@@ -709,13 +695,13 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
             foreignCount: state.detectedForeignWordCount
         )
         workingTokens = Self.filterNoiseTokens(Self.reconcileMultiPassTokens(passes: [workingTokens]))
-        if hardDeadline.timeIntervalSinceNow > 1.0 {
-            try? await Task.sleep(nanoseconds: 110_000_000)
+        if hardDeadline.timeIntervalSinceNow > 0.9 {
+            try? await Task.sleep(nanoseconds: 100_000_000)
         }
         state.progress = max(state.progress, 0.89)
 
         // =========================================================================
-        // PASS 9 / 10 — Audio-Anchored Text Verification & Vocal Pause Alignment (•••)
+        // PASS 9 / 10 — YouTube-Subtitles-Plus Breath-Valley Phrasing & Vocal Pause Alignment (•••)
         // =========================================================================
         guard !Task.isCancelled else { return }
         updatePass(
@@ -726,24 +712,15 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
             pauseCount: detectedPauses.count,
             foreignCount: state.detectedForeignWordCount
         )
-        let syncedLRC: String
-        if !referencePlainLines.isEmpty {
-            syncedLRC = Self.alignReferenceLinesToAudioTokens(
-                referenceLines: referencePlainLines,
-                referenceSyncedLines: referenceSyncedLines,
-                audioTokens: workingTokens,
-                pauses: detectedPauses,
-                trackDuration: trackDuration
-            )
-        } else {
-            syncedLRC = Self.buildSyncedLRCFromTokens(
-                tokens: workingTokens,
-                pauses: detectedPauses,
-                trackDuration: trackDuration
-            )
-        }
-        if hardDeadline.timeIntervalSinceNow > 0.7 {
-            try? await Task.sleep(nanoseconds: 110_000_000)
+        let syncedLRC = Self.buildSubtitleStyleLRCFromTokens(
+            tokens: workingTokens,
+            pauses: detectedPauses,
+            vocalRMSFrames: vocalRMS,
+            rmsFrameDuration: 0.1,
+            trackDuration: trackDuration
+        )
+        if hardDeadline.timeIntervalSinceNow > 0.6 {
+            try? await Task.sleep(nanoseconds: 100_000_000)
         }
         state.progress = max(state.progress, 0.96)
 
@@ -760,7 +737,7 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
             foreignCount: state.detectedForeignWordCount
         )
         if hardDeadline.timeIntervalSinceNow > 0.4 {
-            try? await Task.sleep(nanoseconds: 100_000_000)
+            try? await Task.sleep(nanoseconds: 90_000_000)
         }
 
         let parsedCheck = LRCParser.parseSyncedLRC(syncedLRC, includeIntroDots: true)
@@ -770,6 +747,7 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
            let doc = LyricsService.shared.saveAILyrics(syncedLRC: syncedLRC, for: track) {
             LyricsService.shared.setActiveAIDocument(doc)
             LyricsService.shared.setPreferredLyricsMode(.aiAudio, for: track)
+            OfflineDownloadManager.shared.notifyLyricsChanged(for: track)
             state.isRunning = false
             state.currentPass = Self.totalRequiredPasses
             state.progress = 1.0
@@ -777,11 +755,11 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
             state.completedTrackID = track.id
             state.errorMessage = nil
             state.stageTitle = "Готово (10/10)"
-            state.stageDetail = "Синхронизировано строк: \(sungLinesCount) • Пауз: \(detectedPauses.count)"
+            state.stageDetail = "Создано субтитров: \(sungLinesCount) строк • Пауз: \(detectedPauses.count)"
         } else {
             failPipeline(
                 for: track,
-                message: "ИИ прослушал песню 10 раз с вокальной очисткой, но не нашёл чёткого вокала (возможно, это инструментал). Попробуйте режим «База»."
+                message: "ИИ прослушал песню 10 раз, но вокал не удалось разобрать (возможно, это инструментал или сильные эффекты на голосе)."
             )
         }
     }
@@ -1106,19 +1084,25 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
             return []
         }
 
-        // Prefer Apple's full cloud acoustic model first (vastly superior on singing over music!),
-        // automatically falling back to on-device recognition when offline or if cloud returns empty!
-        let primaryAttempt = await runSingleSpeechRequest(
+        // Prefer Apple Silicon On-Device Neural Engine first when available (5–10x realtime, ZERO server throttling!),
+        // automatically falling back to Apple's cloud Speech model if on-device isn't downloaded or returned empty!
+        let preferOnDevice = recognizer.supportsOnDeviceRecognition
+        let firstAttempt = await runSingleSpeechRequest(
             recognizer: recognizer,
             wavURL: wavURL,
             startTime: startTime,
             locale: locale,
             contextualStrings: contextualStrings,
-            requireOnDevice: false,
+            requireOnDevice: preferOnDevice,
             timeoutSeconds: timeoutSeconds
         )
-        if !primaryAttempt.isEmpty || !recognizer.supportsOnDeviceRecognition {
-            return primaryAttempt
+        if !firstAttempt.isEmpty {
+            return firstAttempt
+        }
+        // Fallback to the opposite engine (cloud if on-device returned empty, or on-device if cloud failed)
+        let fallbackOnDevice = !preferOnDevice
+        if fallbackOnDevice && !recognizer.supportsOnDeviceRecognition {
+            return []
         }
         return await runSingleSpeechRequest(
             recognizer: recognizer,
@@ -1126,8 +1110,8 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
             startTime: startTime,
             locale: locale,
             contextualStrings: contextualStrings,
-            requireOnDevice: true,
-            timeoutSeconds: min(2.2, timeoutSeconds)
+            requireOnDevice: fallbackOnDevice,
+            timeoutSeconds: min(3.0, timeoutSeconds)
         )
     }
 
@@ -1916,6 +1900,123 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
             joined = first.uppercased() + joined.dropFirst()
         }
         return joined
+    }
+
+    /// YouTube-Auto-Captions-Plus Subtitle Builder: creates crisp, singable subtitle lines purely from audio-heard tokens,
+    /// splitting on natural pause gaps AND acoustic vocal-RMS breath valleys (`vocalRMSFrames`) while inserting `•••` pauses.
+    public nonisolated static func buildSubtitleStyleLRCFromTokens(
+        tokens: [AIWordToken],
+        pauses: [AIPauseInterval],
+        vocalRMSFrames: [Float],
+        rmsFrameDuration: TimeInterval = 0.1,
+        trackDuration: TimeInterval
+    ) -> String {
+        let sortedTokens = tokens
+            .filter {
+                let c = $0.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                return !c.isEmpty && !speechFillerWords.contains(c.lowercased())
+            }
+            .sorted { $0.timestamp < $1.timestamp }
+        guard !sortedTokens.isEmpty else { return "" }
+
+        let sortedPauses = pauses.sorted { $0.start < $1.start }
+
+        // Compute vocal energy reference so we can detect breath-valley dips between words in fast rap/pop verses
+        let sortedRMS = vocalRMSFrames.sorted()
+        let valleyThreshold: Float = sortedRMS.isEmpty
+            ? 0
+            : sortedRMS[Int(Double(sortedRMS.count - 1) * 0.35)]
+
+        func hasBreathValleyBetween(_ t1: TimeInterval, _ t2: TimeInterval) -> Bool {
+            guard !vocalRMSFrames.isEmpty, rmsFrameDuration > 0, t2 > t1 else { return false }
+            let f1 = max(0, min(vocalRMSFrames.count - 1, Int(t1 / rmsFrameDuration)))
+            let f2 = max(f1, min(vocalRMSFrames.count - 1, Int(t2 / rmsFrameDuration)))
+            for f in f1...f2 {
+                if vocalRMSFrames[f] <= valleyThreshold {
+                    return true
+                }
+            }
+            return false
+        }
+
+        struct BuiltLine {
+            let timestamp: TimeInterval
+            var text: String
+            let isInstrumental: Bool
+        }
+
+        var lines: [BuiltLine] = []
+        let firstVocalTime = sortedTokens[0].timestamp
+        if firstVocalTime >= 2.4 || sortedPauses.contains(where: { $0.start <= 1.0 && $0.duration >= 2.4 }) {
+            lines.append(BuiltLine(timestamp: 0.0, text: "•••", isInstrumental: true))
+        }
+
+        var currentWords: [AIWordToken] = []
+        var lineStartTime: TimeInterval = sortedTokens[0].timestamp
+
+        func flushCurrentLine() {
+            guard !currentWords.isEmpty else { return }
+            let joined = Self.polishSungLyricLine(Self.joinTokensForDisplay(currentWords))
+            if !joined.isEmpty {
+                if joined.count <= 3 && !containsCJK(joined),
+                   let lastIdx = lines.indices.last,
+                   !lines[lastIdx].isInstrumental,
+                   lines[lastIdx].text.count <= 32,
+                   (lineStartTime - lines[lastIdx].timestamp) <= 3.2 {
+                    lines[lastIdx].text += " " + joined.lowercased()
+                } else {
+                    lines.append(BuiltLine(timestamp: lineStartTime, text: joined, isInstrumental: false))
+                }
+            }
+            currentWords.removeAll(keepingCapacity: true)
+        }
+
+        for token in sortedTokens {
+            if let prev = currentWords.last {
+                let prevEnd = prev.timestamp + prev.duration
+                let gap = token.timestamp - prevEnd
+                let hasPauseBetween = sortedPauses.contains { p in
+                    p.duration >= 2.4 && p.start >= prev.timestamp && p.start < token.timestamp
+                }
+                let currentCharCount = currentWords.reduce(0) { $0 + $1.text.count + 1 }
+                let isCJKLine = currentWords.contains { Self.containsCJK($0.text) }
+                let idealWords = isCJKLine ? 8 : 5
+                let maxWords = isCJKLine ? 12 : 7
+                let maxChars = isCJKLine ? 16 : 36
+                let breathBreak = (currentWords.count >= idealWords) && (gap >= 0.18 || hasBreathValleyBetween(prevEnd, token.timestamp))
+
+                if hasPauseBetween || gap >= 0.45 || breathBreak || currentWords.count >= maxWords || currentCharCount >= maxChars {
+                    flushCurrentLine()
+                    if let matchingPause = sortedPauses.first(where: { p in
+                        p.duration >= 2.6 && p.start >= prevEnd - 0.3 && p.end <= token.timestamp + 0.5
+                    }) {
+                        let dotStart = max(prevEnd + 0.35, matchingPause.start)
+                        if dotStart < token.timestamp - 1.2 {
+                            lines.append(BuiltLine(timestamp: dotStart, text: "•••", isInstrumental: true))
+                        }
+                    } else if gap >= 3.8 {
+                        let dotStart = prevEnd + 0.4
+                        if dotStart < token.timestamp - 1.2 {
+                            lines.append(BuiltLine(timestamp: dotStart, text: "•••", isInstrumental: true))
+                        }
+                    }
+                    lineStartTime = token.timestamp
+                }
+            } else {
+                lineStartTime = token.timestamp
+            }
+            currentWords.append(token)
+        }
+        flushCurrentLine()
+
+        var lrcOutput: [String] = []
+        var lastTS: TimeInterval = -0.05
+        for line in lines {
+            let safeTS = max(line.timestamp, lastTS + 0.05)
+            lastTS = safeTS
+            lrcOutput.append("\(Self.formatLRCTimestamp(safeTS))\(line.text)")
+        }
+        return lrcOutput.joined(separator: "\n")
     }
 
     public nonisolated static func buildSyncedLRCFromTokens(

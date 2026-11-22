@@ -219,25 +219,85 @@ public struct ProviderBadgePill: View {
         self.capability = capability
     }
 
+    public static func formattedLabel(provider: MusicProviderType, capability: PlaybackCapability?) -> String {
+        if let cap = capability?.shortPillLabel {
+            return "\(provider.shortBadgeName) • \(cap)"
+        }
+        return provider.shortBadgeName
+    }
+
     public var body: some View {
-        HStack(spacing: 4) {
+        HStack(spacing: 3.5) {
             Image(systemName: provider.systemIconName)
-                .font(.system(size: 9, weight: .bold))
-            Text(provider.shortBadgeName)
-                .font(.system(size: 9, weight: .bold, design: .rounded))
-            if let capability {
-                Text("• \(capability.rawValue.uppercased())")
-                    .font(.system(size: 8.5, weight: .semibold, design: .rounded))
-                    .opacity(0.88)
-            }
+                .font(.system(size: 8.5, weight: .bold))
+            Text(Self.formattedLabel(provider: provider, capability: capability))
+                .font(.system(size: 8.5, weight: .bold, design: .rounded))
+                .lineLimit(1)
         }
         .foregroundStyle(provider.badgeColor)
-        .padding(.horizontal, 6.5)
+        .padding(.horizontal, 6)
         .padding(.vertical, 2.5)
         .background(
             Capsule(style: .continuous)
                 .fill(provider.badgeColor.opacity(0.14))
         )
+        .fixedSize(horizontal: true, vertical: false)
+        .layoutPriority(1)
+    }
+}
+
+public struct OfflineStatusBadgePill: View {
+    public var text: String = "OFFLINE"
+
+    public init(text: String = "OFFLINE") {
+        self.text = text
+    }
+
+    public var body: some View {
+        HStack(spacing: 3) {
+            Image(systemName: "arrow.down.circle.fill")
+                .font(.system(size: 8.5, weight: .bold))
+            Text(text)
+                .font(.system(size: 8.5, weight: .bold, design: .rounded))
+                .lineLimit(1)
+        }
+        .foregroundStyle(Color.green)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2.5)
+        .background(
+            Capsule(style: .continuous)
+                .fill(Color.green.opacity(0.15))
+        )
+        .fixedSize(horizontal: true, vertical: false)
+        .layoutPriority(1)
+    }
+}
+
+public struct TrimmedBadgePill: View {
+    public let rangeText: String
+
+    public init(rangeText: String) {
+        self.rangeText = rangeText
+    }
+
+    public var body: some View {
+        HStack(spacing: 3) {
+            Image(systemName: "scissors")
+                .font(.system(size: 8.5, weight: .bold))
+            Text(rangeText)
+                .font(.system(size: 8.5, weight: .bold, design: .rounded))
+                .monospacedDigit()
+                .lineLimit(1)
+        }
+        .foregroundStyle(AuraTheme.accentPink)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2.5)
+        .background(
+            Capsule(style: .continuous)
+                .fill(AuraTheme.accentPink.opacity(0.16))
+        )
+        .fixedSize(horizontal: true, vertical: false)
+        .layoutPriority(1)
     }
 }
 

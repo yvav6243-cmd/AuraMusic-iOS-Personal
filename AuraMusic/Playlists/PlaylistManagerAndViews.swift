@@ -565,12 +565,16 @@ public struct PlaylistDetailView: View {
                                         .foregroundStyle(player.currentTrack?.id == track.id ? AuraTheme.accentPink : .primary)
                                         .lineLimit(1)
                                 }
-                                HStack(spacing: 6) {
+                                HStack(spacing: 5) {
                                     ProviderBadgePill(provider: track.provider)
+                                    if downloadManager.isDownloaded(track) {
+                                        OfflineStatusBadgePill()
+                                    }
                                     Text(track.artist)
                                         .font(.system(size: 13))
                                         .foregroundStyle(.secondary)
                                         .lineLimit(1)
+                                        .truncationMode(.tail)
                                 }
                             }
 

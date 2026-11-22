@@ -142,6 +142,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     @Published public var activeYouTubeVideoID: String? = nil
     @Published public var isYouTubeVideoVisible: Bool = false
     @Published public var playbackStatusBanner: String? = nil
+    @Published public private(set) var activeTrackTrimRange: TrackTrimRange? = nil
     public private(set) var capturedYouTubeAudioStreamURLs: [String: URL] = [:]
 
     // MARK: - Audio Enhancement Settings
@@ -184,6 +185,8 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     private var lastUserResumeWallTime: TimeInterval = 0
     private var lastTrackStartWallTime: TimeInterval = 0
     private var playbackGeneration: Int = 0
+    private var appliedStartTrimForGeneration: Int = -1
+    private var triggeredEndTrimForGeneration: Int = -1
     private var playPauseCooldownGate = PlayPauseCooldownGate(cooldownInterval: 1.0)
     private var lastYouTubeJSTickWallTime: TimeInterval = 0
     private var hasReceivedFirstYouTubeProgressTick: Bool = false
@@ -504,6 +507,62 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         self.youtubeWebView = webView
     }
 
+    /// Completely stops, silences, and unmounts the YouTube WebKit engine so downloaded offline tracks & native streams
+    /// NEVER run YouTube JS or load YouTube ads in the background!
+    public func teardownYouTubeWebViewCompletely() {
+        youtubeWatchdogTask?.cancel()
+        youtubeClockInterpolatorTask?.cancel()
+        backgroundProtectTask?.cancel()
+        delayedKeepAliveStopTask?.cancel()
+        if let webView = youtubeWebView {
+            webView.evaluateJavaScript("if(window.auraControl && window.auraControl.pauseForExternalApp){window.auraControl.pauseForExternalApp();}", completionHandler: nil)
+            webView.pauseAllMediaPlayback(completionHandler: nil)
+            webView.stopLoading()
+            webView.loadHTMLString("", baseURL: nil)
+        }
+        youtubeWebView = nil
+        activeYouTubeVideoID = nil
+    }
+
+    /// Updates live playback trim immediately after the user edits song start/end bounds in Clip Settings.
+    public func applyUpdatedTrimRange(_ range: TrackTrimRange?, for track: UniversalTrack) {
+        guard let current = currentTrack,
+              current.id == track.id || (!current.providerTrackID.isEmpty && current.providerTrackID == track.providerTrackID) else {
+            return
+        }
+        let totalDur = max(duration, current.duration)
+        if let range, totalDur > 5, range.isEffectivelyTrimmed(for: totalDur) {
+            let normalized = range.normalized(for: totalDur)
+            activeTrackTrimRange = normalized
+            triggeredEndTrimForGeneration = -1
+            if currentTime < normalized.startSeconds {
+                seek(to: normalized.startSeconds)
+            } else if let endSec = normalized.endSeconds, currentTime >= endSec {
+                seek(to: normalized.startSeconds)
+            }
+        } else {
+            activeTrackTrimRange = nil
+            triggeredEndTrimForGeneration = -1
+        }
+    }
+
+    /// Enforces custom song end trim (`endSeconds`), finishing the track cleanly right at the user's chosen cut point.
+    internal func evaluateTrimBoundsIfNeeded(at seconds: TimeInterval) {
+        guard isPlaying,
+              triggeredEndTrimForGeneration != playbackGeneration,
+              let trim = activeTrackTrimRange else {
+            return
+        }
+        let totalDur = max(duration, currentTrack?.duration ?? 0)
+        guard let endSec = trim.normalized(for: totalDur).endSeconds, endSec > 0 else {
+            return
+        }
+        if seconds >= endSec - 0.15 {
+            triggeredEndTrimForGeneration = playbackGeneration
+            handleTrackFinished()
+        }
+    }
+
     public func handleYouTubePlayerEvent(
         currentTime: Double,
         duration: Double,
@@ -541,6 +600,15 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
                 self.isBuffering = false
                 refreshNowPlayingMetadata()
             }
+            if appliedStartTrimForGeneration != playbackGeneration,
+               let startSec = activeTrackTrimRange?.startSeconds,
+               startSec >= 0.5 {
+                appliedStartTrimForGeneration = playbackGeneration
+                if currentTime < startSec - 0.5 {
+                    seek(to: startSec)
+                }
+            }
+            evaluateTrimBoundsIfNeeded(at: currentTime)
         case 2: // PAUSED
             // Protect against stale in-flight paused ticks queued in WebKit IPC right before the user tapped Play/Resume!
             // Since Play/Pause has a 1.0s cooldown, any state=2 tick within 0.8s of resume() is guaranteed stale.
@@ -694,6 +762,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
                     if self.currentTime + 0.20 < maxDur {
                         self.currentTime += 0.20
                     }
+                    self.evaluateTrimBoundsIfNeeded(at: self.currentTime)
                 }
             }
         }
@@ -987,6 +1056,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
                         self.duration = itemDuration
                     }
                 }
+                self.evaluateTrimBoundsIfNeeded(at: seconds)
                 self.checkCrossfadeTrigger()
             }
         }
@@ -1016,9 +1086,16 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
             }
         }
 
-        currentTime = 0
-        clock.refreshSyncAnchor()
         duration = max(track.duration, 0)
+        if let savedTrim = PersistenceController.shared.trimRange(for: trackWithCustomArt) {
+            activeTrackTrimRange = (duration > 5) ? savedTrim.normalized(for: duration) : savedTrim
+        } else {
+            activeTrackTrimRange = nil
+        }
+        appliedStartTrimForGeneration = -1
+        triggeredEndTrimForGeneration = -1
+        currentTime = activeTrackTrimRange?.startSeconds ?? 0
+        clock.refreshSyncAnchor()
         isUserPaused = false
         isPlaying = true
         isBuffering = true
@@ -1039,10 +1116,8 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         let hasOfflineFile = offlineFileURL.map { FileManager.default.fileExists(atPath: $0.path) } ?? false
 
         if hasOfflineFile {
-            if activeYouTubeVideoID != nil {
-                evaluateYouTubeJS("if(window.auraControl){window.auraControl.pause();}")
-            }
-            activeYouTubeVideoID = nil
+            // Strictly tear down & unmount YouTube WebView engine so downloaded tracks NEVER run YouTube or ads!
+            teardownYouTubeWebViewCompletely()
         } else if track.provider != .youtubeMusic && track.provider != .youtube {
             // Preserve existing WKWebView when switching between online YouTube tracks so background Next/Prev
             // reuses the live WebContent process (destroying WKWebView in background kills background playback on iOS!).
@@ -1151,6 +1226,14 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
             }
 
         case .youtubeMusic, .youtube:
+            // Try 100% AD-FREE direct native AVPlayer playback via ANDROID Innertube itag=18 FIRST (0 ads, 0 WebKit!)
+            if await tryStartDirectAdFreeYouTubeAVStream(videoID: track.providerTrackID, for: track, generation: generation) {
+                Task {
+                    await upgradeToSquareAppleMusicCoverIfNeeded(for: track)
+                }
+                return
+            }
+            guard generation == playbackGeneration, !isUserPaused else { return }
             startFullLengthYouTubeMusicPlayback(videoID: track.providerTrackID, for: track)
             Task {
                 await upgradeToSquareAppleMusicCoverIfNeeded(for: track)
@@ -1206,10 +1289,47 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         return false
     }
 
+    /// Resolves a direct HTTP-200 progressive stream via YouTube ANDROID Innertube API and plays it on native `AVPlayer`:
+    /// 0.00% ads (ad servers are never contacted!), native background audio, native Lock Screen & native trim bounds!
+    private func tryStartDirectAdFreeYouTubeAVStream(
+        videoID: String,
+        for track: UniversalTrack,
+        generation: Int
+    ) async -> Bool {
+        guard !videoID.isEmpty else { return false }
+        let candidates = await YouTubeInnertubeAudioResolver.resolvePlayableStreams(videoID: videoID, timeoutSeconds: 5.5)
+        guard generation == playbackGeneration, !isUserPaused else { return true }
+
+        for stream in candidates where stream.isProgressiveMP4 {
+            let asset = AVURLAsset(url: stream.url, options: ["AVURLAssetHTTPHeaderFieldsKey": stream.headers])
+            if let (isPlayable, loadedDuration) = try? await asset.load(.isPlayable, .duration),
+               generation == playbackGeneration,
+               !isUserPaused,
+               isPlayable,
+               OfflineDownloadManager.isFullLengthDurationValid(
+                   actualDuration: loadedDuration.seconds,
+                   expectedTrackDuration: track.duration
+               ) {
+                if loadedDuration.seconds > self.duration {
+                    self.duration = loadedDuration.seconds
+                }
+                startAVPlayer(
+                    with: stream.url,
+                    for: track,
+                    banner: nil,
+                    customUserAgent: stream.headers["User-Agent"] ?? YouTubeInnertubeAudioResolver.androidUserAgent,
+                    youtubeFallbackVideoID: videoID
+                )
+                return true
+            }
+        }
+        return false
+    }
+
     private func tryUpgradeToFullLengthStream(for track: UniversalTrack, generation: Int) async -> Bool {
         let query = "\(track.title) \(track.artist)"
 
-        // 1. If YouTube Music API is configured, resolve full studio track
+        // 1. If YouTube Music API is configured, resolve full studio track (preferring ad-free native AVPlayer first!)
         if ProviderCredentialsStore.shared.hasConfiguredAPI(for: .youtubeMusic),
            let ytCandidates = try? await ytMusicProvider.searchTracks(query: query, limit: 3),
            let bestYT = ytCandidates.first {
@@ -1218,6 +1338,10 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
                 self.duration = bestYT.duration
             }
             self.isYouTubeVideoVisible = false
+            if await tryStartDirectAdFreeYouTubeAVStream(videoID: bestYT.providerTrackID, for: track, generation: generation) {
+                return true
+            }
+            guard generation == playbackGeneration, !isUserPaused else { return true }
             startFullLengthYouTubeMusicPlayback(videoID: bestYT.providerTrackID, for: track)
             return true
         }
@@ -1284,17 +1408,16 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         for track: UniversalTrack,
         banner: String?,
         isFallbackRetry: Bool = false,
-        customUserAgent: String? = nil
+        customUserAgent: String? = nil,
+        youtubeFallbackVideoID: String? = nil
     ) {
-        youtubeWatchdogTask?.cancel()
-        youtubeClockInterpolatorTask?.cancel()
+        teardownYouTubeWebViewCompletely()
         nativeHandoffTask?.cancel()
         nativeHandoffObservation?.invalidate()
         nativeHandoffObservation = nil
         setBackgroundKeepAliveActive(false)
         configureAudioSession(mixWithWebKit: false)
         ApplicationMusicPlayer.shared.pause()
-        activeYouTubeVideoID = nil
         playbackStatusBanner = banner
 
         var assetOptions: [String: Any] = [:]
@@ -1315,17 +1438,41 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
             self.handleTrackFinished()
         }
 
+        let targetGen = playbackGeneration
         itemStatusObservation?.invalidate()
         itemStatusObservation = playerItem.observe(\.status, options: [.new]) { [weak self] item, _ in
             guard let self else { return }
             Task { @MainActor in
+                guard self.playbackGeneration == targetGen else { return }
                 switch item.status {
                 case .readyToPlay:
+                    let itemDur = item.duration.seconds
+                    if itemDur.isFinite && itemDur > 0 {
+                        self.duration = itemDur
+                        if let trim = self.activeTrackTrimRange {
+                            self.activeTrackTrimRange = trim.normalized(for: itemDur)
+                        }
+                    }
+                    if self.appliedStartTrimForGeneration != targetGen,
+                       let startSec = self.activeTrackTrimRange?.startSeconds,
+                       startSec >= 0.5 {
+                        self.appliedStartTrimForGeneration = targetGen
+                        let target = CMTime(seconds: startSec, preferredTimescale: 600)
+                        self.primaryPlayer.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
+                        self.currentTime = startSec
+                    }
                     self.isBuffering = false
-                    self.isPlaying = true
-                    self.primaryPlayer.play()
+                    if !self.isUserPaused {
+                        self.isPlaying = true
+                        self.primaryPlayer.play()
+                    }
                     self.refreshNowPlayingMetadata()
                 case .failed:
+                    if let ytVid = youtubeFallbackVideoID, !ytVid.isEmpty, !self.isUserPaused {
+                        // Seamlessly fall back to WebKit if direct Innertube stream expired/failed
+                        self.startFullLengthYouTubeMusicPlayback(videoID: ytVid, for: track)
+                        return
+                    }
                     if !isFallbackRetry {
                         if let appleFallback = try? await self.appleProvider.resolvePlayableStreamURL(for: track),
                            appleFallback != url {
@@ -1493,9 +1640,13 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
 
     public func skipToNext() {
         if repeatMode == .one, let current = currentTrack {
-            seek(to: 0)
+            let restartPos = activeTrackTrimRange?.startSeconds ?? 0
+            triggeredEndTrimForGeneration = -1
+            seek(to: restartPos)
             resume()
-            play(current, queue: upNextQueue)
+            if activeYouTubeVideoID == nil && primaryPlayer.currentItem == nil {
+                play(current, queue: upNextQueue)
+            }
             return
         }
 
@@ -1509,13 +1660,14 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
             play(firstHistory, queue: playbackHistory.reversed())
         } else {
             pause()
-            seek(to: 0)
+            seek(to: activeTrackTrimRange?.startSeconds ?? 0)
         }
     }
 
     public func skipToPrevious() {
-        if currentTime > 3.5 {
-            seek(to: 0)
+        let trimStart = activeTrackTrimRange?.startSeconds ?? 0
+        if currentTime > trimStart + 3.5 {
+            seek(to: trimStart)
             return
         }
         if !playbackHistory.isEmpty {
@@ -1525,7 +1677,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
             }
             play(previous, queue: [])
         } else {
-            seek(to: 0)
+            seek(to: trimStart)
         }
     }
 

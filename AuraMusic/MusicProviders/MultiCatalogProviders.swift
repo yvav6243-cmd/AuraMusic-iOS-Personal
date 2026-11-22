@@ -1041,6 +1041,12 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
           window._auraUserPaused = false;
           window._auraSoftPaused = false;
           window._auraAllowPause = false;
+          window._auraExpectedVideoID = (function() {
+            try {
+              var m = (window.location && window.location.search || '').match(/[?&]v=([A-Za-z0-9_-]{6,24})/);
+              return m ? m[1] : null;
+            } catch(e) { return null; }
+          })();
 
           var style = document.createElement('style');
           style.innerHTML = `
@@ -1064,10 +1070,17 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
           function isAdCurrentlyShowing() {
             try {
               var mp = document.getElementById('movie_player');
-              if (mp && (mp.classList.contains('ad-showing') || mp.classList.contains('ad-interrupting'))) {
+              if (mp && (mp.classList.contains('ad-showing') || mp.classList.contains('ad-interrupting') || mp.classList.contains('ad-created'))) {
                 return true;
               }
-              if (document.querySelector('.ytp-ad-player-overlay, .ytp-ad-player-overlay-layout, .ytp-ad-skip-button, .ytp-ad-skip-button-modern, .ytp-skip-ad-button, .ytp-ad-skip-button-slot button, button[id^="skip-button"]')) {
+              // Catch CSS-less / server-side mobile ads whose video_id does NOT match the requested song!
+              if (mp && typeof mp.getVideoData === 'function' && window._auraExpectedVideoID) {
+                var vd = mp.getVideoData();
+                if (vd && vd.video_id && vd.video_id !== window._auraExpectedVideoID) {
+                  return true;
+                }
+              }
+              if (document.querySelector('.ytp-ad-player-overlay, .ytp-ad-player-overlay-layout, .ytp-ad-skip-button, .ytp-ad-skip-button-modern, .ytp-skip-ad-button, .ytp-ad-skip-button-slot button, button[id^="skip-button"], .ytp-ad-text, .ytp-ad-badge, .ytp-ad-preview-container, ytm-ad-slot-renderer .ad-badge')) {
                 return true;
               }
             } catch(e) {}
@@ -1399,6 +1412,7 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
                   window._auraUserPaused = false;
                   window._auraExternalInterrupted = false;
                   window._auraAllowPause = false;
+                  window._auraExpectedVideoID = videoId;
                   window._auraStartupProtectUntil = Date.now() + 4500;
                   window._auraPendingUserResumeUntil = Date.now() + 3000;
                   window._lastReportedAudioUrl = null;
