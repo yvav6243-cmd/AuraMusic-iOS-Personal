@@ -468,8 +468,31 @@ public final class LyricsService: ObservableObject {
         "ai::\(lyricsCacheKey(for: track))"
     }
 
+    private static let preferredModeDefaultsKey = "AuraMusic.PreferredLyricsModeByTrackKey"
+
     public func setActiveAIDocument(_ document: TrackLyricsDocument?) {
         self.aiDocument = document
+    }
+
+    /// Returns the last-used lyrics mode for THIS specific song:
+    /// `.aiAudio` ONLY if the user previously listened to this song in AI mode; otherwise `.standard` (original lyrics).
+    public func preferredLyricsMode(for track: UniversalTrack) -> LyricsDisplayMode {
+        let key = Self.lyricsCacheKey(for: track)
+        let map = UserDefaults.standard.dictionary(forKey: Self.preferredModeDefaultsKey) as? [String: String]
+        return (map?[key] == "ai") ? .aiAudio : .standard
+    }
+
+    /// Persists the user's chosen lyrics mode (`.aiAudio` vs `.standard`) strictly for THIS song across app restarts.
+    public func setPreferredLyricsMode(_ mode: LyricsDisplayMode, for track: UniversalTrack) {
+        let key = Self.lyricsCacheKey(for: track)
+        var map = (UserDefaults.standard.dictionary(forKey: Self.preferredModeDefaultsKey) as? [String: String]) ?? [:]
+        if mode == .aiAudio {
+            map[key] = "ai"
+        } else {
+            map.removeValue(forKey: key)
+        }
+        UserDefaults.standard.set(map, forKey: Self.preferredModeDefaultsKey)
+        self.lyricsMode = mode
     }
 
     public func loadCachedAILyrics(for track: UniversalTrack) -> TrackLyricsDocument? {
@@ -620,14 +643,17 @@ public final class LyricsService: ObservableObject {
     }
 
     public func loadLyrics(for track: UniversalTrack, forceReload: Bool = false) async {
-        // Refresh cached AI document when switching tracks so AI mode stays scoped to the current song
-        if loadedTrackID != track.id {
+        // Restore per-track persistent mode: AI lyrics ONLY if the user last listened to THIS song in AI mode; otherwise original lyrics!
+        if loadedTrackID != track.id || forceReload {
             AILyricsTranscriptionEngine.shared.resetForNewTrack(track.id)
-            self.aiDocument = loadCachedAILyrics(for: track)
+            let savedAI = loadCachedAILyrics(for: track)
+            self.aiDocument = savedAI
+            let preferred = preferredLyricsMode(for: track)
+            self.lyricsMode = (preferred == .aiAudio && savedAI != nil) ? .aiAudio : .standard
         }
 
         // Avoid wiping and reloading already-loaded lyrics when re-opening the Lyrics panel for the same track
-        if !forceReload, loadedTrackID == track.id, currentDocument != nil {
+        if !forceReload, loadedTrackID == track.id, (currentDocument != nil || (lyricsMode == .aiAudio && aiDocument != nil)) {
             isLoading = false
             return
         }
@@ -1534,6 +1560,7 @@ public final class LyricsService: ObservableObject {
         )
         self.loadedTrackID = track.id
         self.errorMessage = nil
+        setPreferredLyricsMode(.standard, for: track)
     }
 
     private func fetchExactLRCLIB(title: String, artist: String, album: String, duration: TimeInterval) async throws -> LRCLIBEntryDTO? {
@@ -1854,7 +1881,7 @@ public struct SynchronizedLyricsView: View {
                     Button {
                         if let track = player.currentTrack {
                             withAnimation(AuraTheme.springInteractive) {
-                                lyricsService.lyricsMode = .aiAudio
+                                lyricsService.setPreferredLyricsMode(.aiAudio, for: track)
                             }
                             aiEngine.startListening(for: track)
                         }
@@ -2054,6 +2081,9 @@ public struct SynchronizedLyricsView: View {
 
                 Button {
                     aiEngine.cancel()
+                    if lyricsService.aiDocument == nil, let track = player.currentTrack {
+                        lyricsService.setPreferredLyricsMode(.standard, for: track)
+                    }
                 } label: {
                     Text("Отменить")
                         .font(.system(size: 14, weight: .semibold))
@@ -2132,109 +2162,72 @@ public struct SynchronizedLyricsView: View {
     }
 
     private var lyricsHeaderBar: some View {
-        VStack(spacing: 8) {
-            HStack(spacing: 10) {
-                // Sleek Glass Mode Selector: База vs ✨ ИИ
-                HStack(spacing: 3) {
-                    ForEach(LyricsDisplayMode.allCases, id: \.self) { mode in
-                        let isSelected = (lyricsService.lyricsMode == mode)
-                        Button {
-                            withAnimation(AuraTheme.springInteractive) {
-                                lyricsService.lyricsMode = mode
-                            }
-                            if mode == .aiAudio, let track = player.currentTrack {
-                                if lyricsService.aiDocument == nil && !aiEngine.state.isRunning {
-                                    aiEngine.startListening(for: track)
-                                }
-                            }
-                        } label: {
-                            HStack(spacing: 4) {
-                                Image(systemName: mode == .aiAudio ? "sparkles" : "waveform")
-                                    .font(.system(size: 11, weight: .bold))
-                                Text(mode.rawValue)
-                                    .font(.system(size: 12, weight: .bold, design: .rounded))
-                            }
-                            .foregroundStyle(isSelected ? Color.black : Color.white.opacity(0.88))
-                            .padding(.horizontal, 11)
-                            .padding(.vertical, 6)
-                            .background(
-                                Capsule(style: .continuous)
-                                    .fill(isSelected ? Color.white : Color.clear)
-                            )
-                        }
-                        .buttonStyle(.plain)
-                    }
+        HStack(spacing: 10) {
+            if let doc = lyricsService.activeDocument {
+                HStack(spacing: 6) {
+                    Image(systemName: lyricsService.lyricsMode == .aiAudio ? "sparkles" : (doc.isSynchronized ? "waveform" : "text.alignleft"))
+                        .font(.system(size: 11, weight: .bold))
+                    Text(lyricsService.lyricsMode == .aiAudio ? "ИИ ЛИРИКА" : (doc.isSynchronized ? "APPLE MUSIC SING SYNC" : "LYRICS"))
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                    Text("• \(doc.detectedLanguageDisplayName.uppercased())")
+                        .font(.system(size: 10, weight: .bold, design: .rounded))
+                        .lineLimit(1)
                 }
-                .padding(3)
-                .background(Capsule(style: .continuous).fill(Color.white.opacity(0.16)))
+                .foregroundStyle(.white.opacity(0.92))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(Capsule().fill(.white.opacity(0.18)))
 
-                if let doc = lyricsService.activeDocument {
-                    HStack(spacing: 4) {
-                        if lyricsService.lyricsMode == .aiAudio {
-                            Text("ИИ 10/10")
-                                .font(.system(size: 10, weight: .bold, design: .rounded))
-                        }
-                        Text("• \(doc.detectedLanguageDisplayName.uppercased())")
-                            .font(.system(size: 10, weight: .bold, design: .rounded))
-                            .lineLimit(1)
-                    }
-                    .foregroundStyle(.white.opacity(0.9))
-                    .padding(.horizontal, 9)
-                    .padding(.vertical, 5)
-                    .background(Capsule().fill(.white.opacity(0.14)))
-                }
-
-                Spacer()
-
-                if isUserManualScrolling {
+                if doc.hasTranslationAvailable && lyricsService.lyricsMode == .standard {
                     Button {
-                        withAnimation(AuraTheme.springInteractive) {
-                            isUserManualScrolling = false
+                        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                            showTranslationOverlay.toggle()
                         }
                     } label: {
-                        Label("Sync", systemImage: "arrow.up.and.down.circle.fill")
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(.black)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 5)
-                            .background(Capsule().fill(.white))
-                    }
-                }
-
-                if lyricsService.lyricsMode == .aiAudio {
-                    Button {
-                        if let track = player.currentTrack {
-                            aiEngine.startListening(for: track, forceReanalyze: true)
-                        }
-                    } label: {
-                        Image(systemName: "arrow.clockwise")
-                            .font(.system(size: 13, weight: .bold))
-                            .foregroundStyle(.white)
-                            .padding(8)
-                            .background(Circle().fill(.white.opacity(0.16)))
-                    }
-                    .disabled(aiEngine.state.isRunning || player.currentTrack == nil)
-                    .opacity(aiEngine.state.isRunning ? 0.4 : 1.0)
-                } else {
-                    Button {
-                        let cleaned = LyricsService.extractCleanTitleAndArtist(
-                            rawTitle: player.currentTrack?.title ?? "",
-                            rawArtist: player.currentTrack?.artist ?? ""
-                        )
-                        manualSongQuery = cleaned.title
-                        manualArtistQuery = cleaned.artist
-                        showManualSearchSheet = true
-                    } label: {
-                        Image(systemName: "magnifyingglass")
-                            .font(.system(size: 13, weight: .bold))
-                            .foregroundStyle(.white)
-                            .padding(8)
-                            .background(Circle().fill(.white.opacity(0.16)))
+                        Image(systemName: "character.bubble.fill")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(showTranslationOverlay ? Color.black : Color.white)
+                            .padding(7)
+                            .background(Circle().fill(showTranslationOverlay ? Color.white : Color.white.opacity(0.18)))
                     }
                 }
             }
+
+            Spacer()
+
+            if isUserManualScrolling {
+                Button {
+                    withAnimation(AuraTheme.springInteractive) {
+                        isUserManualScrolling = false
+                    }
+                } label: {
+                    Label("Resume Sync", systemImage: "arrow.up.and.down.circle.fill")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.black)
+                        .padding(.horizontal, 11)
+                        .padding(.vertical, 5)
+                        .background(Capsule().fill(.white))
+                }
+            }
+
+            // Magnifying glass (лупа): opens both AI Lyrics Mode controls AND manual lyrics search!
+            Button {
+                let cleaned = LyricsService.extractCleanTitleAndArtist(
+                    rawTitle: player.currentTrack?.title ?? "",
+                    rawArtist: player.currentTrack?.artist ?? ""
+                )
+                manualSongQuery = cleaned.title
+                manualArtistQuery = cleaned.artist
+                showManualSearchSheet = true
+            } label: {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 13, weight: .bold))
+                    .foregroundStyle(.white)
+                    .padding(8)
+                    .background(Circle().fill(.white.opacity(0.16)))
+            }
         }
-        .padding(.horizontal, 20)
+        .padding(.horizontal, 24)
         .padding(.vertical, 8)
     }
 
@@ -2362,6 +2355,116 @@ public struct SynchronizedLyricsView: View {
     private var manualLyricsSearchSheet: some View {
         NavigationStack {
             List {
+                if let track = player.currentTrack {
+                    Section {
+                        // Option 1: AI Audio-Listening Lyrics Mode (saved per song!)
+                        Button {
+                            withAnimation(AuraTheme.springInteractive) {
+                                lyricsService.setPreferredLyricsMode(.aiAudio, for: track)
+                            }
+                            showManualSearchSheet = false
+                            if lyricsService.aiDocument == nil && !aiEngine.state.isRunning {
+                                aiEngine.startListening(for: track)
+                            }
+                        } label: {
+                            HStack(spacing: 12) {
+                                ZStack {
+                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                        .fill(
+                                            LinearGradient(
+                                                colors: [AuraTheme.accentPink, Color.purple],
+                                                startPoint: .topLeading,
+                                                endPoint: .bottomTrailing
+                                            )
+                                        )
+                                        .frame(width: 36, height: 36)
+                                    Image(systemName: "sparkles")
+                                        .font(.system(size: 16, weight: .bold))
+                                        .foregroundStyle(.white)
+                                }
+
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text("Режим ИИ-лирики")
+                                        .font(.system(size: 16, weight: .semibold))
+                                        .foregroundStyle(.primary)
+                                    Text(
+                                        lyricsService.aiDocument != nil
+                                            ? "ИИ-текст готов и сохранён для этой песни"
+                                            : "ИИ прослушает песню 10 раз (≤30 сек) и создаст текст"
+                                    )
+                                    .font(.system(size: 12))
+                                    .foregroundStyle(.secondary)
+                                }
+
+                                Spacer()
+
+                                if lyricsService.lyricsMode == .aiAudio {
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .font(.system(size: 20))
+                                        .foregroundStyle(AuraTheme.accentPink)
+                                }
+                            }
+                            .padding(.vertical, 3)
+                        }
+
+                        if lyricsService.aiDocument != nil || lyricsService.lyricsMode == .aiAudio {
+                            Button {
+                                withAnimation(AuraTheme.springInteractive) {
+                                    lyricsService.setPreferredLyricsMode(.aiAudio, for: track)
+                                }
+                                showManualSearchSheet = false
+                                aiEngine.startListening(for: track, forceReanalyze: true)
+                            } label: {
+                                Label("Переслушать песню через ИИ заново (10 раз)", systemImage: "arrow.clockwise")
+                                    .font(.system(size: 14, weight: .semibold))
+                                    .foregroundStyle(AuraTheme.accentPink)
+                            }
+                        }
+
+                        // Option 2: Original Database Lyrics (default for tracks where AI was never enabled)
+                        Button {
+                            aiEngine.cancel()
+                            withAnimation(AuraTheme.springInteractive) {
+                                lyricsService.setPreferredLyricsMode(.standard, for: track)
+                            }
+                            showManualSearchSheet = false
+                        } label: {
+                            HStack(spacing: 12) {
+                                ZStack {
+                                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                        .fill(Color.secondary.opacity(0.16))
+                                        .frame(width: 36, height: 36)
+                                    Image(systemName: "waveform")
+                                        .font(.system(size: 16, weight: .bold))
+                                        .foregroundStyle(.primary)
+                                }
+
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text("Оригинальная лирика")
+                                        .font(.system(size: 16, weight: .semibold))
+                                        .foregroundStyle(.primary)
+                                    Text("Стандартный синхронизированный текст из базы")
+                                        .font(.system(size: 12))
+                                        .foregroundStyle(.secondary)
+                                }
+
+                                Spacer()
+
+                                if lyricsService.lyricsMode == .standard {
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .font(.system(size: 20))
+                                        .foregroundStyle(AuraTheme.accentPink)
+                                }
+                            }
+                            .padding(.vertical, 3)
+                        }
+                    } header: {
+                        Text("Режим лирики для этой песни")
+                    } footer: {
+                        Text("Выбор запоминается отдельно для каждой песни: если последний раз вы слушали этот трек в режиме ИИ, при следующем включении откроется ИИ-текст, а для остальных песен останется оригинальная лирика.")
+                    }
+                }
+
                 Section("Search by Song & Artist (Original Language Preserved)") {
                     TextField("Song Title (e.g. 夜に駆ける, Dynamite, Starboy)", text: $manualSongQuery)
                     TextField("Artist Name", text: $manualArtistQuery)

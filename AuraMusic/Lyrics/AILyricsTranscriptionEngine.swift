@@ -488,9 +488,14 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
         )
 
         // Probe first strong vocal window (~18s right after intro pause) racing BOTH candidate languages in parallel!
-        let introEnd = detectedPauses.first(where: { $0.start <= 1.2 })?.end ?? 0.0
+        let vocalSpan = Self.detectVocalActiveSpan(
+            rmsFrames: vocalRMS,
+            frameDuration: 0.1,
+            trackDuration: trackDuration
+        )
+        let introEnd = max(vocalSpan.start, detectedPauses.first(where: { $0.start <= 1.2 })?.end ?? 0.0)
         let probeStart = min(max(0, introEnd), max(0, trackDuration - 12.0))
-        let probeEnd = min(trackDuration, probeStart + 18.0)
+        let probeEnd = min(vocalSpan.end, probeStart + 18.0)
 
         var pass1Tokens: [AIWordToken] = []
         let pass1Timeout = Self.computePassTimeout(hardDeadline: hardDeadline, preferred: 3.4, reserveForLater: 11.0)
@@ -531,9 +536,30 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
 
             if let winner = probeResults.max(by: { Self.scoreLanguageProbe($0.1) < Self.scoreLanguageProbe($1.1) }) {
                 pass1Tokens = winner.1
-                if referenceSample.isEmpty && Self.scoreLanguageProbe(winner.1) > 0.8 {
+                let bestScore = Self.scoreLanguageProbe(winner.1)
+                if referenceSample.isEmpty && bestScore > 0.8 {
                     primaryLocale = winner.0
                     secondaryLocale = (winner.0.identifier == candA.identifier) ? candB : candA
+                } else if referenceSample.isEmpty && bestScore < 0.6 && !candA.identifier.hasPrefix("zh") && !candB.identifier.hasPrefix("zh") {
+                    // 3rd-language rescue for Chinese songs with Romanized/English titles (e.g. "Sunny Day", "Mojito")
+                    let zhBudget = Self.computePassTimeout(hardDeadline: hardDeadline, preferred: 1.8, reserveForLater: 10.5)
+                    if zhBudget >= 0.9 {
+                        let zhLocale = Locale(identifier: "zh-CN")
+                        let zhToks = await Self.recognizeSegment(
+                            samples: processed.vocalIsolated,
+                            sampleRate: Self.targetSampleRate,
+                            startTime: probeStart,
+                            endTime: probeEnd,
+                            locale: zhLocale,
+                            contextualStrings: contextualWords,
+                            timeoutSeconds: zhBudget
+                        )
+                        if Self.scoreLanguageProbe(zhToks) > bestScore + 0.4 {
+                            pass1Tokens = zhToks
+                            primaryLocale = zhLocale
+                            secondaryLocale = Locale(identifier: "en-US")
+                        }
+                    }
                 }
             }
         }
@@ -546,9 +572,9 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
         state.detectedPauseCount = detectedPauses.count
         state.progress = 0.13
 
-        // Build 100% CONTIGUOUS vocal-span chunks (~24s each, 1.5s overlap — ZERO skipped seconds across the entire song!)
+        // Build 100% CONTIGUOUS vocal-span chunks (~24s each, 1.5s overlap), trimming silent MV credits outros to save budget!
         let vocalStart = min(introEnd, max(0, trackDuration - 10.0))
-        let vocalEnd = max(vocalStart + 5.0, trackDuration)
+        let vocalEnd = max(vocalStart + 5.0, min(trackDuration, vocalSpan.end))
         let allChunks = Self.buildContiguousListeningChunks(
             start: vocalStart,
             end: vocalEnd,
@@ -743,6 +769,7 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
         if sungLinesCount > 0,
            let doc = LyricsService.shared.saveAILyrics(syncedLRC: syncedLRC, for: track) {
             LyricsService.shared.setActiveAIDocument(doc)
+            LyricsService.shared.setPreferredLyricsMode(.aiAudio, for: track)
             state.isRunning = false
             state.currentPass = Self.totalRequiredPasses
             state.progress = 1.0
@@ -1123,6 +1150,7 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
         }
 
         let langCode = locale.language.languageCode?.identifier ?? locale.identifier
+        let contextualSet = Set(contextualStrings.map { $0.lowercased() })
 
         return await withCheckedContinuation { (continuation: CheckedContinuation<[AIWordToken], Never>) in
             let box = SpeechRecognitionBox(continuation: continuation)
@@ -1135,13 +1163,20 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
             let task = recognizer.recognitionTask(with: request) { result, error in
                 if let result {
                     let tokens: [AIWordToken] = result.bestTranscription.segments.compactMap { seg in
-                        let word = seg.substring.trimmingCharacters(in: .whitespacesAndNewlines)
-                        guard !word.isEmpty else { return nil }
+                        let rawWord = seg.substring.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !rawWord.isEmpty else { return nil }
+                        let conf: Float = seg.confidence > 0 ? seg.confidence : 0.55
+                        let chosen = Self.selectBestSegmentWord(
+                            primary: rawWord,
+                            confidence: conf,
+                            alternatives: seg.alternativeSubstrings,
+                            contextualSet: contextualSet
+                        )
                         return AIWordToken(
-                            text: word,
+                            text: chosen.word,
                             timestamp: startTime + seg.timestamp,
                             duration: max(0.08, seg.duration),
-                            confidence: seg.confidence > 0 ? seg.confidence : 0.55,
+                            confidence: chosen.confidence,
                             languageCode: langCode
                         )
                     }
@@ -1157,6 +1192,53 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
             }
             box.attachTask(task)
         }
+    }
+
+    /// Uses Apple Speech's N-best `alternativeSubstrings`: when the primary guess has weak confidence (<0.62)
+    /// and an alternative matches our track's contextual vocabulary, promotes that alternative cleanly!
+    public nonisolated static func selectBestSegmentWord(
+        primary: String,
+        confidence: Float,
+        alternatives: [String],
+        contextualSet: Set<String>
+    ) -> (word: String, confidence: Float) {
+        let cleanPrimary = primary.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !contextualSet.isEmpty, confidence < 0.62, !alternatives.isEmpty else {
+            return (cleanPrimary, confidence)
+        }
+        if contextualSet.contains(cleanPrimary.lowercased()) {
+            return (cleanPrimary, max(confidence, 0.72))
+        }
+        for alt in alternatives {
+            let cleanAlt = alt.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !cleanAlt.isEmpty && contextualSet.contains(cleanAlt.lowercased()) {
+                return (cleanAlt, max(confidence + 0.16, 0.68))
+            }
+        }
+        return (cleanPrimary, confidence)
+    }
+
+    /// Detects active vocal boundaries `(start, end)` from vocal-band RMS, trimming dead MV intros and trailing credits silence
+    /// so all 10 passes focus 100% of the 30-second budget on actual singing!
+    public nonisolated static func detectVocalActiveSpan(
+        rmsFrames: [Float],
+        frameDuration: TimeInterval = 0.1,
+        trackDuration: TimeInterval
+    ) -> (start: TimeInterval, end: TimeInterval) {
+        guard !rmsFrames.isEmpty, frameDuration > 0 else {
+            return (0, max(0, trackDuration))
+        }
+        let sorted = rmsFrames.sorted()
+        let p15 = sorted[Int(Double(sorted.count - 1) * 0.15)]
+        let p80 = sorted[Int(Double(sorted.count - 1) * 0.80)]
+        let threshold = max(0.008, p15 + (p80 - p15) * 0.24)
+
+        let firstActive = rmsFrames.firstIndex(where: { $0 > threshold }) ?? 0
+        let lastActive = rmsFrames.lastIndex(where: { $0 > threshold }) ?? (rmsFrames.count - 1)
+
+        let startSec = max(0, Double(firstActive) * frameDuration - 0.5)
+        let endSec = min(trackDuration, max(startSec + 4.0, Double(lastActive + 1) * frameDuration + 1.8))
+        return (startSec, endSec)
     }
 
     // MARK: - Pure Deterministic DSP, Coverage, Language Scoring, Audio-Anchored Alignment & LRC Builder (100% Testable!)
@@ -1536,23 +1618,31 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
         let sortedTokens = audioTokens.sorted { $0.timestamp < $1.timestamp }
         let sortedPauses = pauses.sorted { $0.start < $1.start }
 
-        // Compute monotonic anchor timestamps by matching each reference line's words against chronologically ordered heard tokens
-        var anchors: [Int: TimeInterval] = [:]
+        // Compute weighted monotonic anchor timestamps with adaptive lookahead so heavy EDM drops / missed verses recover cleanly
+        var rawAnchors: [Int: TimeInterval] = [:]
         var tokenCursor = 0
+        let totalLines = max(1, cleanLines.count)
 
         for (lineIdx, lineText) in cleanLines.enumerated() {
             let lineUnits = normalizedMatchUnits(for: lineText)
             guard !lineUnits.isEmpty, tokenCursor < sortedTokens.count else { continue }
 
-            // Look ahead over a reasonable window of heard tokens so a single missed line never blocks later matches
-            let searchEnd = min(sortedTokens.count, tokenCursor + 24)
-            var bestScore = 0
+            let remainingLines = max(1, totalLines - lineIdx)
+            let remainingTokens = sortedTokens.count - tokenCursor
+            let adaptiveWindow = max(36, min(90, (remainingTokens / remainingLines) * 5 + 24))
+            let searchEnd = min(sortedTokens.count, tokenCursor + adaptiveWindow)
+
+            var bestWeightedScore: Double = 0
+            var bestMatchCount = 0
             var bestFirstMatchedIdx: Int? = nil
             var bestLastMatchedIdx: Int? = nil
 
+            let totalLineWeight = lineUnits.reduce(0.0) { $0 + Self.wordMatchWeight($1) }
+
             for startIdx in tokenCursor..<searchEnd {
-                let spanEnd = min(sortedTokens.count, startIdx + max(4, lineUnits.count + 3))
+                let spanEnd = min(sortedTokens.count, startIdx + max(5, lineUnits.count + 4))
                 var matchedCount = 0
+                var weightedScore = 0.0
                 var matchedUnits = Set<String>()
                 var firstMatchIdx: Int? = nil
                 var lastMatchIdx: Int? = nil
@@ -1561,9 +1651,10 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
                     let heardUnits = normalizedMatchUnits(for: sortedTokens[tIdx].text)
                     var tokenMatchedLine = false
                     for hu in heardUnits where !matchedUnits.contains(hu) {
-                        if lineUnits.contains(where: { wordsFuzzyMatch($0, hu) }) {
+                        if let matchedLineUnit = lineUnits.first(where: { wordsFuzzyMatch($0, hu) }) {
                             matchedUnits.insert(hu)
                             matchedCount += 1
+                            weightedScore += Self.wordMatchWeight(matchedLineUnit)
                             tokenMatchedLine = true
                         }
                     }
@@ -1572,17 +1663,19 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
                         lastMatchIdx = tIdx
                     }
                 }
-                if matchedCount > bestScore, let fm = firstMatchIdx, let lm = lastMatchIdx {
-                    bestScore = matchedCount
+                if weightedScore > bestWeightedScore, let fm = firstMatchIdx, let lm = lastMatchIdx {
+                    bestWeightedScore = weightedScore
+                    bestMatchCount = matchedCount
                     bestFirstMatchedIdx = fm
                     bestLastMatchedIdx = lm
                 }
             }
 
-            let minRequired = lineUnits.count <= 2 ? 1 : max(2, Int(ceil(Double(lineUnits.count) * 0.34)))
-            if bestScore >= minRequired, var firstIdx = bestFirstMatchedIdx, let lastIdx = bestLastMatchedIdx {
-                // If the line starts with a 1-letter word ("I", "Я", "В", "A") that sits immediately before `firstIdx`,
-                // anchor right on that leading word so the line illuminates on beat 1 instead of 300ms late!
+            let minRequiredCount = lineUnits.count <= 2 ? 1 : max(2, Int(ceil(Double(lineUnits.count) * 0.34)))
+            let minRequiredWeight = max(1.0, totalLineWeight * 0.36)
+            if bestMatchCount >= minRequiredCount && bestWeightedScore >= minRequiredWeight,
+               var firstIdx = bestFirstMatchedIdx, let lastIdx = bestLastMatchedIdx {
+                // Anchor leading 1-letter words ("I", "Я", "В", "A") on beat 1 instead of 300ms late!
                 if firstIdx > tokenCursor,
                    let firstLineWord = lineText.lowercased().components(separatedBy: CharacterSet.alphanumerics.inverted).first(where: { !$0.isEmpty }),
                    firstLineWord.count == 1,
@@ -1590,10 +1683,13 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
                    (sortedTokens[firstIdx].timestamp - sortedTokens[firstIdx - 1].timestamp) <= 0.7 {
                     firstIdx -= 1
                 }
-                anchors[lineIdx] = sortedTokens[firstIdx].timestamp
+                rawAnchors[lineIdx] = sortedTokens[firstIdx].timestamp
                 tokenCursor = min(sortedTokens.count, lastIdx + 1)
             }
         }
+
+        // Prune physically impossible timestamp jumps (e.g. stray repeated filler word pulling a line off-beat)
+        let anchors = Self.pruneOutlierAnchors(rawAnchors, totalLines: cleanLines.count, pauses: sortedPauses)
 
         // If reference already has synced timestamps AND audio anchors confirm similar pacing (or <2 anchors found),
         // calibrate synced timestamps using the real audio-heard offset (handles MV intros cleanly!).
@@ -1733,13 +1829,105 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
         return false
     }
 
+    private nonisolated static let lowWeightStopWords: Set<String> = [
+        "the", "and", "you", "for", "are", "but", "not", "all", "can", "had", "her", "was", "one", "our", "out",
+        "я", "ты", "он", "она", "мы", "вы", "они", "не", "на", "по", "за", "из", "от", "до", "но", "да", "же", "ли", "бы", "то", "что", "это", "как", "так", "все", "всё"
+    ]
+
+    private nonisolated static func wordMatchWeight(_ unit: String) -> Double {
+        if containsCJK(unit) { return 1.8 }
+        if lowWeightStopWords.contains(unit) { return 0.5 }
+        if unit.count >= 5 { return 2.0 }
+        return 1.2
+    }
+
+    /// Rejects physically impossible outlier anchors (e.g. a stray filler match jumping +45s forward and then jamming into the next line)
+    /// while preserving all genuine chronological vocal anchors (including legitimate breaks across detected `AIPauseInterval`s).
+    public nonisolated static func pruneOutlierAnchors(
+        _ anchors: [Int: TimeInterval],
+        totalLines: Int,
+        pauses: [AIPauseInterval]
+    ) -> [Int: TimeInterval] {
+        let sorted = anchors.sorted { $0.key < $1.key }
+        guard sorted.count >= 3 else { return anchors }
+
+        var kept: [(Int, TimeInterval)] = []
+        for idx in 0..<sorted.count {
+            let (lineIdx, ts) = sorted[idx]
+            // Check consistency against surrounding anchors (prev and next)
+            if idx > 0 && idx < sorted.count - 1 {
+                let (prevLine, prevTS) = kept.last ?? sorted[idx - 1]
+                let (nextLine, nextTS) = sorted[idx + 1]
+                let dLinesPrev = max(1, lineIdx - prevLine)
+                let dLinesNext = max(1, nextLine - lineIdx)
+                let dtPrev = ts - prevTS
+                let dtNext = nextTS - ts
+
+                // Non-monotonic or jammed (< 0.35s per line) or wild spike without a vocal pause -> reject middle outlier!
+                if dtPrev < Double(dLinesPrev) * 0.30 || dtNext < Double(dLinesNext) * 0.30 {
+                    // Check if prev -> next directly has normal pacing
+                    let directDt = nextTS - prevTS
+                    let directDLines = max(1, nextLine - prevLine)
+                    if directDt >= Double(directDLines) * 0.45 {
+                        continue
+                    }
+                }
+                let pauseAllowance = pauses
+                    .filter { $0.start >= prevTS && $0.end <= ts + 1.0 }
+                    .reduce(0.0) { $0 + $1.duration }
+                let maxPlausiblePrev = Double(dLinesPrev) * 14.0 + pauseAllowance + 6.0
+                if dtPrev > maxPlausiblePrev && dtNext < Double(dLinesNext) * 0.6 {
+                    continue
+                }
+            }
+            kept.append((lineIdx, ts))
+        }
+        return Dictionary(uniqueKeysWithValues: kept)
+    }
+
+    private nonisolated static let speechFillerWords: Set<String> = [
+        "uh", "um", "erm", "hmm", "hm", "ээ", "эээ", "мм", "ммм", "ага"
+    ]
+
+    /// Studio polish for pure audio-only AI lyric lines: strips speech filler artifacts, collapses duplicate seam stutters,
+    /// and applies crisp Apple Music Sing sentence-case capitalization for Latin/Cyrillic lines.
+    public nonisolated static func polishSungLyricLine(_ rawLine: String) -> String {
+        let trimmed = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "" }
+        if containsCJK(trimmed) && !trimmed.contains(" ") {
+            return trimmed
+        }
+        let words = trimmed.split(whereSeparator: \.isWhitespace).map(String.init)
+        var cleaned: [String] = []
+        for w in words {
+            let lower = w.lowercased().trimmingCharacters(in: .punctuationCharacters)
+            if speechFillerWords.contains(lower) { continue }
+            if let prev = cleaned.last, prev.lowercased() == w.lowercased() && cleaned.count >= 2 {
+                // Keep intentional artistic double-words like "love love", only drop 3+ stutter chains
+                if cleaned.count >= 2 && cleaned[cleaned.count - 2].lowercased() == w.lowercased() {
+                    continue
+                }
+            }
+            cleaned.append(w)
+        }
+        guard !cleaned.isEmpty else { return "" }
+        var joined = cleaned.joined(separator: " ")
+        if let first = joined.first, first.isLetter && first.isLowercase {
+            joined = first.uppercased() + joined.dropFirst()
+        }
+        return joined
+    }
+
     public nonisolated static func buildSyncedLRCFromTokens(
         tokens: [AIWordToken],
         pauses: [AIPauseInterval],
         trackDuration: TimeInterval
     ) -> String {
         let sortedTokens = tokens
-            .filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .filter {
+                let c = $0.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                return !c.isEmpty && !speechFillerWords.contains(c.lowercased())
+            }
             .sorted { $0.timestamp < $1.timestamp }
         guard !sortedTokens.isEmpty else { return "" }
 
@@ -1747,7 +1935,7 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
 
         struct BuiltLine {
             let timestamp: TimeInterval
-            let text: String
+            var text: String
             let isInstrumental: Bool
         }
 
@@ -1763,9 +1951,18 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
 
         func flushCurrentLine() {
             guard !currentWords.isEmpty else { return }
-            let joined = Self.joinTokensForDisplay(currentWords)
+            let joined = Self.polishSungLyricLine(Self.joinTokensForDisplay(currentWords))
             if !joined.isEmpty {
-                lines.append(BuiltLine(timestamp: lineStartTime, text: joined, isInstrumental: false))
+                // Merge tiny 1-word orphan fragments (<= 3 chars) into the previous short sung line if < 0.9s apart
+                if joined.count <= 3 && !containsCJK(joined),
+                   let lastIdx = lines.indices.last,
+                   !lines[lastIdx].isInstrumental,
+                   lines[lastIdx].text.count <= 34,
+                   (lineStartTime - lines[lastIdx].timestamp) <= 3.5 {
+                    lines[lastIdx].text += " " + joined.lowercased()
+                } else {
+                    lines.append(BuiltLine(timestamp: lineStartTime, text: joined, isInstrumental: false))
+                }
             }
             currentWords.removeAll(keepingCapacity: true)
         }
