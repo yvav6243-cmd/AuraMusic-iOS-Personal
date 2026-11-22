@@ -453,6 +453,58 @@ public final class LyricsService: ObservableObject {
         }
     }
 
+    nonisolated public static func lyricsCacheKey(for track: UniversalTrack) -> String {
+        let (parsedTitle, parsedArtist) = extractCleanTitleAndArtist(rawTitle: track.title, rawArtist: track.artist)
+        return "\(parsedArtist.lowercased())::\(parsedTitle.lowercased())"
+    }
+
+    public func hasCachedLyrics(for track: UniversalTrack) -> Bool {
+        let key = Self.lyricsCacheKey(for: track)
+        let context = PersistenceController.shared.context
+        let descriptor = FetchDescriptor<PersistedCachedLyricsEntity>(
+            predicate: #Predicate { $0.cacheKey == key }
+        )
+        guard let cached = try? context.fetch(descriptor).first else { return false }
+        return !(cached.syncedLRC ?? "").isEmpty || !(cached.plainLyrics ?? "").isEmpty
+    }
+
+    /// Downloads & persists synchronized lyrics alongside offline audio tracks / playlists WITHOUT disturbing the currently playing lyrics view!
+    @discardableResult
+    public func prefetchAndCacheLyrics(for track: UniversalTrack) async -> Bool {
+        let cacheKey = Self.lyricsCacheKey(for: track)
+        let context = PersistenceController.shared.context
+        let descriptor = FetchDescriptor<PersistedCachedLyricsEntity>(
+            predicate: #Predicate { $0.cacheKey == cacheKey }
+        )
+        if let existing = try? context.fetch(descriptor).first,
+           !(existing.syncedLRC ?? "").isEmpty {
+            return true
+        }
+
+        if let bestDTO = await fetchBestRemoteLyricsCandidate(for: track) {
+            cacheLyrics(
+                cacheKey: cacheKey,
+                title: track.title,
+                artist: track.artist,
+                syncedLRC: bestDTO.syncedLyrics,
+                plainLyrics: bestDTO.plainLyrics
+            )
+            // If this track is currently active on screen and had no lyrics yet, display them immediately
+            if loadedTrackID == track.id && currentDocument == nil {
+                self.currentDocument = buildDocument(
+                    title: track.title,
+                    artist: track.artist,
+                    syncedLRC: bestDTO.syncedLyrics,
+                    plainLyrics: bestDTO.plainLyrics,
+                    trackDuration: track.duration
+                )
+                self.errorMessage = nil
+            }
+            return true
+        }
+        return hasCachedLyrics(for: track)
+    }
+
     public func loadLyrics(for track: UniversalTrack, forceReload: Bool = false) async {
         // Avoid wiping and reloading already-loaded lyrics when re-opening the Lyrics panel for the same track
         if !forceReload, loadedTrackID == track.id, currentDocument != nil {
@@ -463,18 +515,19 @@ public final class LyricsService: ObservableObject {
         let requestID = UUID()
         activeRequestID = requestID
 
-        let (parsedTitle, parsedArtist) = Self.extractCleanTitleAndArtist(rawTitle: track.title, rawArtist: track.artist)
-        let cacheKey = "\(parsedArtist.lowercased())::\(parsedTitle.lowercased())"
+        let (parsedTitle, _) = Self.extractCleanTitleAndArtist(rawTitle: track.title, rawArtist: track.artist)
+        let cacheKey = Self.lyricsCacheKey(for: track)
 
         isLoading = true
         errorMessage = nil
 
-        // 1. Check SwiftData local lyrics cache first (only if it has synchronized LRC)
+        // 1. Check SwiftData local offline lyrics cache first
         let context = PersistenceController.shared.context
         let descriptor = FetchDescriptor<PersistedCachedLyricsEntity>(
             predicate: #Predicate { $0.cacheKey == cacheKey }
         )
-        if let cached = try? context.fetch(descriptor).first,
+        let cachedEntity = try? context.fetch(descriptor).first
+        if let cached = cachedEntity,
            !(cached.syncedLRC ?? "").isEmpty {
             guard activeRequestID == requestID else { return }
             self.currentDocument = buildDocument(
@@ -489,62 +542,160 @@ public final class LyricsService: ObservableObject {
             return
         }
 
-        // 2. Parallel 6-provider lyrics search prioritizing time-synchronized LRC in the ORIGINAL language:
-        //    Wave 1 (Parallel): YouTube Music InnerTube Timed Lyrics (exact videoId) + LRCLIB + QQ Music + NetEase Cloud Music
-        //    Wave 2 (Fallback if no synced LRC yet): Kugou Music + iTunes CN/RU/US canonical metadata + reversed query + Lyrics.ovh
+        // 2. Parallel 6-provider remote lookup
+        if let bestDTO = await fetchBestRemoteLyricsCandidate(for: track) {
+            guard activeRequestID == requestID else { return }
+            cacheLyrics(
+                cacheKey: cacheKey,
+                title: track.title,
+                artist: track.artist,
+                syncedLRC: bestDTO.syncedLyrics,
+                plainLyrics: bestDTO.plainLyrics
+            )
+            self.currentDocument = buildDocument(
+                title: track.title,
+                artist: track.artist,
+                syncedLRC: bestDTO.syncedLyrics,
+                plainLyrics: bestDTO.plainLyrics,
+                trackDuration: track.duration
+            )
+            self.loadedTrackID = track.id
+            self.isLoading = false
+            return
+        }
+
+        // 3. Offline Airplane Mode fallback: if plain lyrics were cached locally with the downloaded song, display them cleanly!
+        if let cached = cachedEntity, !(cached.plainLyrics ?? "").isEmpty {
+            guard activeRequestID == requestID else { return }
+            self.currentDocument = buildDocument(
+                title: track.title,
+                artist: track.artist,
+                syncedLRC: nil,
+                plainLyrics: cached.plainLyrics,
+                trackDuration: track.duration
+            )
+            self.loadedTrackID = track.id
+            self.isLoading = false
+            return
+        }
+
+        guard activeRequestID == requestID else { return }
+        self.currentDocument = nil
+        self.loadedTrackID = track.id
+        self.errorMessage = "No licensed lyrics found for \"\(parsedTitle)\". Tap the magnifying glass to search manually."
+        self.isLoading = false
+    }
+
+    private func fetchBestRemoteLyricsCandidate(for track: UniversalTrack) async -> LRCLIBEntryDTO? {
+        let (parsedTitle, parsedArtist) = Self.extractCleanTitleAndArtist(rawTitle: track.title, rawArtist: track.artist)
         let referenceScriptText = "\(track.title) \(track.artist) \(parsedTitle) \(parsedArtist)"
         let youtubeVideoID: String? = (track.provider == .youtubeMusic || track.provider == .youtube)
             ? track.providerTrackID
             : nil
 
-        do {
-            var allCandidates: [LRCLIBEntryDTO] = []
+        var allCandidates: [LRCLIBEntryDTO] = []
 
-            // Wave 1: Fire YouTube Music (exact videoId), LRCLIB, QQ Music, and NetEase Cloud Music in parallel!
-            let primaryQuery = "\(parsedTitle) \(parsedArtist)".trimmingCharacters(in: .whitespacesAndNewlines)
-            let wave1Results: [LRCLIBEntryDTO] = await withTaskGroup(of: [LRCLIBEntryDTO].self) { group in
-                if let vid = youtubeVideoID, !vid.isEmpty {
+        // Wave 1: Fire YouTube Music (exact videoId), LRCLIB, QQ Music, and NetEase Cloud Music in parallel!
+        let primaryQuery = "\(parsedTitle) \(parsedArtist)".trimmingCharacters(in: .whitespacesAndNewlines)
+        let wave1Results: [LRCLIBEntryDTO] = await withTaskGroup(of: [LRCLIBEntryDTO].self) { group in
+            if let vid = youtubeVideoID, !vid.isEmpty {
+                group.addTask {
+                    if let ytDTO = await self.fetchYouTubeMusicOfficialLyrics(
+                        videoID: vid,
+                        fallbackTitle: parsedTitle,
+                        fallbackArtist: parsedArtist,
+                        duration: track.duration
+                    ) {
+                        return [ytDTO]
+                    }
+                    return []
+                }
+            }
+
+            group.addTask {
+                var list: [LRCLIBEntryDTO] = []
+                if let exact = try? await self.fetchExactLRCLIB(title: parsedTitle, artist: parsedArtist, album: track.album, duration: track.duration) {
+                    list.append(exact)
+                }
+                if let search1 = try? await self.searchLRCLIB(title: parsedTitle, artist: parsedArtist) {
+                    list.append(contentsOf: search1)
+                }
+                if let search2 = try? await self.searchLRCLIB(title: parsedTitle, artist: "") {
+                    list.append(contentsOf: search2)
+                }
+                return list
+            }
+
+            group.addTask {
+                var qqList = await self.fetchQQMusicLyrics(query: primaryQuery, targetDuration: track.duration)
+                if qqList.isEmpty && !parsedTitle.isEmpty && primaryQuery != parsedTitle {
+                    qqList = await self.fetchQQMusicLyrics(query: parsedTitle, targetDuration: track.duration)
+                }
+                return qqList
+            }
+
+            group.addTask {
+                var neList = await self.fetchNetEaseLyrics(query: primaryQuery, targetDuration: track.duration)
+                if neList.isEmpty && !parsedTitle.isEmpty && primaryQuery != parsedTitle {
+                    neList = await self.fetchNetEaseLyrics(query: parsedTitle, targetDuration: track.duration)
+                }
+                return neList
+            }
+
+            var merged: [LRCLIBEntryDTO] = []
+            for await batch in group {
+                merged.append(contentsOf: batch)
+            }
+            return merged
+        }
+        allCandidates.append(contentsOf: wave1Results)
+
+        let hasGoodSyncedAlready = Self.selectBestOriginalLanguageCandidate(
+            from: allCandidates,
+            referenceText: referenceScriptText,
+            targetTitle: parsedTitle,
+            targetArtist: parsedArtist,
+            targetDuration: track.duration
+        ).map { !($0.syncedLyrics ?? "").isEmpty } ?? false
+
+        // Wave 2: Smart fallbacks (Kugou Music + localized iTunes CN/RU/US canonical lookup + reversed "Song - Artist" + Lyrics.ovh)
+        if !hasGoodSyncedAlready {
+            let wave2Results: [LRCLIBEntryDTO] = await withTaskGroup(of: [LRCLIBEntryDTO].self) { group in
+                group.addTask {
+                    await self.fetchKugouLyrics(query: primaryQuery, targetDuration: track.duration)
+                }
+
+                if parsedTitle != parsedArtist, !parsedArtist.isEmpty {
                     group.addTask {
-                        if let ytDTO = await self.fetchYouTubeMusicOfficialLyrics(
-                            videoID: vid,
-                            fallbackTitle: parsedTitle,
-                            fallbackArtist: parsedArtist,
-                            duration: track.duration
-                        ) {
-                            return [ytDTO]
+                        var rev: [LRCLIBEntryDTO] = []
+                        if let reversedSearch = try? await self.searchLRCLIB(title: parsedArtist, artist: parsedTitle) {
+                            rev.append(contentsOf: reversedSearch)
                         }
-                        return []
+                        let reversedQuery = "\(parsedArtist) \(parsedTitle)"
+                        rev.append(contentsOf: await self.fetchQQMusicLyrics(query: reversedQuery, targetDuration: track.duration))
+                        return rev
                     }
                 }
 
                 group.addTask {
-                    var list: [LRCLIBEntryDTO] = []
-                    if let exact = try? await self.fetchExactLRCLIB(title: parsedTitle, artist: parsedArtist, album: track.album, duration: track.duration) {
-                        list.append(exact)
+                    var canonicalHits: [LRCLIBEntryDTO] = []
+                    let countryCode: String
+                    if Self.containsScript(referenceScriptText, pattern: "\\p{Han}") && !Self.containsScript(referenceScriptText, pattern: "[\\p{Hiragana}\\p{Katakana}]") {
+                        countryCode = "cn"
+                    } else if Self.containsScript(referenceScriptText, pattern: "\\p{Cyrillic}") {
+                        countryCode = "ru"
+                    } else {
+                        countryCode = "us"
                     }
-                    if let search1 = try? await self.searchLRCLIB(title: parsedTitle, artist: parsedArtist) {
-                        list.append(contentsOf: search1)
+                    if let canonical = await self.resolveCanonicalMetadataFromCatalog(query: primaryQuery, country: countryCode) {
+                        let canonicalQuery = "\(canonical.title) \(canonical.artist)".trimmingCharacters(in: .whitespacesAndNewlines)
+                        if let s3 = try? await self.searchLRCLIB(title: canonical.title, artist: canonical.artist) {
+                            canonicalHits.append(contentsOf: s3)
+                        }
+                        canonicalHits.append(contentsOf: await self.fetchQQMusicLyrics(query: canonicalQuery, targetDuration: track.duration))
+                        canonicalHits.append(contentsOf: await self.fetchNetEaseLyrics(query: canonicalQuery, targetDuration: track.duration))
                     }
-                    if let search2 = try? await self.searchLRCLIB(title: parsedTitle, artist: "") {
-                        list.append(contentsOf: search2)
-                    }
-                    return list
-                }
-
-                group.addTask {
-                    var qqList = await self.fetchQQMusicLyrics(query: primaryQuery, targetDuration: track.duration)
-                    if qqList.isEmpty && !parsedTitle.isEmpty && primaryQuery != parsedTitle {
-                        qqList = await self.fetchQQMusicLyrics(query: parsedTitle, targetDuration: track.duration)
-                    }
-                    return qqList
-                }
-
-                group.addTask {
-                    var neList = await self.fetchNetEaseLyrics(query: primaryQuery, targetDuration: track.duration)
-                    if neList.isEmpty && !parsedTitle.isEmpty && primaryQuery != parsedTitle {
-                        neList = await self.fetchNetEaseLyrics(query: parsedTitle, targetDuration: track.duration)
-                    }
-                    return neList
+                    return canonicalHits
                 }
 
                 var merged: [LRCLIBEntryDTO] = []
@@ -553,117 +704,34 @@ public final class LyricsService: ObservableObject {
                 }
                 return merged
             }
-            allCandidates.append(contentsOf: wave1Results)
+            allCandidates.append(contentsOf: wave2Results)
+        }
 
-            let hasGoodSyncedAlready = Self.selectBestOriginalLanguageCandidate(
-                from: allCandidates,
-                referenceText: referenceScriptText,
-                targetTitle: parsedTitle,
-                targetArtist: parsedArtist,
-                targetDuration: track.duration
-            ).map { !($0.syncedLyrics ?? "").isEmpty } ?? false
-
-            // Wave 2: Smart fallbacks (Kugou Music + localized iTunes CN/RU/US canonical lookup + reversed "Song - Artist" + Lyrics.ovh)
-            if !hasGoodSyncedAlready {
-                let wave2Results: [LRCLIBEntryDTO] = await withTaskGroup(of: [LRCLIBEntryDTO].self) { group in
-                    group.addTask {
-                        await self.fetchKugouLyrics(query: primaryQuery, targetDuration: track.duration)
-                    }
-
-                    if parsedTitle != parsedArtist, !parsedArtist.isEmpty {
-                        group.addTask {
-                            var rev: [LRCLIBEntryDTO] = []
-                            if let reversedSearch = try? await self.searchLRCLIB(title: parsedArtist, artist: parsedTitle) {
-                                rev.append(contentsOf: reversedSearch)
-                            }
-                            let reversedQuery = "\(parsedArtist) \(parsedTitle)"
-                            rev.append(contentsOf: await self.fetchQQMusicLyrics(query: reversedQuery, targetDuration: track.duration))
-                            return rev
-                        }
-                    }
-
-                    group.addTask {
-                        var canonicalHits: [LRCLIBEntryDTO] = []
-                        let countryCode: String
-                        if Self.containsScript(referenceScriptText, pattern: "\\p{Han}") && !Self.containsScript(referenceScriptText, pattern: "[\\p{Hiragana}\\p{Katakana}]") {
-                            countryCode = "cn"
-                        } else if Self.containsScript(referenceScriptText, pattern: "\\p{Cyrillic}") {
-                            countryCode = "ru"
-                        } else {
-                            countryCode = "us"
-                        }
-                        if let canonical = await self.resolveCanonicalMetadataFromCatalog(query: primaryQuery, country: countryCode) {
-                            let canonicalQuery = "\(canonical.title) \(canonical.artist)".trimmingCharacters(in: .whitespacesAndNewlines)
-                            if let s3 = try? await self.searchLRCLIB(title: canonical.title, artist: canonical.artist) {
-                                canonicalHits.append(contentsOf: s3)
-                            }
-                            canonicalHits.append(contentsOf: await self.fetchQQMusicLyrics(query: canonicalQuery, targetDuration: track.duration))
-                            canonicalHits.append(contentsOf: await self.fetchNetEaseLyrics(query: canonicalQuery, targetDuration: track.duration))
-                        }
-                        return canonicalHits
-                    }
-
-                    var merged: [LRCLIBEntryDTO] = []
-                    for await batch in group {
-                        merged.append(contentsOf: batch)
-                    }
-                    return merged
-                }
-                allCandidates.append(contentsOf: wave2Results)
-            }
-
-            // Stage 3: Backup public Lyrics.ovh lookup if all 5 synced catalogs returned nothing
-            if allCandidates.isEmpty {
-                if let ovhPlain = await fetchBackupLyricsOvh(artist: parsedArtist, title: parsedTitle) {
-                    allCandidates.append(
-                        LRCLIBEntryDTO(
-                            id: 999999,
-                            trackName: parsedTitle,
-                            artistName: parsedArtist,
-                            albumName: track.album,
-                            duration: track.duration,
-                            instrumental: false,
-                            plainLyrics: ovhPlain,
-                            syncedLyrics: nil
-                        )
+        // Stage 3: Backup public Lyrics.ovh lookup if all 5 synced catalogs returned nothing
+        if allCandidates.isEmpty {
+            if let ovhPlain = await fetchBackupLyricsOvh(artist: parsedArtist, title: parsedTitle) {
+                allCandidates.append(
+                    LRCLIBEntryDTO(
+                        id: 999999,
+                        trackName: parsedTitle,
+                        artistName: parsedArtist,
+                        albumName: track.album,
+                        duration: track.duration,
+                        instrumental: false,
+                        plainLyrics: ovhPlain,
+                        syncedLyrics: nil
                     )
-                }
-            }
-
-            guard activeRequestID == requestID else { return }
-
-            if let bestDTO = Self.selectBestOriginalLanguageCandidate(
-                from: allCandidates,
-                referenceText: referenceScriptText,
-                targetTitle: parsedTitle,
-                targetArtist: parsedArtist,
-                targetDuration: track.duration
-            ) {
-                cacheLyrics(
-                    cacheKey: cacheKey,
-                    title: track.title,
-                    artist: track.artist,
-                    syncedLRC: bestDTO.syncedLyrics,
-                    plainLyrics: bestDTO.plainLyrics
                 )
-                self.currentDocument = buildDocument(
-                    title: track.title,
-                    artist: track.artist,
-                    syncedLRC: bestDTO.syncedLyrics,
-                    plainLyrics: bestDTO.plainLyrics,
-                    trackDuration: track.duration
-                )
-                self.loadedTrackID = track.id
-                self.isLoading = false
-                return
             }
         }
 
-        guard activeRequestID == requestID else { return }
-        self.currentDocument = nil
-        self.loadedTrackID = track.id
-        self.errorMessage = "No licensed lyrics found for \"\(parsedTitle)\". Tap the magnifying glass to search manually."
-        self.isLoading = false
+        return Self.selectBestOriginalLanguageCandidate(
+            from: allCandidates,
+            referenceText: referenceScriptText,
+            targetTitle: parsedTitle,
+            targetArtist: parsedArtist,
+            targetDuration: track.duration
+        )
     }
 
     /// Splits composite titles like "Miyagi & Эндшпиль feat. Рем Дигга - I Got Love (Official Video)" into ("I Got Love", "Miyagi & Эндшпиль")

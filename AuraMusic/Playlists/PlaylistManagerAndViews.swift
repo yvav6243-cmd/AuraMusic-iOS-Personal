@@ -494,6 +494,50 @@ public struct PlaylistDetailView: View {
                         .buttonStyle(.plain)
                     }
                     .padding(.top, 4)
+
+                    // Prominent One-Tap Download Entire Playlist Button (Full Audio + Synced Lyrics!)
+                    if !tracks.isEmpty {
+                        let summary = downloadManager.playlistDownloadSummary(for: tracks)
+                        let allDone = summary.total > 0 && summary.completed == summary.total
+                        Button {
+                            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                            downloadManager.enqueuePlaylistDownload(tracks: tracks)
+                        } label: {
+                            HStack(spacing: 8) {
+                                if summary.active > 0 {
+                                    ProgressView()
+                                        .scaleEffect(0.85)
+                                        .tint(AuraTheme.accentPink)
+                                    Text("Скачивание плейлиста: \(summary.completed) / \(summary.total)")
+                                        .font(.system(size: 14, weight: .bold))
+                                        .foregroundStyle(AuraTheme.accentPink)
+                                } else if allDone {
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .font(.system(size: 16, weight: .bold))
+                                        .foregroundStyle(.green)
+                                    Text("Плейлист скачан офлайн (\(summary.completed)/\(summary.total))")
+                                        .font(.system(size: 14, weight: .bold))
+                                        .foregroundStyle(.green)
+                                } else {
+                                    Image(systemName: "arrow.down.circle.fill")
+                                        .font(.system(size: 16, weight: .bold))
+                                        .foregroundStyle(.white)
+                                    Text(summary.completed > 0
+                                         ? "Докачать плейлист (\(summary.total - summary.completed) осталось)"
+                                         : "Скачать весь плейлист (\(summary.total))")
+                                        .font(.system(size: 14, weight: .bold))
+                                        .foregroundStyle(.white)
+                                }
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 11)
+                            .background(
+                                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                    .fill(allDone ? Color.green.opacity(0.16) : (summary.active > 0 ? AuraTheme.accentPink.opacity(0.14) : AuraTheme.accentPink))
+                            )
+                        }
+                        .buttonStyle(.plain)
+                    }
                 }
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 8)
@@ -509,7 +553,7 @@ public struct PlaylistDetailView: View {
                 } else {
                     ForEach(tracks) { track in
                         HStack(spacing: 12) {
-                            AuraArtworkView(url: track.artworkURL, size: 46, cornerRadius: 7)
+                            AuraArtworkView(url: persistence.effectiveArtworkURL(for: track), size: 46, cornerRadius: 7)
 
                             VStack(alignment: .leading, spacing: 3) {
                                 HStack(spacing: 6) {
@@ -531,6 +575,15 @@ public struct PlaylistDetailView: View {
                             }
 
                             Spacer()
+
+                            if downloadManager.isDownloaded(track) {
+                                Image(systemName: "arrow.down.circle.fill")
+                                    .font(.system(size: 14, weight: .semibold))
+                                    .foregroundStyle(.green)
+                            } else if downloadManager.isDownloadingOrQueued(track) {
+                                ProgressView()
+                                    .scaleEffect(0.7)
+                            }
 
                             Text(track.formattedDuration)
                                 .font(.system(size: 12, weight: .medium))
@@ -555,6 +608,17 @@ public struct PlaylistDetailView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
+                if !tracks.isEmpty {
+                    let summary = downloadManager.playlistDownloadSummary(for: tracks)
+                    Button {
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        downloadManager.enqueuePlaylistDownload(tracks: tracks)
+                    } label: {
+                        Image(systemName: summary.completed == summary.total ? "checkmark.circle.fill" : "arrow.down.circle")
+                            .foregroundStyle(summary.completed == summary.total ? Color.green : AuraTheme.accentPink)
+                    }
+                    .accessibilityLabel("Download Entire Playlist")
+                }
                 if !playlist.isSmartPlaylist {
                     EditButton()
                 }

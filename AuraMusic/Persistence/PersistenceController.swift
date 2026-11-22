@@ -71,6 +71,7 @@ public final class PersistedTrackEntity {
 
     public func toUniversalTrack() -> UniversalTrack {
         let provider = MusicProviderType(rawValue: providerRaw) ?? .audius
+        let resolvedArtworkURL = artworkURLString.flatMap { PersistenceController.resolveLiveCustomCoverURL(from: $0) ?? URL(string: $0) }
         return UniversalTrack(
             id: trackID,
             provider: provider,
@@ -78,7 +79,7 @@ public final class PersistedTrackEntity {
             title: title,
             artist: artist,
             album: album,
-            artworkURL: artworkURLString.flatMap(URL.init(string:)),
+            artworkURL: resolvedArtworkURL,
             duration: duration,
             isrc: isrc,
             genre: genre,
@@ -266,7 +267,21 @@ public final class PersistenceController: ObservableObject {
     // O(1) in-memory lookup caches rebuilt once per reloadAll() to eliminate O(N) SwiftData scans inside ScrollView cells
     private var favoriteTrackIDs: Set<String> = []
     private var customArtworkURLByTrackID: [String: URL] = [:]
+    private var customArtworkURLByProviderTrackID: [String: URL] = [:]
     private var customArtworkFlagTrackIDs: Set<String> = []
+    private var customArtworkFlagProviderTrackIDs: Set<String> = []
+
+    /// Resolves any persisted custom cover path against the CURRENT app sandbox Documents directory
+    /// so custom song photos survive Sideloadly updates and iOS container UUID relocations!
+    nonisolated public static func resolveLiveCustomCoverURL(from stored: String) -> URL? {
+        let marker = "AuraLocalFiles/CustomCovers/"
+        guard let range = stored.range(of: marker) else { return nil }
+        let fileName = String(stored[range.upperBound...]).removingPercentEncoding ?? String(stored[range.upperBound...])
+        guard !fileName.isEmpty, !fileName.contains("..") else { return nil }
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let liveURL = docs.appendingPathComponent(marker).appendingPathComponent(fileName)
+        return FileManager.default.fileExists(atPath: liveURL.path) ? liveURL : nil
+    }
 
     public init(inMemory: Bool = false) {
         let schema = Schema([
@@ -306,23 +321,33 @@ public final class PersistenceController: ObservableObject {
 
         var favs = Set<String>()
         var customURLs: [String: URL] = [:]
+        var customByProviderID: [String: URL] = [:]
         var customFlags = Set<String>()
+        var customProviderFlags = Set<String>()
         for entity in fetchedTracks {
             if entity.isFavorite {
                 favs.insert(entity.trackID)
             }
             if let artStr = entity.artworkURLString,
-               artStr.hasPrefix("file://"),
-               let url = URL(string: artStr) {
-                customURLs[entity.trackID] = url
-                if entity.customArtworkData != nil {
+               (artStr.hasPrefix("file://") || artStr.contains("AuraLocalFiles/CustomCovers/")) {
+                let resolved = Self.resolveLiveCustomCoverURL(from: artStr) ?? URL(string: artStr)
+                if let url = resolved, FileManager.default.fileExists(atPath: url.path) {
+                    customURLs[entity.trackID] = url
+                    if !entity.providerTrackID.isEmpty {
+                        customByProviderID[entity.providerTrackID] = url
+                    }
                     customFlags.insert(entity.trackID)
+                    if !entity.providerTrackID.isEmpty {
+                        customProviderFlags.insert(entity.providerTrackID)
+                    }
                 }
             }
         }
         self.favoriteTrackIDs = favs
         self.customArtworkURLByTrackID = customURLs
+        self.customArtworkURLByProviderTrackID = customByProviderID
         self.customArtworkFlagTrackIDs = customFlags
+        self.customArtworkFlagProviderTrackIDs = customProviderFlags
 
         let playlistDescriptor = FetchDescriptor<PersistedPlaylistEntity>(
             sortBy: [SortDescriptor(\.updatedAt, order: .reverse)]
@@ -425,7 +450,8 @@ public final class PersistenceController: ObservableObject {
         }
     }
 
-    /// Sets a custom user photo as the song's cover artwork, or pass nil to restore the default album cover
+    /// Sets a custom user photo as the song's cover artwork, or pass nil to restore the default album cover.
+    /// Uses a unique versioned filename + invalidates ArtworkCacheManager so UI and Lock Screen update instantaneously!
     @discardableResult
     public func setCustomTrackArtwork(imageData: Data?, for track: UniversalTrack, defaultArtworkURL: URL? = nil) -> URL? {
         let entity = upsertTrack(track, addToLibrary: true)
@@ -436,29 +462,47 @@ public final class PersistenceController: ObservableObject {
         let safeID = track.id
             .replacingOccurrences(of: ":", with: "_")
             .replacingOccurrences(of: "/", with: "_")
-        let fileURL = coversDir.appendingPathComponent("\(safeID)_custom.jpg")
+
+        // Invalidate & delete any previous custom cover file for this track
+        if let prevArt = entity.artworkURLString,
+           let prevLive = Self.resolveLiveCustomCoverURL(from: prevArt) ?? URL(string: prevArt),
+           prevLive.isFileURL {
+            ArtworkCacheManager.shared.invalidate(url: prevLive)
+            try? FileManager.default.removeItem(at: prevLive)
+        }
+        let legacyURL = coversDir.appendingPathComponent("\(safeID)_custom.jpg")
+        ArtworkCacheManager.shared.invalidate(url: legacyURL)
+        try? FileManager.default.removeItem(at: legacyURL)
 
         if let imageData, let uiImg = UIImage(data: imageData), let jpg = uiImg.jpegData(compressionQuality: 0.88) {
-            // Store original remote URL in customArtworkData if needed so we can restore default cover later
-            if entity.customArtworkData == nil,
-               let currentArt = entity.artworkURLString,
-               !currentArt.hasPrefix("file://") {
-                entity.customArtworkData = Data(currentArt.utf8)
+            // Preserve original remote URL in customArtworkData so user can reset to default album cover later
+            if entity.customArtworkData == nil {
+                let candidateOriginal = entity.artworkURLString ?? defaultArtworkURL?.absoluteString
+                if let orig = candidateOriginal,
+                   !orig.hasPrefix("file://"),
+                   !orig.contains("AuraLocalFiles/CustomCovers/") {
+                    entity.customArtworkData = Data(orig.utf8)
+                }
             }
+            let stamp = Int(Date().timeIntervalSince1970 * 1000)
+            let versionedName = "\(safeID)_custom_\(stamp).jpg"
+            let fileURL = coversDir.appendingPathComponent(versionedName)
             try? jpg.write(to: fileURL, options: .atomic)
-            entity.artworkURLString = fileURL.absoluteString
+            // Store container-independent relative marker so custom photo survives Sideloadly app updates!
+            entity.artworkURLString = "AuraLocalFiles/CustomCovers/\(versionedName)"
             try? context.save()
             reloadAll()
             return fileURL
         } else {
             // Restore default album cover
-            try? FileManager.default.removeItem(at: fileURL)
             if let savedOriginalData = entity.customArtworkData,
                let originalURLString = String(data: savedOriginalData, encoding: .utf8),
                !originalURLString.isEmpty {
                 entity.artworkURLString = originalURLString
-            } else if let defaultArtworkURL {
+            } else if let defaultArtworkURL, !defaultArtworkURL.isFileURL {
                 entity.artworkURLString = defaultArtworkURL.absoluteString
+            } else {
+                entity.artworkURLString = nil
             }
             entity.customArtworkData = nil
             try? context.save()
@@ -471,8 +515,19 @@ public final class PersistenceController: ObservableObject {
         customArtworkFlagTrackIDs.contains(trackID)
     }
 
+    public func hasCustomArtwork(for track: UniversalTrack) -> Bool {
+        customArtworkFlagTrackIDs.contains(track.id)
+            || (!track.providerTrackID.isEmpty && customArtworkFlagProviderTrackIDs.contains(track.providerTrackID))
+    }
+
     public func effectiveArtworkURL(for track: UniversalTrack) -> URL? {
-        customArtworkURLByTrackID[track.id] ?? track.artworkURL
+        if let byID = customArtworkURLByTrackID[track.id] {
+            return byID
+        }
+        if !track.providerTrackID.isEmpty, let byProvider = customArtworkURLByProviderTrackID[track.providerTrackID] {
+            return byProvider
+        }
+        return track.artworkURL
     }
 
     public func isTrackFavorite(_ trackID: String) -> Bool {

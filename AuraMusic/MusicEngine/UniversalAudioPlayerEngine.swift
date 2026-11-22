@@ -484,10 +484,17 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     }
 
     public func applyUpdatedArtworkURL(_ newURL: URL?, forTrackID trackID: String) {
-        guard var current = currentTrack, current.id == trackID else { return }
+        guard var current = currentTrack,
+              current.id == trackID || (!current.providerTrackID.isEmpty && current.providerTrackID == trackID) else {
+            return
+        }
+        if let oldURL = current.artworkURL, oldURL != newURL {
+            ArtworkCacheManager.shared.invalidate(url: oldURL)
+        }
         current.artworkURL = newURL
         self.currentTrack = current
         refreshNowPlayingMetadata()
+        reassertNowPlayingOwnershipAfterDelay()
     }
 
     // MARK: - YouTube IFrame JS Bridge Handlers
@@ -985,28 +992,45 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         lastUserResumeWallTime = 0
         playPauseCooldownGate.reset()
         playbackStatusBanner = nil
-        // Preserve existing WKWebView when switching between online YouTube tracks so background Next/Prev
-        // reuses the live WebContent process (destroying WKWebView in background kills background playback on iOS!).
-        let hasOfflineFile = (track.localFileRelativePath ?? OfflineDownloadManager.shared.completedLocalRelativePath(for: track.id)) != nil
-        if (track.provider != .youtubeMusic && track.provider != .youtube) || hasOfflineFile {
+        // ALWAYS prefer local offline downloaded audio FIRST — even when internet is available (instant start + 0 ads + native AVPlayer)!
+        let offlineRelativePath = OfflineDownloadManager.shared.completedLocalRelativePath(for: track)
+        let offlineFileURL = offlineRelativePath.flatMap { resolveLocalFileURL(relativePath: $0) }
+        let hasOfflineFile = offlineFileURL.map { FileManager.default.fileExists(atPath: $0.path) } ?? false
+
+        if hasOfflineFile {
+            if activeYouTubeVideoID != nil {
+                evaluateYouTubeJS("if(window.auraControl){window.auraControl.pause();}")
+            }
+            activeYouTubeVideoID = nil
+        } else if track.provider != .youtubeMusic && track.provider != .youtube {
+            // Preserve existing WKWebView when switching between online YouTube tracks so background Next/Prev
+            // reuses the live WebContent process (destroying WKWebView in background kills background playback on iOS!).
             activeYouTubeVideoID = nil
         }
+
         // Default to pure Apple Music square-artwork audio view; only show video automatically if user explicitly tapped a raw YouTube video
-        isYouTubeVideoVisible = (track.provider == .youtube)
+        isYouTubeVideoVisible = (!hasOfflineFile && track.provider == .youtube)
         crossfadeTriggeredForCurrentItem = false
-        refreshNowPlayingMetadata()
 
         Task { @MainActor in
-            PersistenceController.shared.recordPlayback(of: track)
+            PersistenceController.shared.recordPlayback(of: trackWithCustomArt)
             ProviderCredentialsStore.shared.refreshActiveProviderPriority()
         }
 
         Task {
-            await LyricsService.shared.loadLyrics(for: track)
+            await LyricsService.shared.loadLyrics(for: trackWithCustomArt)
         }
 
+        // If full-length offline audio is already downloaded, start native AVPlayer IMMEDIATELY on frame 0!
+        if let localURL = offlineFileURL, hasOfflineFile {
+            startAVPlayer(with: localURL, for: trackWithCustomArt, banner: "Offline Audio")
+            return
+        }
+
+        refreshNowPlayingMetadata()
+
         Task {
-            await loadAndStartPlayback(for: track, generation: activeGeneration)
+            await loadAndStartPlayback(for: trackWithCustomArt, generation: activeGeneration)
         }
     }
 
@@ -1016,9 +1040,8 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
             configureAudioSession(mixWithWebKit: true)
         }
 
-        // 1. Check if downloaded offline or imported as a local file first (works 100% offline in Airplane Mode)
-        let offlinePath = track.localFileRelativePath
-            ?? OfflineDownloadManager.shared.completedLocalRelativePath(for: track.id)
+        // 1. Check if downloaded offline or imported as a local file first (works 100% offline in Airplane Mode & skips online buffering/ads!)
+        let offlinePath = OfflineDownloadManager.shared.completedLocalRelativePath(for: track)
         if let localRelative = offlinePath,
            let fileURL = resolveLocalFileURL(relativePath: localRelative),
            FileManager.default.fileExists(atPath: fileURL.path) {
@@ -1167,7 +1190,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
 
     private func upgradeToSquareAppleMusicCoverIfNeeded(for track: UniversalTrack) async {
         // Never overwrite a custom cover photo chosen by the user
-        if PersistenceController.shared.hasCustomArtwork(for: track.id) {
+        if PersistenceController.shared.hasCustomArtwork(for: track) {
             if let customURL = PersistenceController.shared.effectiveArtworkURL(for: track),
                currentTrack?.id == track.id {
                 var updated = track
@@ -1545,7 +1568,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
             return
         }
 
-        let info: [String: Any] = [
+        var info: [String: Any] = [
             MPMediaItemPropertyTitle: track.title,
             MPMediaItemPropertyArtist: track.artist,
             MPMediaItemPropertyAlbumTitle: track.album,
@@ -1555,24 +1578,49 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
             MPNowPlayingInfoPropertyDefaultPlaybackRate: 1.0
         ]
 
-        center.nowPlayingInfo = info
-        center.playbackState = isPlaying ? .playing : .paused
-
-        // Sync title, artist, album, and cover into WebKit navigator.mediaSession too so Lock Screen shows AuraMusic's track metadata + ⏮/⏭
-        if activeYouTubeVideoID != nil {
-            let metaPayload: [String: String] = [
-                "title": track.title,
-                "artist": track.artist,
-                "album": track.album,
-                "artwork": track.artworkURL?.absoluteString ?? ""
-            ]
-            if let jsonData = try? JSONSerialization.data(withJSONObject: metaPayload),
-               let jsonString = String(data: jsonData, encoding: .utf8) {
-                evaluateYouTubeJS("if(window.auraControl && window.auraControl.setMetadata){window.auraControl.setMetadata(\(jsonString));}")
+        // Synchronously attach custom local `file://` photo (or memory-cached cover) immediately on frame 0 so Lock Screen ALWAYS shows it!
+        let effectiveArtURL = PersistenceController.shared.effectiveArtworkURL(for: track) ?? track.artworkURL
+        var attachedImmediateArtwork = false
+        if let artworkURL = effectiveArtURL {
+            if let immediateImage = ArtworkCacheManager.shared.cachedMemoryImage(for: artworkURL)
+                ?? (artworkURL.isFileURL ? UIImage(contentsOfFile: artworkURL.path) : nil) {
+                info[MPMediaItemPropertyArtwork] = MPMediaItemArtwork(boundsSize: immediateImage.size) { _ in immediateImage }
+                attachedImmediateArtwork = true
             }
         }
 
-        if let artworkURL = track.artworkURL {
+        center.nowPlayingInfo = info
+        center.playbackState = isPlaying ? .playing : .paused
+
+        // Sync title, artist, album, and cover into WebKit navigator.mediaSession too so Lock Screen shows AuraMusic's custom photo + ⏮/⏭!
+        // NOTE: WebKit blocks raw `file://` URLs inside `https://m.youtube.com`, so custom photos are sent as a 512x512 JPEG `data:` URI!
+        if activeYouTubeVideoID != nil {
+            let targetTrackID = track.id
+            if let artworkURL = effectiveArtURL, artworkURL.isFileURL {
+                pushWebKitMediaSessionMetadata(title: track.title, artist: track.artist, album: track.album, artworkString: "")
+                Task { @MainActor in
+                    if let dataURI = await ArtworkCacheManager.shared.base64JPEGDataURI(for: artworkURL),
+                       self.currentTrack?.id == targetTrackID,
+                       self.activeYouTubeVideoID != nil {
+                        self.pushWebKitMediaSessionMetadata(
+                            title: track.title,
+                            artist: track.artist,
+                            album: track.album,
+                            artworkString: dataURI
+                        )
+                    }
+                }
+            } else {
+                pushWebKitMediaSessionMetadata(
+                    title: track.title,
+                    artist: track.artist,
+                    album: track.album,
+                    artworkString: effectiveArtURL?.absoluteString ?? ""
+                )
+            }
+        }
+
+        if let artworkURL = effectiveArtURL, !attachedImmediateArtwork {
             let targetTrackID = track.id
             Task { @MainActor in
                 if let image = await ArtworkCacheManager.shared.image(for: artworkURL),
@@ -1594,6 +1642,19 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
             currentTime: currentTime,
             duration: duration > 0 ? duration : track.duration
         )
+    }
+
+    private func pushWebKitMediaSessionMetadata(title: String, artist: String, album: String, artworkString: String) {
+        let metaPayload: [String: String] = [
+            "title": title,
+            "artist": artist,
+            "album": album,
+            "artwork": artworkString
+        ]
+        if let jsonData = try? JSONSerialization.data(withJSONObject: metaPayload),
+           let jsonString = String(data: jsonData, encoding: .utf8) {
+            evaluateYouTubeJS("if(window.auraControl && window.auraControl.setMetadata){window.auraControl.setMetadata(\(jsonString));}")
+        }
     }
 
     private func updateNowPlayingElapsedTime() {

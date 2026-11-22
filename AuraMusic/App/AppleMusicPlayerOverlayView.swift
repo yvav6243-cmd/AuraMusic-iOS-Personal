@@ -250,7 +250,7 @@ public struct AppleMusicPlayerOverlayView: View {
         .photosPicker(isPresented: $showCustomCoverPicker, selection: $selectedCoverPhotoItem, matching: .images)
         .onChange(of: selectedCoverPhotoItem) { _, newItem in
             guard let newItem else { return }
-            Task {
+            Task { @MainActor in
                 if let data = try? await newItem.loadTransferable(type: Data.self) {
                     let newURL = persistence.setCustomTrackArtwork(
                         imageData: data,
@@ -259,6 +259,7 @@ public struct AppleMusicPlayerOverlayView: View {
                     )
                     player.applyUpdatedArtworkURL(newURL, forTrackID: track.id)
                 }
+                selectedCoverPhotoItem = nil
             }
         }
     }
@@ -369,16 +370,26 @@ public struct AppleMusicPlayerOverlayView: View {
 
             Spacer()
 
-            // Direct 1-Tap Offline Download Button on Expanded Player
+            // Direct 1-Tap Offline Download Button on Expanded Player (Full Audio + Synced Lyrics!)
             Button {
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
                 downloadManager.enqueueDownload(for: track)
             } label: {
-                let isDownloaded = downloadManager.isDownloaded(track.id)
-                Image(systemName: isDownloaded ? "checkmark.circle.fill" : "arrow.down.circle.fill")
-                    .font(.system(size: 17, weight: .bold))
-                    .foregroundStyle(isDownloaded ? Color.green : .white)
-                    .frame(width: 34, height: 34)
-                    .background(Circle().fill(.white.opacity(0.16)))
+                let isDownloaded = downloadManager.isDownloaded(track)
+                let isDownloading = downloadManager.isDownloadingOrQueued(track)
+                ZStack {
+                    if isDownloading {
+                        ProgressView()
+                            .tint(.white)
+                            .scaleEffect(0.75)
+                    } else {
+                        Image(systemName: isDownloaded ? "checkmark.circle.fill" : "arrow.down.circle.fill")
+                            .font(.system(size: 17, weight: .bold))
+                            .foregroundStyle(isDownloaded ? Color.green : .white)
+                    }
+                }
+                .frame(width: 34, height: 34)
+                .background(Circle().fill(.white.opacity(0.16)))
             }
 
             Button {
@@ -398,7 +409,7 @@ public struct AppleMusicPlayerOverlayView: View {
                     Label("Change Song Cover (Photos)…", systemImage: "photo.badge.plus")
                 }
 
-                if persistence.hasCustomArtwork(for: track.id) {
+                if persistence.hasCustomArtwork(for: track) {
                     Button {
                         let restoredURL = persistence.setCustomTrackArtwork(imageData: nil, for: track)
                         player.applyUpdatedArtworkURL(restoredURL, forTrackID: track.id)

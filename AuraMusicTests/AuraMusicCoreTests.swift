@@ -1897,4 +1897,209 @@ final class AuraMusicCoreTests: XCTestCase {
         let decoded = LyricsService.decodeLyricsHTMLEntities(raw)
         XCTAssertEqual(decoded, "[00:10.00]I'm \"ready\" & here: now\n[00:15.00]Don't stop")
     }
+
+    // MARK: - Full-Length Offline Downloads, Playlist Batching, Offline Priority & Background Custom Artwork Tests
+
+    func testFullLengthDownloadValidatorStrictlyRejects30SecondPreviewsAndAdClips() {
+        // 30-second iTunes preview or 15-second YouTube ad clip MUST be rejected for full-length songs (>= 60s)
+        XCTAssertFalse(OfflineDownloadManager.isFullLengthDurationValid(actualDuration: 29.8, expectedTrackDuration: 210.0))
+        XCTAssertFalse(OfflineDownloadManager.isFullLengthDurationValid(actualDuration: 30.0, expectedTrackDuration: 185.0))
+        XCTAssertFalse(OfflineDownloadManager.isFullLengthDurationValid(actualDuration: 15.0, expectedTrackDuration: 240.0))
+        XCTAssertFalse(OfflineDownloadManager.isFullLengthDurationValid(actualDuration: 2.0, expectedTrackDuration: 40.0))
+
+        // Full-length audio passes cleanly
+        XCTAssertTrue(OfflineDownloadManager.isFullLengthDurationValid(actualDuration: 208.5, expectedTrackDuration: 210.0))
+        XCTAssertTrue(OfflineDownloadManager.isFullLengthDurationValid(actualDuration: 145.0, expectedTrackDuration: 150.0))
+        // Genuinely short interlude (< 60s) passes cleanly
+        XCTAssertTrue(OfflineDownloadManager.isFullLengthDurationValid(actualDuration: 38.0, expectedTrackDuration: 40.0))
+
+        // Sanitizer strips range/rn/rbuf/ump/srfvp while preserving pot= and mime=audio%2Fmp4
+        let raw = "https://rr3---sn-test.googlevideo.com/videoplayback?itag=140&mime=audio%2Fmp4&range=0-65535&rn=2&rbuf=0&ump=1&srfvp=1&pot=VALID_TOKEN"
+        let clean = YouTubeWebKitAudioExtractor.sanitizeFullLengthYouTubeStreamURL(raw)
+        XCTAssertNotNil(clean)
+        let cleanStr = clean?.absoluteString ?? ""
+        XCTAssertTrue(cleanStr.contains("itag=140"))
+        XCTAssertTrue(cleanStr.contains("pot=VALID_TOKEN"))
+        XCTAssertFalse(cleanStr.contains("range="))
+        XCTAssertFalse(cleanStr.contains("ump="))
+        XCTAssertFalse(cleanStr.contains("srfvp="))
+    }
+
+    @MainActor
+    func testOfflineDownloadAlwaysPlaysFirstEvenWhenOnlineAndAcrossProviders() throws {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let dlDir = docs.appendingPathComponent("AuraDownloads", isDirectory: true)
+        try FileManager.default.createDirectory(at: dlDir, withIntermediateDirectories: true)
+        let relPath = "AuraDownloads/offline_priority_test.wav"
+        let fullURL = docs.appendingPathComponent(relPath)
+        try UniversalAudioPlayerEngine.buildSubAudibleKeepAliveWAVData().write(to: fullURL, options: .atomic)
+        defer {
+            OfflineDownloadManager.shared.removeDownload(trackID: "youtubeMusic:OFFLINE_VID_1")
+            try? FileManager.default.removeItem(at: fullURL)
+        }
+
+        let ytTrack = UniversalTrack(
+            provider: .youtubeMusic,
+            providerTrackID: "OFFLINE_VID_1",
+            title: "Starboy",
+            artist: "The Weeknd",
+            album: "Starboy",
+            duration: 230.0,
+            isStreamable: true
+        )
+        OfflineDownloadManager.shared.registerCompletedDownloadForTesting(track: ytTrack, relativePath: relPath)
+
+        // 1. Direct match resolves offline file
+        XCTAssertEqual(OfflineDownloadManager.shared.completedLocalRelativePath(for: ytTrack), relPath)
+
+        // 2. Same video via `.youtube` provider resolves the exact same offline file
+        let ytVideoTrack = UniversalTrack(
+            provider: .youtube,
+            providerTrackID: "OFFLINE_VID_1",
+            title: "Starboy (Official Video)",
+            artist: "The Weeknd",
+            album: "YouTube",
+            duration: 230.0,
+            isStreamable: true
+        )
+        XCTAssertEqual(OfflineDownloadManager.shared.completedLocalRelativePath(for: ytVideoTrack), relPath)
+
+        // 3. Same song via `.appleMusic` catalog chart resolves the downloaded offline file too!
+        let appleVariant = UniversalTrack(
+            provider: .appleMusic,
+            providerTrackID: "am-999111",
+            title: "Starboy",
+            artist: "The Weeknd",
+            album: "Starboy",
+            duration: 230.0,
+            isStreamable: false
+        )
+        XCTAssertEqual(OfflineDownloadManager.shared.completedLocalRelativePath(for: appleVariant), relPath)
+
+        // 4. Playing the YouTube track immediately uses native AVPlayer offline (activeYouTubeVideoID == nil -> 0 ads, 0 WebKit wait!)
+        let engine = UniversalAudioPlayerEngine.shared
+        engine.play(ytTrack)
+        XCTAssertNil(engine.activeYouTubeVideoID, "Downloaded offline song MUST play natively via AVPlayer without loading WKWebView")
+        XCTAssertEqual(engine.playbackStatusBanner, "Offline Audio")
+        XCTAssertTrue(engine.isPlaying)
+        engine.pause()
+    }
+
+    @MainActor
+    func testPlaylistDownloadSummaryTracksCompletedAndTotalAccurately() throws {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let dlDir = docs.appendingPathComponent("AuraDownloads", isDirectory: true)
+        try FileManager.default.createDirectory(at: dlDir, withIntermediateDirectories: true)
+        let relPath = "AuraDownloads/playlist_summary_t1.wav"
+        let fullURL = docs.appendingPathComponent(relPath)
+        try UniversalAudioPlayerEngine.buildSubAudibleKeepAliveWAVData().write(to: fullURL, options: .atomic)
+        defer {
+            OfflineDownloadManager.shared.removeDownload(trackID: "youtubeMusic:PL_T1")
+            try? FileManager.default.removeItem(at: fullURL)
+        }
+
+        let t1 = UniversalTrack(provider: .youtubeMusic, providerTrackID: "PL_T1", title: "Song One", artist: "Artist A", album: "A", duration: 200)
+        let t2 = UniversalTrack(provider: .youtubeMusic, providerTrackID: "PL_T2", title: "Song Two", artist: "Artist B", album: "B", duration: 210)
+        let t3 = UniversalTrack(provider: .youtubeMusic, providerTrackID: "PL_T3", title: "Song Three", artist: "Artist C", album: "C", duration: 220)
+
+        OfflineDownloadManager.shared.registerCompletedDownloadForTesting(track: t1, relativePath: relPath)
+        let summary = OfflineDownloadManager.shared.playlistDownloadSummary(for: [t1, t2, t3])
+        XCTAssertEqual(summary.completed, 1)
+        XCTAssertEqual(summary.active, 0)
+        XCTAssertEqual(summary.total, 3)
+    }
+
+    @MainActor
+    func testOfflineLyricsCacheKeyMatchesNormalizedYouTubeAndCleanTitles() {
+        let ytTrack = UniversalTrack(
+            provider: .youtubeMusic,
+            providerTrackID: "DYptgVvkVLQ",
+            title: "周杰伦《晴天》官方MV",
+            artist: "JVR Music",
+            album: "YouTube Music",
+            duration: 269
+        )
+        let cleanTrack = UniversalTrack(
+            provider: .appleMusic,
+            providerTrackID: "cn-101",
+            title: "晴天",
+            artist: "周杰伦",
+            album: "叶惠美",
+            duration: 269
+        )
+        XCTAssertEqual(
+            LyricsService.lyricsCacheKey(for: ytTrack),
+            LyricsService.lyricsCacheKey(for: cleanTrack),
+            "Offline cached lyrics must resolve consistently between YouTube and clean catalog titles"
+        )
+    }
+
+    @MainActor
+    func testCustomSongArtworkUpdatesLockScreenNowPlayingImmediatelyAndEncodesBase64DataURIForWebKit() async throws {
+        let defaultRemoteURL = URL(string: "https://is1-ssl.mzstatic.com/image/thumb/default_cover.jpg")!
+        let track = UniversalTrack(
+            provider: .youtubeMusic,
+            providerTrackID: "CUSTOM_ART_BG_01",
+            title: "Custom Cover Song",
+            artist: "Test Artist",
+            album: "Test Album",
+            artworkURL: defaultRemoteURL,
+            duration: 215.0,
+            isStreamable: true
+        )
+
+        // Generate two distinct in-memory JPEG photos (red, then green)
+        func makeSolidPhotoData(_ color: UIColor) -> Data {
+            let renderer = UIGraphicsImageRenderer(size: CGSize(width: 120, height: 120))
+            let img = renderer.image { ctx in
+                color.setFill()
+                ctx.fill(CGRect(x: 0, y: 0, width: 120, height: 120))
+            }
+            return img.jpegData(compressionQuality: 0.9)!
+        }
+
+        let persistence = PersistenceController.shared
+        let engine = UniversalAudioPlayerEngine.shared
+        defer {
+            _ = persistence.setCustomTrackArtwork(imageData: nil, for: track, defaultArtworkURL: defaultRemoteURL)
+            engine.pause()
+            engine.activeYouTubeVideoID = nil
+        }
+
+        // 1. Apply first custom photo -> must save versioned file & resolve via live relative path
+        let firstURL = try XCTUnwrap(
+            persistence.setCustomTrackArtwork(imageData: makeSolidPhotoData(.systemRed), for: track, defaultArtworkURL: defaultRemoteURL)
+        )
+        XCTAssertTrue(firstURL.isFileURL)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: firstURL.path))
+        XCTAssertTrue(persistence.hasCustomArtwork(for: track))
+        XCTAssertEqual(persistence.effectiveArtworkURL(for: track), firstURL)
+
+        // 2. Start playing -> Lock Screen MPNowPlayingInfoCenter MUST immediately carry custom MPMediaItemArtwork on frame 0!
+        engine.play(track)
+        XCTAssertEqual(engine.currentTrack?.artworkURL, firstURL)
+        XCTAssertNotNil(
+            MPNowPlayingInfoCenter.default().nowPlayingInfo?[MPMediaItemPropertyArtwork],
+            "Custom song cover photo MUST be attached immediately to Lock Screen MPNowPlayingInfoCenter"
+        )
+
+        // 3. Base64 JPEG data URI for WKWebView navigator.mediaSession (since WebKit blocks file:// URLs!)
+        let dataURI = try XCTUnwrap(await ArtworkCacheManager.shared.base64JPEGDataURI(for: firstURL))
+        XCTAssertTrue(dataURI.hasPrefix("data:image/jpeg;base64,"), "Custom photo must encode to data:image/jpeg;base64 URI for WebKit Lock Screen")
+
+        // 4. Replace with second custom photo -> must get a fresh versioned URL & update Lock Screen immediately
+        try await Task.sleep(nanoseconds: 10_000_000)
+        let secondURL = try XCTUnwrap(
+            persistence.setCustomTrackArtwork(imageData: makeSolidPhotoData(.systemGreen), for: track, defaultArtworkURL: defaultRemoteURL)
+        )
+        XCTAssertNotEqual(firstURL, secondURL, "Changing photo must create a fresh versioned file URL so caches never stick on old image")
+        engine.applyUpdatedArtworkURL(secondURL, forTrackID: track.id)
+        XCTAssertEqual(engine.currentTrack?.artworkURL, secondURL)
+        XCTAssertNotNil(MPNowPlayingInfoCenter.default().nowPlayingInfo?[MPMediaItemPropertyArtwork])
+
+        // 5. Reset back to default album cover
+        let restored = persistence.setCustomTrackArtwork(imageData: nil, for: track, defaultArtworkURL: defaultRemoteURL)
+        XCTAssertEqual(restored, defaultRemoteURL)
+        XCTAssertFalse(persistence.hasCustomArtwork(for: track))
+    }
 }

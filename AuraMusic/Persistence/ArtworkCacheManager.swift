@@ -7,6 +7,7 @@ public final class ArtworkCacheManager: ObservableObject, @unchecked Sendable {
 
     private let memoryCache = NSCache<NSString, UIImage>()
     private let paletteCache = NSCache<NSString, NSArray>()
+    private let base64DataURICache = NSCache<NSString, NSString>()
     private let diskDirectory: URL
 
     private static let defaultPalette: [Color] = [
@@ -137,9 +138,55 @@ public final class ArtworkCacheManager: ObservableObject, @unchecked Sendable {
         return Self.defaultPalette
     }
 
+    public func invalidate(url: URL?) {
+        guard let url else { return }
+        let key = NSString(string: url.absoluteString)
+        memoryCache.removeObject(forKey: key)
+        paletteCache.removeObject(forKey: key)
+        base64DataURICache.removeObject(forKey: key)
+        if !url.isFileURL {
+            try? FileManager.default.removeItem(at: diskFileURL(for: url))
+        }
+    }
+
+    public func prefetchArtwork(for url: URL?) async {
+        guard let url else { return }
+        _ = await image(for: url)
+    }
+
+    /// Produces a compact 512x512 JPEG `data:image/jpeg;base64,...` URI so WKWebView's `navigator.mediaSession.metadata`
+    /// can display local `file://` custom photos on the iOS Lock Screen & Control Center (WebKit blocks raw `file://` URLs!).
+    public func base64JPEGDataURI(for url: URL, maxDimension: CGFloat = 512) async -> String? {
+        let key = NSString(string: url.absoluteString)
+        if let cached = base64DataURICache.object(forKey: key) {
+            return String(cached)
+        }
+        guard let sourceImage = await image(for: url) else { return nil }
+        let cache = self.base64DataURICache
+        return await Task.detached(priority: .utility) { () -> String? in
+            let originalSize = sourceImage.size
+            let scaleFactor = min(1.0, maxDimension / max(originalSize.width, originalSize.height, 1))
+            let targetSize = CGSize(
+                width: max(1, (originalSize.width * scaleFactor).rounded()),
+                height: max(1, (originalSize.height * scaleFactor).rounded())
+            )
+            let format = UIGraphicsImageRendererFormat()
+            format.scale = 1.0
+            let renderer = UIGraphicsImageRenderer(size: targetSize, format: format)
+            let resized = renderer.image { _ in
+                sourceImage.draw(in: CGRect(origin: .zero, size: targetSize))
+            }
+            guard let jpeg = resized.jpegData(compressionQuality: 0.80) else { return nil }
+            let uri = "data:image/jpeg;base64,\(jpeg.base64EncodedString())"
+            cache.setObject(NSString(string: uri), forKey: key)
+            return uri
+        }.value
+    }
+
     public func clearCache() {
         memoryCache.removeAllObjects()
         paletteCache.removeAllObjects()
+        base64DataURICache.removeAllObjects()
         try? FileManager.default.removeItem(at: diskDirectory)
         try? FileManager.default.createDirectory(at: diskDirectory, withIntermediateDirectories: true)
     }
