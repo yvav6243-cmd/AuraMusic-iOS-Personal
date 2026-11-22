@@ -380,11 +380,6 @@ public struct AppleMusicPlayerOverlayView: View {
                                 .fill(isOffline ? Color.green.opacity(0.22) : .white.opacity(0.18))
                         )
                         .fixedSize(horizontal: true, vertical: false)
-
-                    if let trim = player.activeTrackTrimRange,
-                       trim.isEffectivelyTrimmed(for: max(player.duration, track.duration)) {
-                        TrimmedBadgePill(rangeText: trim.formattedRange(for: max(player.duration, track.duration)))
-                    }
                 }
             }
 
@@ -780,22 +775,28 @@ private struct ExpandedPlaybackScrubberView: View {
     @State private var scrubTimeValue: Double = 0
 
     var body: some View {
-        let total = max(clock.duration, track.duration, 1)
-        let labelTime = isScrubbing ? scrubTimeValue : min(clock.currentTime, total)
-        let remaining = max(0, total - labelTime)
+        let rawTotal = max(clock.duration, track.duration, 1)
+        let bounds = player.displayPlaybackBounds(for: rawTotal)
+        let displayTotal = max(bounds.duration, 1)
+        let labelTime = isScrubbing
+            ? scrubTimeValue
+            : max(0, min(displayTotal, clock.currentTime - bounds.start))
+        let remaining = max(0, displayTotal - labelTime)
         let shouldAnimateBar = player.isPlaying && !player.isBuffering && !isScrubbing && scenePhase == .active
 
         VStack(spacing: 8) {
             SmoothAppleMusicScrubberBar(
-                totalDuration: total,
+                trimStart: bounds.start,
+                totalDuration: displayTotal,
+                rawTotalDuration: rawTotal,
                 clock: clock,
                 isPlaying: player.isPlaying,
                 isBuffering: player.isBuffering,
                 shouldAnimateBar: shouldAnimateBar,
                 isScrubbing: $isScrubbing,
                 scrubTimeValue: $scrubTimeValue,
-                onCommitSeek: { target in
-                    player.seek(to: target)
+                onCommitSeek: { displayTarget in
+                    player.seek(to: bounds.start + displayTarget)
                 }
             )
 
@@ -808,21 +809,11 @@ private struct ExpandedPlaybackScrubberView: View {
                 Spacer()
 
                 let isOffline = OfflineDownloadManager.shared.isDownloaded(track)
-                HStack(spacing: 5) {
-                    if let trim = player.activeTrackTrimRange, trim.isEffectivelyTrimmed(for: total) {
-                        Image(systemName: "scissors")
-                            .font(.system(size: 9, weight: .bold))
-                        Text(trim.formattedRange(for: total))
-                            .font(.system(size: 10, weight: .bold, design: .rounded))
-                            .monospacedDigit()
-                    } else {
-                        Text(isOffline ? "OFFLINE AUDIO" : track.provider.shortBadgeName)
-                            .font(.system(size: 10, weight: .bold, design: .rounded))
-                    }
-                }
-                .foregroundStyle(isOffline ? Color.green.opacity(0.95) : .white.opacity(0.75))
-                .lineLimit(1)
-                .fixedSize(horizontal: true, vertical: false)
+                Text(isOffline ? "OFFLINE AUDIO" : track.provider.shortBadgeName)
+                    .font(.system(size: 10, weight: .bold, design: .rounded))
+                    .foregroundStyle(isOffline ? Color.green.opacity(0.95) : .white.opacity(0.75))
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
 
                 Spacer()
 
@@ -845,10 +836,13 @@ private struct ExpandedPlaybackScrubberView: View {
 
 /// Ultra-lightweight Apple Music smooth progress bar:
 /// - Glides smoothly at 30 FPS via O(1) wall-clock linear interpolation between 4–5Hz engine ticks (~0.1% CPU)
+/// - Displays trim-relative elapsed time (`0:00 → newLength`) seamlessly as if the trimmed track were the original
 /// - Automatically pauses TimelineView (0% CPU) when paused, buffering, scrubbing, or backgrounded
 /// - Never triggers PlaybackClock or UniversalAudioPlayerEngine invalidations
 private struct SmoothAppleMusicScrubberBar: View {
+    let trimStart: TimeInterval
     let totalDuration: TimeInterval
+    let rawTotalDuration: TimeInterval
     let clock: PlaybackClock
     let isPlaying: Bool
     let isBuffering: Bool
@@ -863,13 +857,14 @@ private struct SmoothAppleMusicScrubberBar: View {
             let barHeight: CGFloat = isScrubbing ? 10 : 6
 
             TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !shouldAnimateBar)) { _ in
+                let rawInterpolated = clock.interpolatedTime(
+                    isPlaying: isPlaying,
+                    isBuffering: isBuffering,
+                    fallbackDuration: rawTotalDuration
+                )
                 let displayTime: TimeInterval = isScrubbing
                     ? scrubTimeValue
-                    : clock.interpolatedTime(
-                        isPlaying: isPlaying,
-                        isBuffering: isBuffering,
-                        fallbackDuration: totalDuration
-                    )
+                    : max(0, min(totalDuration, rawInterpolated - trimStart))
                 let progress = max(0, min(1, totalDuration > 0 ? displayTime / totalDuration : 0))
                 let fillWidth = max(barHeight, width * CGFloat(progress))
 
@@ -952,7 +947,7 @@ private struct LiveLyricPreviewPillView: View {
         .onChange(of: lyricsService.currentDocument?.id) { _, _ in
             displayedLine = lyricsService.activeLyricLineText(at: PlaybackClock.shared.currentTime)
         }
-        .onChange(of: lyricsService.aiDocument?.id) { _, _ in
+        .onChange(of: lyricsService.customDocument?.id) { _, _ in
             displayedLine = lyricsService.activeLyricLineText(at: PlaybackClock.shared.currentTime)
         }
         .onChange(of: lyricsService.lyricsMode) { _, _ in

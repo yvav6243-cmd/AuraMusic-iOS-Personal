@@ -704,7 +704,7 @@ public final class OfflineDownloadManager: NSObject, ObservableObject {
                 if fileManager.fileExists(atPath: fullURL.path) {
                     let size = (try? fileManager.attributesOfItem(atPath: fullURL.path)[.size] as? Int64) ?? 0
                     let track = entity.toUniversalTrack()
-                    let hasLyrics = LyricsService.shared.hasCachedLyrics(for: track) || (LyricsService.shared.loadCachedAILyrics(for: track) != nil)
+                    let hasLyrics = LyricsService.shared.hasCachedLyrics(for: track) || (LyricsService.shared.loadCachedCustomLyrics(for: track) != nil)
                     let fingerprint = LyricsService.shared.activeLyricsFingerprint(for: track)
                     tasks.append(
                         DownloadTaskItem(
@@ -769,7 +769,7 @@ public final class OfflineDownloadManager: NSObject, ObservableObject {
         }
         let mode = LyricsService.shared.preferredLyricsMode(for: track)
         var gotLyrics = false
-        if mode == .aiAudio, LyricsService.shared.loadCachedAILyrics(for: track) != nil {
+        if mode == .custom, LyricsService.shared.loadCachedCustomLyrics(for: track) != nil {
             gotLyrics = true
         } else {
             gotLyrics = await LyricsService.shared.prefetchAndCacheLyrics(for: track)

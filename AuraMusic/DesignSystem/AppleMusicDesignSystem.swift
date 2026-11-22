@@ -273,34 +273,6 @@ public struct OfflineStatusBadgePill: View {
     }
 }
 
-public struct TrimmedBadgePill: View {
-    public let rangeText: String
-
-    public init(rangeText: String) {
-        self.rangeText = rangeText
-    }
-
-    public var body: some View {
-        HStack(spacing: 3) {
-            Image(systemName: "scissors")
-                .font(.system(size: 8.5, weight: .bold))
-            Text(rangeText)
-                .font(.system(size: 8.5, weight: .bold, design: .rounded))
-                .monospacedDigit()
-                .lineLimit(1)
-        }
-        .foregroundStyle(AuraTheme.accentPink)
-        .padding(.horizontal, 6)
-        .padding(.vertical, 2.5)
-        .background(
-            Capsule(style: .continuous)
-                .fill(AuraTheme.accentPink.opacity(0.16))
-        )
-        .fixedSize(horizontal: true, vertical: false)
-        .layoutPriority(1)
-    }
-}
-
 // MARK: - Apple Music Section Header
 
 public struct AppleMusicSectionHeader: View {

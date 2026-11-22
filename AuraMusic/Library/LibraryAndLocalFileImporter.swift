@@ -1126,12 +1126,7 @@ public struct TrackRowView: View {
                     if isDownloaded {
                         OfflineStatusBadgePill()
                     }
-                    if let trim = persistence.trimRange(for: track),
-                       track.duration > 5,
-                       trim.isEffectivelyTrimmed(for: track.duration) {
-                        TrimmedBadgePill(rangeText: trim.formattedRange(for: track.duration))
-                    }
-                    Text("\(track.artist) • \(track.formattedDuration)")
+                    Text("\(track.artist) • \(persistence.effectiveFormattedDuration(for: track))")
                         .font(.system(size: 12))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)

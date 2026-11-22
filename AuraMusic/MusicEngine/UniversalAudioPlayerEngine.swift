@@ -524,6 +524,26 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         activeYouTubeVideoID = nil
     }
 
+    /// Returns the display start offset and visible duration of the currently playing song.
+    /// When the user trims a song (e.g. `0:30 → 2:15`), AuraMusic presents it cleanly as a `0:00 → 1:45` original song!
+    public func displayPlaybackBounds(for rawDuration: TimeInterval) -> (start: TimeInterval, duration: TimeInterval) {
+        let safeRaw = max(rawDuration, 0)
+        guard let trim = activeTrackTrimRange,
+              safeRaw > 5,
+              trim.isEffectivelyTrimmed(for: safeRaw) else {
+            return (0, safeRaw)
+        }
+        let norm = trim.normalized(for: safeRaw)
+        let effDur = norm.effectiveDuration(for: safeRaw)
+        return (norm.startSeconds, effDur)
+    }
+
+    /// Converts a raw audio timestamp into the trim-relative display clock (`0:00 → newLength`).
+    public func displayPlaybackTime(rawTime: TimeInterval, rawDuration: TimeInterval) -> TimeInterval {
+        let bounds = displayPlaybackBounds(for: rawDuration)
+        return max(0, min(max(bounds.duration, 0), rawTime - bounds.start))
+    }
+
     /// Updates live playback trim immediately after the user edits song start/end bounds in Clip Settings.
     public func applyUpdatedTrimRange(_ range: TrackTrimRange?, for track: UniversalTrack) {
         guard let current = currentTrack,
@@ -544,6 +564,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
             activeTrackTrimRange = nil
             triggeredEndTrimForGeneration = -1
         }
+        refreshNowPlayingMetadata()
     }
 
     /// Enforces custom song end trim (`endSeconds`), finishing the track cleanly right at the user's chosen cut point.
@@ -1034,7 +1055,10 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
                 return .commandFailed
             }
             Task { @MainActor in
-                self.seek(to: posEvent.positionTime)
+                let rawTotal = max(self.duration, self.currentTrack?.duration ?? 0)
+                let bounds = self.displayPlaybackBounds(for: rawTotal)
+                let clampedDisplay = max(0, min(bounds.duration > 0 ? bounds.duration : posEvent.positionTime, posEvent.positionTime))
+                self.seek(to: bounds.start + clampedDisplay)
             }
             return .success
         }
@@ -1785,12 +1809,17 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
             return
         }
 
+        let rawDuration = duration > 0 ? duration : track.duration
+        let bounds = displayPlaybackBounds(for: rawDuration)
+        let displayDuration = bounds.duration
+        let displayElapsed = displayPlaybackTime(rawTime: currentTime, rawDuration: rawDuration)
+
         var info: [String: Any] = [
             MPMediaItemPropertyTitle: track.title,
             MPMediaItemPropertyArtist: track.artist,
             MPMediaItemPropertyAlbumTitle: track.album,
-            MPMediaItemPropertyPlaybackDuration: duration > 0 ? duration : track.duration,
-            MPNowPlayingInfoPropertyElapsedPlaybackTime: currentTime,
+            MPMediaItemPropertyPlaybackDuration: displayDuration,
+            MPNowPlayingInfoPropertyElapsedPlaybackTime: displayElapsed,
             MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? 1.0 : 0.0,
             MPNowPlayingInfoPropertyDefaultPlaybackRate: 1.0
         ]
@@ -1843,10 +1872,12 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
                 if let image = await ArtworkCacheManager.shared.image(for: artworkURL),
                    self.currentTrack?.id == targetTrackID {
                     let artwork = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
+                    let latestRaw = self.duration > 0 ? self.duration : track.duration
                     var latest = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? info
                     latest[MPMediaItemPropertyArtwork] = artwork
                     latest[MPNowPlayingInfoPropertyPlaybackRate] = self.isPlaying ? 1.0 : 0.0
-                    latest[MPNowPlayingInfoPropertyElapsedPlaybackTime] = self.currentTime
+                    latest[MPNowPlayingInfoPropertyElapsedPlaybackTime] = self.displayPlaybackTime(rawTime: self.currentTime, rawDuration: latestRaw)
+                    latest[MPMediaItemPropertyPlaybackDuration] = self.displayPlaybackBounds(for: latestRaw).duration
                     MPNowPlayingInfoCenter.default().nowPlayingInfo = latest
                     MPNowPlayingInfoCenter.default().playbackState = self.isPlaying ? .playing : .paused
                 }
@@ -1856,8 +1887,8 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         DynamicIslandNowPlayingCoordinator.shared.updateLiveActivity(
             track: track,
             isPlaying: isPlaying,
-            currentTime: currentTime,
-            duration: duration > 0 ? duration : track.duration
+            currentTime: displayElapsed,
+            duration: displayDuration
         )
     }
 
@@ -1877,8 +1908,10 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     private func updateNowPlayingElapsedTime() {
         let center = MPNowPlayingInfoCenter.default()
         guard var info = center.nowPlayingInfo else { return }
-        info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = currentTime
-        info[MPMediaItemPropertyPlaybackDuration] = duration
+        let rawDur = duration > 0 ? duration : (currentTrack?.duration ?? 0)
+        let bounds = displayPlaybackBounds(for: rawDur)
+        info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = displayPlaybackTime(rawTime: currentTime, rawDuration: rawDur)
+        info[MPMediaItemPropertyPlaybackDuration] = bounds.duration
         info[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying ? 1.0 : 0.0
         center.nowPlayingInfo = info
         center.playbackState = isPlaying ? .playing : .paused

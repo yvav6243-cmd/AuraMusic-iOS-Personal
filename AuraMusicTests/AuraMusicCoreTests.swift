@@ -311,8 +311,8 @@ final class AuraMusicCoreTests: XCTestCase {
         """
         let lines = LRCParser.parseSyncedLRC(duplicateLRC, includeIntroDots: false)
         XCTAssertEqual(lines.count, 3)
-        XCTAssertTrue(lines[1].text.contains("You better"))
-        XCTAssertTrue(lines[1].text.contains("The soul's escaping"))
+        XCTAssertEqual(lines[1].text, "You better")
+        XCTAssertEqual(lines[1].secondaryText, "The soul's escaping, through this hole that is gaping")
         XCTAssertEqual(LyricSynchronizationEngine.activeLineIndex(at: 123.04, in: lines), 1)
         XCTAssertEqual(LyricSynchronizationEngine.activeLineIndex(at: 126.10, in: lines), 2)
     }
@@ -2212,163 +2212,6 @@ final class AuraMusicCoreTests: XCTestCase {
         XCTAssertEqual(resumedState?["userPaused"] as? Bool, false)
     }
 
-    func testAILyricsPass1PauseDetectorIdentifiesIntroAndMidSongPausesFromRMSEnvelope() {
-        // Build 30.0s RMS envelope at 0.1s per frame (300 frames):
-        // 0.0-4.0s intro silence | 4.0-12.0s verse | 12.0-13.0s 1s short breath | 13.0-19.0s chorus | 19.0-24.0s 5s bridge pause | 24.0-30.0s outro
-        var rms = [Float]()
-        for i in 0..<300 {
-            let t = Double(i) * 0.1
-            if t < 4.0 {
-                rms.append(0.002)
-            } else if t < 12.0 {
-                rms.append(0.35)
-            } else if t < 13.0 {
-                rms.append(0.004) // short 1.0s breath -> must be ignored (< 2.4s)
-            } else if t < 19.0 {
-                rms.append(0.42)
-            } else if t < 24.0 {
-                rms.append(0.003) // 5.0s instrumental break -> must be detected!
-            } else {
-                rms.append(0.33)
-            }
-        }
-
-        let pauses = AILyricsTranscriptionEngine.detectPauseIntervals(
-            rmsFrames: rms,
-            frameDuration: 0.1,
-            trackDuration: 30.0,
-            minPauseDuration: 2.4
-        )
-        XCTAssertEqual(pauses.count, 2, "Pass 1 DSP must detect intro pause and 5s mid-song pause while ignoring 1s breath")
-        XCTAssertEqual(pauses[0].start, 0.0, accuracy: 0.15)
-        XCTAssertEqual(pauses[0].end, 4.0, accuracy: 0.15)
-        XCTAssertEqual(pauses[1].start, 19.0, accuracy: 0.15)
-        XCTAssertEqual(pauses[1].end, 24.0, accuracy: 0.15)
-    }
-
-    func testAILyricsForeignWordMergerReplacesLowConfidenceSegmentsAndPreservesNativeWords() {
-        let primaryTokens: [AIWordToken] = [
-            AIWordToken(text: "Окутала", timestamp: 5.0, duration: 0.5, confidence: 0.92, languageCode: "ru"),
-            AIWordToken(text: "меня", timestamp: 5.6, duration: 0.4, confidence: 0.90, languageCode: "ru"),
-            AIWordToken(text: "ай", timestamp: 8.0, duration: 0.25, confidence: 0.34, languageCode: "ru"),
-            AIWordToken(text: "гат", timestamp: 8.35, duration: 0.25, confidence: 0.31, languageCode: "ru"),
-            AIWordToken(text: "лав", timestamp: 8.70, duration: 0.35, confidence: 0.38, languageCode: "ru")
-        ]
-        let secondaryTokens: [AIWordToken] = [
-            AIWordToken(text: "Oh", timestamp: 5.05, duration: 0.4, confidence: 0.55, languageCode: "en"), // weaker than Russian 0.92 -> MUST NOT replace!
-            AIWordToken(text: "I", timestamp: 8.02, duration: 0.22, confidence: 0.89, languageCode: "en"),
-            AIWordToken(text: "got", timestamp: 8.36, duration: 0.24, confidence: 0.91, languageCode: "en"),
-            AIWordToken(text: "love", timestamp: 8.72, duration: 0.34, confidence: 0.94, languageCode: "en")
-        ]
-
-        let result = AILyricsTranscriptionEngine.mergeForeignLanguageTokens(
-            primaryTokens: primaryTokens,
-            secondaryTokens: secondaryTokens
-        )
-        XCTAssertEqual(result.foreignReplacements, 3, "All 3 low-confidence English hook words must be replaced cleanly")
-        XCTAssertEqual(result.merged.map(\.text), ["Окутала", "меня", "I", "got", "love"])
-    }
-
-    @MainActor
-    func testAILyricsMultiPassConsensusAndSyncedLRCBuilderProducesValidMonotonicLyricsWithPauses() throws {
-        // Overlapping passes with a boundary duplicate and slight timestamp jitter
-        let passA: [AIWordToken] = [
-            AIWordToken(text: "Небо", timestamp: 6.0, duration: 0.4, confidence: 0.85, languageCode: "ru"),
-            AIWordToken(text: "в", timestamp: 6.5, duration: 0.15, confidence: 0.82, languageCode: "ru"),
-            AIWordToken(text: "алмазах", timestamp: 6.75, duration: 0.55, confidence: 0.88, languageCode: "ru"),
-            AIWordToken(text: "I", timestamp: 16.0, duration: 0.2, confidence: 0.90, languageCode: "en"),
-            AIWordToken(text: "got", timestamp: 16.3, duration: 0.25, confidence: 0.91, languageCode: "en"),
-            AIWordToken(text: "love", timestamp: 16.65, duration: 0.4, confidence: 0.94, languageCode: "en")
-        ]
-        let passB: [AIWordToken] = [
-            AIWordToken(text: "алмазах", timestamp: 6.80, duration: 0.52, confidence: 0.91, languageCode: "ru"), // boundary overlap
-            AIWordToken(text: "I", timestamp: 16.02, duration: 0.22, confidence: 0.88, languageCode: "en")
-        ]
-
-        let reconciled = AILyricsTranscriptionEngine.reconcileMultiPassTokens(passes: [passA, passB])
-        XCTAssertEqual(reconciled.map(\.text), ["Небо", "в", "алмазах", "I", "got", "love"])
-
-        let pauses = [
-            AIPauseInterval(start: 0.0, end: 5.8),
-            AIPauseInterval(start: 8.2, end: 15.6)
-        ]
-        let lrc = AILyricsTranscriptionEngine.buildSyncedLRCFromTokens(
-            tokens: reconciled,
-            pauses: pauses,
-            trackDuration: 25.0
-        )
-        let parsed = LRCParser.parseSyncedLRC(lrc, includeIntroDots: true)
-        XCTAssertGreaterThanOrEqual(parsed.count, 4, "Must include intro dots, verse line, mid-song pause dots, and hook line")
-        XCTAssertTrue(parsed[0].isInstrumental, "Intro pause must render as ••• dots")
-        XCTAssertTrue(parsed.contains(where: { $0.text == "Небо в алмазах" }))
-        XCTAssertTrue(parsed.contains(where: { $0.text == "I got love" }))
-        XCTAssertTrue(parsed.filter(\.isInstrumental).count >= 2, "Both intro and mid-song pause must be marked with •••")
-
-        // Verify strictly increasing timestamps
-        for idx in 1..<parsed.count {
-            XCTAssertGreaterThan(parsed[idx].timestamp, parsed[idx - 1].timestamp)
-        }
-
-        // Verify SwiftData AI cache round-trip using separate "ai::" namespace (never overwrites standard lyrics!)
-        let track = UniversalTrack(
-            provider: .youtubeMusic,
-            providerTrackID: "AI_LRC_TEST_01",
-            title: "I Got Love",
-            artist: "Miyagi",
-            album: "Single",
-            duration: 25.0
-        )
-        XCTAssertTrue(LyricsService.aiLyricsCacheKey(for: track).hasPrefix("ai::"))
-        let saved = try XCTUnwrap(LyricsService.shared.saveAILyrics(syncedLRC: lrc, for: track))
-        XCTAssertTrue(saved.isSynchronized)
-        let reloaded = try XCTUnwrap(LyricsService.shared.loadCachedAILyrics(for: track))
-        XCTAssertEqual(reloaded.syncedLines.count, saved.syncedLines.count)
-    }
-
-    func testAILyricsTenPassContractAnd30SecondHardBudgetEnforced() {
-        XCTAssertEqual(AILyricsTranscriptionEngine.totalRequiredPasses, 10)
-        XCTAssertEqual(AILyricsTranscriptionEngine.maxDurationBudgetSeconds, 30.0, accuracy: 0.001)
-
-        // Pass 1 must explain language, pauses, and foreign-language word detection
-        let p1 = AILyricsTranscriptionEngine.passDescriptor(for: 1, primaryLang: nil, secondaryLang: nil, pauseCount: 0, foreignCount: 0)
-        XCTAssertTrue(p1.title.contains("1/10"))
-        XCTAssertTrue(p1.detail.lowercased().contains("язык"))
-        XCTAssertTrue(p1.detail.lowercased().contains("пауз"))
-
-        // Passes 2...10 must all have valid Russian descriptors
-        for pass in 2...10 {
-            let desc = AILyricsTranscriptionEngine.passDescriptor(for: pass, primaryLang: "Русский", secondaryLang: "English", pauseCount: 3, foreignCount: 5)
-            XCTAssertTrue(desc.title.contains("\(pass)/10"), "Pass \(pass) title must display \(pass)/10")
-            XCTAssertFalse(desc.detail.isEmpty)
-        }
-
-        // Budget enforcement: remaining time strictly caps per-pass timeout and stops at 0 when expired
-        let now = Date()
-        let deadline = now.addingTimeInterval(28.5)
-        XCTAssertEqual(
-            AILyricsTranscriptionEngine.computePassTimeout(hardDeadline: deadline, preferred: 4.0, reserveForLater: 6.0, now: now),
-            4.0,
-            accuracy: 0.01
-        )
-        XCTAssertEqual(
-            AILyricsTranscriptionEngine.computePassTimeout(hardDeadline: deadline, preferred: 4.0, reserveForLater: 27.0, now: now),
-            1.5,
-            accuracy: 0.01
-        )
-        XCTAssertEqual(
-            AILyricsTranscriptionEngine.computePassTimeout(hardDeadline: deadline, preferred: 4.0, reserveForLater: 28.4, now: now),
-            0.0,
-            accuracy: 0.001
-        )
-    }
-
-    func testInfoPlistDeclaresSpeechRecognitionUsageDescriptionForAILyrics() {
-        let appBundle = Bundle(for: UniversalAudioPlayerEngine.self)
-        let usage = appBundle.object(forInfoDictionaryKey: "NSSpeechRecognitionUsageDescription") as? String
-        XCTAssertNotNil(usage, "NSSpeechRecognitionUsageDescription MUST be present in Info.plist so Speech permission never crashes on iOS")
-        XCTAssertFalse((usage ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-    }
-
     // MARK: - Real Offline Download Engine, YouTube Innertube Resolver & M4A Audio Extraction Tests
 
     func testYouTubeInnertubePlayerJSONParserPrioritizesProgressiveMP4Itag18AndRejectsUnplayable() throws {
@@ -2573,153 +2416,21 @@ final class AuraMusicCoreTests: XCTestCase {
         XCTAssertFalse(manager.isDownloaded(invalidTrack))
     }
 
-    // MARK: - Studio Vocal Isolation DSP, 100% Chunk Coverage & Audio-Anchored AI Lyrics v2 Tests
-
-    func testVocalIsolationDSPSuppressesSubBassAndWideStereoWhilePreservingCenterVocals() {
-        let sr = 16_000.0
-        let count = Int(sr * 1.0) // 1.0 second
-
-        // 1. Center-panned 1000 Hz vocal tone (L == R)
-        var vocalL = [Float](repeating: 0, count: count)
-        var vocalR = [Float](repeating: 0, count: count)
-        // 2. Heavy 60 Hz 808 sub-bass (L == R)
-        var bassL = [Float](repeating: 0, count: count)
-        var bassR = [Float](repeating: 0, count: count)
-        // 3. Wide stereo out-of-phase synth at 1000 Hz (L = +s, R = -s -> pure Side!)
-        var wideL = [Float](repeating: 0, count: count)
-        var wideR = [Float](repeating: 0, count: count)
-
-        for i in 0..<count {
-            let t = Double(i) / sr
-            let v = Float(sin(2.0 * Double.pi * 1000.0 * t) * 0.5)
-            vocalL[i] = v
-            vocalR[i] = v
-
-            let b = Float(sin(2.0 * Double.pi * 60.0 * t) * 0.8)
-            bassL[i] = b
-            bassR[i] = b
-
-            let w = Float(sin(2.0 * Double.pi * 1000.0 * t) * 0.6)
-            wideL[i] = w
-            wideR[i] = -w
-        }
-
-        let vocalOut = VocalIsolationDSP.processStereoForVocals(left: vocalL, right: vocalR, sampleRate: sr).vocalIsolated
-        let bassOut = VocalIsolationDSP.processStereoForVocals(left: bassL, right: bassR, sampleRate: sr).vocalIsolated
-        let wideOut = VocalIsolationDSP.processStereoForVocals(left: wideL, right: wideR, sampleRate: sr).vocalIsolated
-
-        let vocalRMS = AILyricsTranscriptionEngine.computeRMSEnvelope(samples: vocalOut, sampleRate: sr).reduce(0, +)
-        let bassRMS = AILyricsTranscriptionEngine.computeRMSEnvelope(samples: bassOut, sampleRate: sr).reduce(0, +)
-        let wideRMS = AILyricsTranscriptionEngine.computeRMSEnvelope(samples: wideOut, sampleRate: sr).reduce(0, +)
-
-        XCTAssertGreaterThan(vocalRMS, 0.5, "Center 1000 Hz vocal must pass cleanly at strong level")
-        XCTAssertLessThan(bassRMS, vocalRMS * 0.35, "190 Hz high-pass must heavily suppress 60 Hz 808 sub-bass")
-        XCTAssertLessThan(wideRMS, 0.01, "Mid/Side stereo vocal isolation must cancel wide out-of-phase stereo instruments")
-    }
-
-    func testAILyricsContiguousChunksCover100PercentOfSongWithZeroSkippedSeconds() {
-        let chunks = AILyricsTranscriptionEngine.buildContiguousListeningChunks(
-            start: 8.0,
-            end: 240.0,
-            chunkLength: 24.0,
-            overlap: 1.5
-        )
-        XCTAssertGreaterThanOrEqual(chunks.count, 10)
-        XCTAssertEqual(chunks.first?.start ?? -1, 8.0, accuracy: 0.001)
-        XCTAssertEqual(chunks.last?.end ?? -1, 240.0, accuracy: 0.001)
-        for i in 0..<chunks.count {
-            XCTAssertLessThanOrEqual(chunks[i].end - chunks[i].start, 24.01, "Each chunk must be <= 24s for fast isFinal recognition")
-            if i > 0 {
-                XCTAssertLessThan(chunks[i].start, chunks[i - 1].end, "Adjacent chunks MUST overlap so ZERO seconds of the song are skipped!")
-            }
-        }
-    }
-
-    func testAILyricsLanguageProbeScorePrefersConfidentRussianOverLowConfidenceEnglishGibberish() {
-        let confidentRussian = [
-            AIWordToken(text: "Окутала", timestamp: 10.0, duration: 0.5, confidence: 0.89, languageCode: "ru"),
-            AIWordToken(text: "меня", timestamp: 10.6, duration: 0.4, confidence: 0.87, languageCode: "ru"),
-            AIWordToken(text: "небо", timestamp: 11.4, duration: 0.4, confidence: 0.85, languageCode: "ru"),
-            AIWordToken(text: "алмазах", timestamp: 12.0, duration: 0.6, confidence: 0.91, languageCode: "ru")
-        ]
-        let englishGibberish = [
-            AIWordToken(text: "a", timestamp: 10.0, duration: 0.2, confidence: 0.22, languageCode: "en"),
-            AIWordToken(text: "cool", timestamp: 10.3, duration: 0.3, confidence: 0.28, languageCode: "en"),
-            AIWordToken(text: "la", timestamp: 10.7, duration: 0.2, confidence: 0.24, languageCode: "en"),
-            AIWordToken(text: "men", timestamp: 11.1, duration: 0.3, confidence: 0.31, languageCode: "en"),
-            AIWordToken(text: "yeah", timestamp: 11.6, duration: 0.3, confidence: 0.27, languageCode: "en")
-        ]
-        XCTAssertGreaterThan(
-            AILyricsTranscriptionEngine.scoreLanguageProbe(confidentRussian),
-            AILyricsTranscriptionEngine.scoreLanguageProbe(englishGibberish),
-            "Confidence-weighted probe score MUST select true Russian vocals over low-confidence English hallucinations"
-        )
-    }
-
-    func testAILyricsAudioAnchoredAlignmentFixesSpellingWhilePreservingRealAudioTimestampsAndPauses() {
-        let referenceLines = [
-            "I got love, I got love",
-            "Окутала меня, окутала",
-            "Небо в алмазах - лето",
-            "Свет в темноте горит"
-        ]
-        // Simulated real audio timestamps from a version with a 15-second MV intro & a 10-second instrumental break!
-        // Notice slightly misheard words ("окутал", "алмазы") that Pass 9 must verify & fix while keeping exact audio timestamps!
-        let audioTokens = [
-            AIWordToken(text: "I", timestamp: 15.2, duration: 0.2, confidence: 0.88, languageCode: "en"),
-            AIWordToken(text: "got", timestamp: 15.5, duration: 0.25, confidence: 0.90, languageCode: "en"),
-            AIWordToken(text: "love", timestamp: 15.85, duration: 0.35, confidence: 0.92, languageCode: "en"),
-            AIWordToken(text: "окутал", timestamp: 21.8, duration: 0.5, confidence: 0.68, languageCode: "ru"),
-            AIWordToken(text: "меня", timestamp: 22.4, duration: 0.4, confidence: 0.86, languageCode: "ru"),
-            AIWordToken(text: "небо", timestamp: 38.5, duration: 0.4, confidence: 0.88, languageCode: "ru"),
-            AIWordToken(text: "алмазы", timestamp: 39.1, duration: 0.5, confidence: 0.72, languageCode: "ru"),
-            AIWordToken(text: "свет", timestamp: 44.0, duration: 0.4, confidence: 0.84, languageCode: "ru"),
-            AIWordToken(text: "темноте", timestamp: 44.6, duration: 0.5, confidence: 0.89, languageCode: "ru")
-        ]
-        let pauses = [
-            AIPauseInterval(start: 0.0, end: 14.8),
-            AIPauseInterval(start: 26.0, end: 36.5)
-        ]
-
-        let lrc = AILyricsTranscriptionEngine.alignReferenceLinesToAudioTokens(
-            referenceLines: referenceLines,
-            audioTokens: audioTokens,
-            pauses: pauses,
-            trackDuration: 52.0
-        )
-        let parsed = LRCParser.parseSyncedLRC(lrc, includeIntroDots: true)
-        XCTAssertTrue(parsed.first?.isInstrumental == true, "15s MV intro MUST render as ••• dots")
-        XCTAssertGreaterThanOrEqual(parsed.filter(\.isInstrumental).count, 2, "Both 15s intro and 10.5s mid-song pause MUST render as •••")
-
-        let line1 = parsed.first { $0.text == "I got love, I got love" }
-        let line2 = parsed.first { $0.text == "Окутала меня, окутала" }
-        let line3 = parsed.first { $0.text == "Небо в алмазах - лето" }
-        let line4 = parsed.first { $0.text == "Свет в темноте горит" }
-        XCTAssertNotNil(line1)
-        XCTAssertNotNil(line2)
-        XCTAssertNotNil(line3)
-        XCTAssertNotNil(line4)
-        XCTAssertEqual(line1?.timestamp ?? -1, 15.2, accuracy: 0.15, "Must preserve exact 15.2s audio-heard timestamp")
-        XCTAssertEqual(line2?.timestamp ?? -1, 21.8, accuracy: 0.15, "Must preserve exact 21.8s audio-heard timestamp & fix spelling")
-        XCTAssertEqual(line3?.timestamp ?? -1, 38.5, accuracy: 0.15, "Must preserve exact 38.5s audio-heard timestamp after mid-song pause")
-        XCTAssertEqual(line4?.timestamp ?? -1, 44.0, accuracy: 0.15)
-    }
-
-    // MARK: - Per-Track Persistent AI Lyrics Preference & AI v3 Accuracy Verification Tests
+    // MARK: - Per-Track Persistent Custom Lyrics Mode & Manual Lyrics Creator Studio Tests
 
     @MainActor
-    func testPerTrackPreferredLyricsModeRemembersAIOnlyForSongsWhereUserEnabledAI() async throws {
+    func testPerTrackPreferredLyricsModeRemembersCustomOnlyForSongsWhereUserCreatedCustomLyrics() async throws {
         let lyricsService = LyricsService.shared
 
-        let songWithAI = UniversalTrack(
+        let songWithCustom = UniversalTrack(
             provider: .youtubeMusic,
-            providerTrackID: "PREF_AI_TRACK_A",
-            title: "Unique AI Song Alpha",
+            providerTrackID: "PREF_CUSTOM_TRACK_A",
+            title: "Unique Custom Song Alpha",
             artist: "Unique Artist Alpha",
             album: "Single",
             duration: 180.0
         )
-        let songWithoutAI = UniversalTrack(
+        let songWithoutCustom = UniversalTrack(
             provider: .youtubeMusic,
             providerTrackID: "PREF_ORIG_TRACK_B",
             title: "Unique Original Song Beta",
@@ -2729,189 +2440,48 @@ final class AuraMusicCoreTests: XCTestCase {
         )
 
         defer {
-            lyricsService.setPreferredLyricsMode(.standard, for: songWithAI)
-            lyricsService.setPreferredLyricsMode(.standard, for: songWithoutAI)
+            lyricsService.deleteCustomLyrics(for: songWithCustom)
+            lyricsService.setPreferredLyricsMode(.standard, for: songWithoutCustom)
         }
 
         // 1. By default, BOTH songs start in original (.standard) mode
-        lyricsService.setPreferredLyricsMode(.standard, for: songWithAI)
-        lyricsService.setPreferredLyricsMode(.standard, for: songWithoutAI)
-        XCTAssertEqual(lyricsService.preferredLyricsMode(for: songWithAI), .standard)
-        XCTAssertEqual(lyricsService.preferredLyricsMode(for: songWithoutAI), .standard)
+        lyricsService.setPreferredLyricsMode(.standard, for: songWithCustom)
+        lyricsService.setPreferredLyricsMode(.standard, for: songWithoutCustom)
+        XCTAssertEqual(lyricsService.preferredLyricsMode(for: songWithCustom), .standard)
+        XCTAssertEqual(lyricsService.preferredLyricsMode(for: songWithoutCustom), .standard)
 
-        // 2. User enables AI mode on Song A and AI saves synced lyrics for Song A
-        let sampleAILRC = "[00:05.00]ИИ распознал первую строку\n[00:10.00]ИИ распознал вторую строку"
-        let savedAI = try XCTUnwrap(lyricsService.saveAILyrics(syncedLRC: sampleAILRC, for: songWithAI))
-        XCTAssertTrue(savedAI.isSynchronized)
-        lyricsService.setPreferredLyricsMode(.aiAudio, for: songWithAI)
-        XCTAssertEqual(lyricsService.preferredLyricsMode(for: songWithAI), .aiAudio)
-        XCTAssertEqual(lyricsService.preferredLyricsMode(for: songWithoutAI), .standard, "Enabling AI on Song A MUST NOT enable AI on Song B")
-
-        // 3. User switches to Song B (never used AI!) -> MUST automatically display original (.standard) mode!
-        await lyricsService.loadLyrics(for: songWithoutAI)
-        XCTAssertEqual(lyricsService.lyricsMode, .standard, "Songs where user never enabled AI MUST stay on original lyrics")
-
-        // 4. User returns to Song A (last listened in AI mode!) -> MUST automatically restore AI mode & saved AI lyrics!
-        await lyricsService.loadLyrics(for: songWithAI)
-        XCTAssertEqual(lyricsService.lyricsMode, .aiAudio, "Re-playing a song last listened in AI mode MUST reopen AI lyrics automatically")
-        XCTAssertNotNil(lyricsService.aiDocument)
-        XCTAssertEqual(lyricsService.activeDocument?.syncedLines.first(where: { !$0.isInstrumental })?.text, "ИИ распознал первую строку")
-
-        // 5. User switches Song A back to Original inside the magnifying glass -> next load MUST stay on Original!
-        lyricsService.setPreferredLyricsMode(.standard, for: songWithAI)
-        await lyricsService.loadLyrics(for: songWithoutAI)
-        await lyricsService.loadLyrics(for: songWithAI)
-        XCTAssertEqual(lyricsService.lyricsMode, .standard, "Switching Song A back to Original must be remembered on next playback")
-    }
-
-    func testAILyricsOutlierAnchorPrunerRejectsImpossibleTimestampJumpsAndKeepsTrueAnchors() {
-        // Line 0 @ 10s, Line 1 @ 14s, Line 2 @ 55s (BOGUS outlier jump!), Line 3 @ 18s (wait - monotonic jammed at 55.2s), Line 4 @ 26s
-        let noisyAnchors: [Int: TimeInterval] = [
-            0: 10.0,
-            1: 14.0,
-            2: 49.8, // bogus jump +35.8s followed by jammed 0.2s gap to line 3!
-            3: 50.0,
-            4: 54.0
+        // 2. User creates custom lyrics for Song A and saves them -> ONLY Song A switches to .custom
+        let customEntries = [
+            CustomLyricEntry(kind: .pause, timestamp: 0.0, pauseDuration: 4.5),
+            CustomLyricEntry(kind: .lyric, timestamp: 5.0, primaryText: "Моя первая строка"),
+            CustomLyricEntry(kind: .lyric, timestamp: 10.0, primaryText: "Основной голос", secondaryText: "Второй голос сразу")
         ]
-        // Another clean case: Line 0 @ 10s, Line 1 @ 10.1s (jammed <0.30s!), Line 2 @ 18s
-        let jammedAnchors: [Int: TimeInterval] = [
-            0: 10.0,
-            1: 10.1,
-            2: 18.0,
-            3: 22.0
-        ]
+        let customLRC = CustomLyricsDocumentBuilder.buildLRC(from: customEntries)
+        let savedCustom = try XCTUnwrap(lyricsService.saveCustomLyrics(syncedLRC: customLRC, for: songWithCustom))
+        XCTAssertTrue(savedCustom.isSynchronized)
+        lyricsService.setPreferredLyricsMode(.custom, for: songWithCustom)
+        XCTAssertEqual(lyricsService.preferredLyricsMode(for: songWithCustom), .custom)
+        XCTAssertEqual(lyricsService.preferredLyricsMode(for: songWithoutCustom), .standard, "Custom lyrics on Song A MUST NOT change Song B")
 
-        let prunedNoisy = AILyricsTranscriptionEngine.pruneOutlierAnchors(noisyAnchors, totalLines: 6, pauses: [])
-        XCTAssertNil(prunedNoisy[2], "Bogus +35.8s outlier anchor jammed against next line must be pruned")
-        XCTAssertEqual(prunedNoisy[0], 10.0)
-        XCTAssertEqual(prunedNoisy[1], 14.0)
-        XCTAssertEqual(prunedNoisy[4], 54.0)
+        // 3. Switch to Song B -> MUST stay on original (.standard) mode
+        await lyricsService.loadLyrics(for: songWithoutCustom)
+        XCTAssertEqual(lyricsService.lyricsMode, .standard)
 
-        let prunedJammed = AILyricsTranscriptionEngine.pruneOutlierAnchors(jammedAnchors, totalLines: 5, pauses: [])
-        XCTAssertNil(prunedJammed[1], "Impossible 0.1s jammed anchor between 10s and 18s must be pruned")
-        XCTAssertEqual(prunedJammed[0], 10.0)
-        XCTAssertEqual(prunedJammed[2], 18.0)
-        XCTAssertEqual(prunedJammed[3], 22.0)
+        // 4. Return to Song A -> MUST automatically restore .custom mode & custom lyrics
+        await lyricsService.loadLyrics(for: songWithCustom)
+        XCTAssertEqual(lyricsService.lyricsMode, .custom, "Re-playing a song with custom lyrics MUST restore .custom automatically")
+        XCTAssertNotNil(lyricsService.customDocument)
+        let sungLines = lyricsService.activeDocument?.syncedLines.filter { !$0.isInstrumental } ?? []
+        XCTAssertEqual(sungLines.first?.text, "Моя первая строка")
+        XCTAssertEqual(sungLines.last?.secondaryText, "Второй голос сразу")
+
+        // 5. Deleting custom lyrics cleanly reverts Song A back to Original
+        lyricsService.deleteCustomLyrics(for: songWithCustom)
+        XCTAssertEqual(lyricsService.preferredLyricsMode(for: songWithCustom), .standard)
+        XCTAssertNil(lyricsService.loadCachedCustomLyrics(for: songWithCustom))
     }
 
-    func testAILyricsWeightedReferenceAlignmentRecoversAfterLongInstrumentalDropAndRepeatedChorus() {
-        let referenceLines = [
-            "Ночной город зажигает огни",
-            "Мы летим по трассе далеко",
-            "Тайный проигрыш без слов тут был",
-            "Снова припев звучит на всю",
-            "Звёзды падают прямо в океан"
-        ]
-        // Verse 1 heard at 8s & 12s; line 2 completely drowned by loud EDM drop; Chorus & Finale re-locked at 36s & 41s!
-        let tokens = [
-            AIWordToken(text: "ночной", timestamp: 8.0, duration: 0.4, confidence: 0.90, languageCode: "ru"),
-            AIWordToken(text: "город", timestamp: 8.5, duration: 0.4, confidence: 0.88, languageCode: "ru"),
-            AIWordToken(text: "огни", timestamp: 9.2, duration: 0.4, confidence: 0.85, languageCode: "ru"),
-            AIWordToken(text: "летим", timestamp: 12.2, duration: 0.4, confidence: 0.87, languageCode: "ru"),
-            AIWordToken(text: "трассе", timestamp: 12.8, duration: 0.5, confidence: 0.89, languageCode: "ru"),
-            // Noise words during drop that shouldn't mis-anchor line 2
-            AIWordToken(text: "да", timestamp: 18.0, duration: 0.2, confidence: 0.30, languageCode: "ru"),
-            AIWordToken(text: "не", timestamp: 22.0, duration: 0.2, confidence: 0.30, languageCode: "ru"),
-            // Chorus re-lock after instrumental drop
-            AIWordToken(text: "снова", timestamp: 36.0, duration: 0.4, confidence: 0.91, languageCode: "ru"),
-            AIWordToken(text: "припев", timestamp: 36.5, duration: 0.5, confidence: 0.93, languageCode: "ru"),
-            AIWordToken(text: "звучит", timestamp: 37.1, duration: 0.4, confidence: 0.88, languageCode: "ru"),
-            AIWordToken(text: "звёзды", timestamp: 41.0, duration: 0.4, confidence: 0.90, languageCode: "ru"),
-            AIWordToken(text: "океан", timestamp: 41.8, duration: 0.5, confidence: 0.92, languageCode: "ru")
-        ]
-        let pauses = [AIPauseInterval(start: 0.0, end: 7.5), AIPauseInterval(start: 16.0, end: 34.5)]
-
-        let lrc = AILyricsTranscriptionEngine.alignReferenceLinesToAudioTokens(
-            referenceLines: referenceLines,
-            audioTokens: tokens,
-            pauses: pauses,
-            trackDuration: 48.0
-        )
-        let parsed = LRCParser.parseSyncedLRC(lrc, includeIntroDots: true)
-        let line0 = parsed.first { $0.text == "Ночной город зажигает огни" }
-        let line3 = parsed.first { $0.text == "Снова припев звучит на всю" }
-        let line4 = parsed.first { $0.text == "Звёзды падают прямо в океан" }
-
-        XCTAssertEqual(line0?.timestamp ?? -1, 8.0, accuracy: 0.2)
-        XCTAssertEqual(line3?.timestamp ?? -1, 36.0, accuracy: 0.2, "Weighted aligner MUST recover and re-lock at 36.0s after EDM drop")
-        XCTAssertEqual(line4?.timestamp ?? -1, 41.0, accuracy: 0.2)
-    }
-
-    func testAILyricsAudioOnlyPolishCapitalizesRemovesFillersMergesOrphansAndHandlesMixedLanguages() {
-        XCTAssertEqual(
-            AILyricsTranscriptionEngine.polishSungLyricLine("  uh привет my friend ээ  "),
-            "Привет my friend",
-            "Line polish must strip speech fillers and apply Apple Music Sing capitalization"
-        )
-
-        let tokens = [
-            AIWordToken(text: "uh", timestamp: 4.5, duration: 0.2, confidence: 0.35, languageCode: "en"),
-            AIWordToken(text: "привет", timestamp: 5.0, duration: 0.4, confidence: 0.91, languageCode: "ru"),
-            AIWordToken(text: "мой", timestamp: 5.5, duration: 0.25, confidence: 0.89, languageCode: "ru"),
-            AIWordToken(text: "мир", timestamp: 5.85, duration: 0.35, confidence: 0.92, languageCode: "ru"),
-            // Tiny 2-char orphan word 0.8s later -> should merge cleanly into previous line instead of becoming a 1-word line!
-            AIWordToken(text: "да", timestamp: 7.0, duration: 0.2, confidence: 0.80, languageCode: "ru"),
-            AIWordToken(text: "we", timestamp: 12.0, duration: 0.2, confidence: 0.88, languageCode: "en"),
-            AIWordToken(text: "shine", timestamp: 12.3, duration: 0.4, confidence: 0.93, languageCode: "en"),
-            AIWordToken(text: "bright", timestamp: 12.8, duration: 0.4, confidence: 0.94, languageCode: "en")
-        ]
-
-        let lrc = AILyricsTranscriptionEngine.buildSyncedLRCFromTokens(tokens: tokens, pauses: [], trackDuration: 20.0)
-        let parsed = LRCParser.parseSyncedLRC(lrc, includeIntroDots: true)
-        let sungTexts = parsed.filter { !$0.isInstrumental }.map(\.text)
-
-        XCTAssertEqual(sungTexts.count, 2, "Tiny orphan 'да' must merge into line 1 instead of producing an awkward 1-word row")
-        XCTAssertEqual(sungTexts[0], "Привет мой мир да")
-        XCTAssertEqual(sungTexts[1], "We shine bright")
-    }
-
-    func testAILyricsTrailingSilenceDetectorTrimsMVOutroToSave30SecondBudget() {
-        // 240s MV: 0-12s silent intro | 12-200s active vocals | 200-240s dead credits outro!
-        var rms = [Float]()
-        for i in 0..<2400 {
-            let t = Double(i) * 0.1
-            if t >= 12.0 && t <= 200.0 {
-                rms.append(0.32)
-            } else {
-                rms.append(0.002)
-            }
-        }
-        let span = AILyricsTranscriptionEngine.detectVocalActiveSpan(
-            rmsFrames: rms,
-            frameDuration: 0.1,
-            trackDuration: 240.0
-        )
-        XCTAssertGreaterThanOrEqual(span.start, 10.5)
-        XCTAssertLessThanOrEqual(span.start, 12.2)
-        XCTAssertGreaterThanOrEqual(span.end, 200.0)
-        XCTAssertLessThanOrEqual(span.end, 204.0, "40-second dead MV outro must be trimmed cleanly so AI doesn't waste its 30s budget")
-    }
-
-    func testAILyricsContextualAlternativeSelectorPicksDomainWordOverLowConfidenceMistake() {
-        let vocab: Set<String> = ["окутала", "алмазах", "starboy", "miyagi"]
-
-        // Low-confidence misheard word promoted to exact vocabulary match from N-best alternatives
-        let promoted = AILyricsTranscriptionEngine.selectBestSegmentWord(
-            primary: "окутал",
-            confidence: 0.42,
-            alternatives: ["окутала", "окутали"],
-            contextualSet: vocab
-        )
-        XCTAssertEqual(promoted.word, "окутала")
-        XCTAssertGreaterThanOrEqual(promoted.confidence, 0.68)
-
-        // High-confidence word NOT overwritten even if alternatives contain something else
-        let preserved = AILyricsTranscriptionEngine.selectBestSegmentWord(
-            primary: "лето",
-            confidence: 0.91,
-            alternatives: ["окутала"],
-            contextualSet: vocab
-        )
-        XCTAssertEqual(preserved.word, "лето")
-        XCTAssertEqual(preserved.confidence, 0.91, accuracy: 0.001)
-    }
-
-    // MARK: - Badge Layout, Song Trim/Cut Settings, Ad-Free Offline Teardown, Video-ID Ad Catcher & Pure Audio AI Subtitles Tests
+    // MARK: - Badge Layout, Song Trim/Cut Settings, Ad-Free Offline Teardown & Video-ID Ad Catcher Tests
 
     func testProviderBadgeAndCapabilityShortPillLabelsStayCompactSingleLine() {
         XCTAssertEqual(PlaybackCapability.offlineFile.shortPillLabel, "OFFLINE")
@@ -3101,58 +2671,8 @@ final class AuraMusicCoreTests: XCTestCase {
         XCTAssertEqual(adCatchResult?["restoredRate"] as? Double ?? 0, 1.0, accuracy: 0.1)
     }
 
-    func testAISubtitleGeneratorCreatesCleanYouTubeStyleSubtitlesPurelyFromAudioTokensAndBreathValleys() {
-        // 10 continuous words with a breath-valley energy dip right between word 5 (t=7.0) and word 6 (t=7.25)
-        let tokens: [AIWordToken] = [
-            AIWordToken(text: "uh", timestamp: 4.5, duration: 0.2, confidence: 0.30, languageCode: "en"),
-            AIWordToken(text: "ночной", timestamp: 5.0, duration: 0.35, confidence: 0.90, languageCode: "ru"),
-            AIWordToken(text: "ветер", timestamp: 5.4, duration: 0.35, confidence: 0.88, languageCode: "ru"),
-            AIWordToken(text: "несёт", timestamp: 5.8, duration: 0.35, confidence: 0.91, languageCode: "ru"),
-            AIWordToken(text: "наши", timestamp: 6.2, duration: 0.35, confidence: 0.87, languageCode: "ru"),
-            AIWordToken(text: "голоса", timestamp: 6.6, duration: 0.40, confidence: 0.93, languageCode: "ru"),
-            // Small 0.25s breath valley dip in vocalRMS at t=7.0..7.25 -> should split cleanly into subtitle line 2!
-            AIWordToken(text: "вверх", timestamp: 7.25, duration: 0.35, confidence: 0.89, languageCode: "ru"),
-            AIWordToken(text: "к", timestamp: 7.65, duration: 0.15, confidence: 0.85, languageCode: "ru"),
-            AIWordToken(text: "ярким", timestamp: 7.85, duration: 0.35, confidence: 0.91, languageCode: "ru"),
-            AIWordToken(text: "звёздам", timestamp: 8.25, duration: 0.45, confidence: 0.94, languageCode: "ru"),
-            // Mid-song pause at 9.2..14.0 -> •••
-            AIWordToken(text: "we", timestamp: 14.2, duration: 0.2, confidence: 0.90, languageCode: "en"),
-            AIWordToken(text: "never", timestamp: 14.45, duration: 0.3, confidence: 0.92, languageCode: "en"),
-            AIWordToken(text: "stop", timestamp: 14.8, duration: 0.35, confidence: 0.94, languageCode: "en")
-        ]
-
-        // 200 RMS frames (20.0s @ 0.1s/frame) with clear vocal breath dip at 7.0..7.2s and silence 0..4.8s & 9.0..14.0s
-        var rms = [Float]()
-        for i in 0..<200 {
-            let t = Double(i) * 0.1
-            if (t >= 5.0 && t < 7.0) || (t >= 7.25 && t <= 8.8) || (t >= 14.2 && t <= 15.5) {
-                rms.append(0.35)
-            } else {
-                rms.append(0.005)
-            }
-        }
-        let pauses = AILyricsTranscriptionEngine.detectPauseIntervals(rmsFrames: rms, frameDuration: 0.1, trackDuration: 20.0)
-
-        let lrc = AILyricsTranscriptionEngine.buildSubtitleStyleLRCFromTokens(
-            tokens: tokens,
-            pauses: pauses,
-            vocalRMSFrames: rms,
-            rmsFrameDuration: 0.1,
-            trackDuration: 20.0
-        )
-        let parsed = LRCParser.parseSyncedLRC(lrc, includeIntroDots: true)
-        let sung = parsed.filter { !$0.isInstrumental }
-
-        XCTAssertTrue(parsed.first?.isInstrumental == true, "Intro silence must render as •••")
-        XCTAssertGreaterThanOrEqual(parsed.filter(\.isInstrumental).count, 2, "Both intro and mid-song vocal pause must render as •••")
-        XCTAssertEqual(sung.count, 3, "Breath valley at t=7.0..7.25 must split verse into 2 crisp subtitle lines + 3rd English line")
-        XCTAssertEqual(sung[0].text, "Ночной ветер несёт наши голоса")
-        XCTAssertEqual(sung[1].text, "Вверх к ярким звёздам")
-        XCTAssertEqual(sung[2].text, "We never stop")
-    }
-
     @MainActor
-    func testOfflineDownloadDetectsChangedLyricsAndUpdatesOfflineCacheWithoutRedownloadingAudio() async throws {
+    func testOfflineDownloadDetectsChangedCustomLyricsAndUpdatesOfflineCacheWithoutRedownloadingAudio() async throws {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
         let dlDir = docs.appendingPathComponent("AuraDownloads", isDirectory: true)
         try FileManager.default.createDirectory(at: dlDir, withIntermediateDirectories: true)
@@ -3173,18 +2693,22 @@ final class AuraMusicCoreTests: XCTestCase {
 
         defer {
             manager.removeDownload(trackID: track.id)
-            lyrics.setPreferredLyricsMode(.standard, for: track)
+            lyrics.deleteCustomLyrics(for: track)
             try? FileManager.default.removeItem(at: fullURL)
         }
 
-        // 1. Register downloaded track initially without synced AI lyrics
+        // 1. Register downloaded track initially
         manager.registerCompletedDownloadForTesting(track: track, relativePath: relPath, hasLyrics: true)
         XCTAssertTrue(manager.isDownloaded(track))
 
-        // 2. User generates brand-new AI lyrics & switches song to AI mode -> manager MUST flag update available!
-        _ = lyrics.saveAILyrics(syncedLRC: "[00:05.00]Новые ИИ субтитры\n[00:10.00]Вторая строка", for: track)
-        lyrics.setPreferredLyricsMode(.aiAudio, for: track)
-        XCTAssertTrue(manager.hasLyricsUpdateAvailable(for: track), "Changing lyrics on a downloaded song MUST show 'Докачать обновлённую лирику'")
+        // 2. User writes brand-new custom lyrics & activates .custom mode -> manager MUST flag update available!
+        let customLRC = CustomLyricsDocumentBuilder.buildLRC(from: [
+            CustomLyricEntry(kind: .lyric, timestamp: 5.0, primaryText: "Моя новая строка"),
+            CustomLyricEntry(kind: .lyric, timestamp: 10.0, primaryText: "Вторая строка", secondaryText: "Бэк-вокал")
+        ])
+        _ = lyrics.saveCustomLyrics(syncedLRC: customLRC, for: track)
+        lyrics.setPreferredLyricsMode(.custom, for: track)
+        XCTAssertTrue(manager.hasLyricsUpdateAvailable(for: track), "Saving custom lyrics on a downloaded song MUST show 'Докачать обновлённую лирику'")
 
         // 3. User taps "Докачать обновлённую лирику" -> syncs offline lyrics WITHOUT touching audio file!
         await manager.syncOfflineLyricsForTrack(track)
@@ -3192,32 +2716,162 @@ final class AuraMusicCoreTests: XCTestCase {
         XCTAssertEqual(manager.completedLocalRelativePath(for: track), relPath, "Audio file must stay intact without re-downloading")
     }
 
-    func testVocalClarityDSPPreservesHighFrequencyConsonantsWhileSuppressingSubBass() {
-        let sr = 16_000.0
-        let count = Int(sr * 1.0)
-        var sibilantL = [Float](repeating: 0, count: count)
-        var sibilantR = [Float](repeating: 0, count: count)
-        var bassL = [Float](repeating: 0, count: count)
-        var bassR = [Float](repeating: 0, count: count)
+    // MARK: - Trim-Relative Original Time Display & Manual Lyrics Studio Tests
 
-        for i in 0..<count {
-            let t = Double(i) / sr
-            let s = Float(sin(2.0 * Double.pi * 5000.0 * t) * 0.45) // 5 kHz consonant sibilant (S/SH/CH/Щ)
-            sibilantL[i] = s
-            sibilantR[i] = s
+    @MainActor
+    func testTrimmedSongReportsTrimRelativeTimeAndDurationAsOriginalAcrossPlayerAndRows() {
+        let persistence = PersistenceController.shared
+        let engine = UniversalAudioPlayerEngine.shared
 
-            let b = Float(sin(2.0 * Double.pi * 55.0 * t) * 0.80) // 55 Hz 808 sub-bass
-            bassL[i] = b
-            bassR[i] = b
+        let track = UniversalTrack(
+            provider: .youtubeMusic,
+            providerTrackID: "TRIM_AS_ORIG_VID_1",
+            title: "Trimmed Looks Like Original",
+            artist: "Clean Playlist Artist",
+            album: "Single",
+            duration: 240.0, // Original 4:00
+            isStreamable: true
+        )
+
+        defer {
+            persistence.setTrimRange(nil, for: track)
+            engine.pause()
+            engine.activeYouTubeVideoID = nil
         }
 
-        let sibOut = VocalIsolationDSP.processStereoForVocals(left: sibilantL, right: sibilantR, sampleRate: sr).vocalIsolated
-        let bassOut = VocalIsolationDSP.processStereoForVocals(left: bassL, right: bassR, sampleRate: sr).vocalIsolated
+        // Before trimming: playlist & player show original 4:00
+        XCTAssertEqual(persistence.effectiveDuration(for: track), 240.0, accuracy: 0.01)
+        XCTAssertEqual(persistence.effectiveFormattedDuration(for: track), "4:00")
 
-        let sibRMS = AILyricsTranscriptionEngine.computeRMSEnvelope(samples: sibOut, sampleRate: sr).reduce(0, +)
-        let bassRMS = AILyricsTranscriptionEngine.computeRMSEnvelope(samples: bassOut, sampleRate: sr).reduce(0, +)
+        // User trims song to 0:30 → 2:15 (new clean length = 1:45 = 105s)
+        let trim = TrackTrimRange(startSeconds: 30.0, endSeconds: 135.0)
+        persistence.setTrimRange(trim, for: track)
 
-        XCTAssertGreaterThan(sibRMS, 0.5, "7200 Hz low-pass must preserve 5 kHz vocal sibilants so words stay sharp & recognizable")
-        XCTAssertLessThan(bassRMS, sibRMS * 0.35, "4th-order 140 Hz high-pass must suppress 55 Hz 808 sub-bass cleanly")
+        // Playlist / Library rows display 1:45 cleanly (NO scissors/trimmed badge!)
+        XCTAssertEqual(persistence.effectiveDuration(for: track), 105.0, accuracy: 0.01)
+        XCTAssertEqual(persistence.effectiveFormattedDuration(for: track), "1:45")
+
+        // Player & Lock Screen report trim-relative time 0:00 → 1:45 as if it were the original!
+        engine.play(track)
+        let bounds = engine.displayPlaybackBounds(for: 240.0)
+        XCTAssertEqual(bounds.start, 30.0, accuracy: 0.01)
+        XCTAssertEqual(bounds.duration, 105.0, accuracy: 0.01)
+        XCTAssertEqual(engine.displayPlaybackTime(rawTime: 30.0, rawDuration: 240.0), 0.0, accuracy: 0.01)
+        XCTAssertEqual(engine.displayPlaybackTime(rawTime: 75.0, rawDuration: 240.0), 45.0, accuracy: 0.01)
+        XCTAssertEqual(engine.displayPlaybackTime(rawTime: 135.0, rawDuration: 240.0), 105.0, accuracy: 0.01)
+        XCTAssertEqual(engine.displayPlaybackTime(rawTime: 10.0, rawDuration: 240.0), 0.0, accuracy: 0.01, "Raw time before trimStart clamps cleanly to 0:00")
+
+        // Resetting trim immediately restores original 4:00 duration everywhere
+        persistence.setTrimRange(nil, for: track)
+        engine.applyUpdatedTrimRange(nil, for: track)
+        XCTAssertEqual(persistence.effectiveFormattedDuration(for: track), "4:00")
+        XCTAssertEqual(engine.displayPlaybackBounds(for: 240.0).duration, 240.0, accuracy: 0.01)
+    }
+
+    func testCustomLyricsSerializerAndParserSupportTextPausesWithExactDurationAndDualSimultaneousLines() throws {
+        let entries: [CustomLyricEntry] = [
+            CustomLyricEntry(kind: .pause, timestamp: 0.0, pauseDuration: 6.5),
+            CustomLyricEntry(kind: .lyric, timestamp: 7.0, primaryText: "Окутала меня"),
+            CustomLyricEntry(kind: .lyric, timestamp: 12.4, primaryText: "Я лечу к тебе", secondaryText: "(I got love, I got love)"),
+            CustomLyricEntry(kind: .pause, timestamp: 16.0, pauseDuration: 1.5), // short explicit user pause -> MUST be preserved!
+            CustomLyricEntry(kind: .lyric, timestamp: 18.0, primaryText: "Финальный припев"),
+            CustomLyricEntry(kind: .pause, timestamp: 22.0, pauseDuration: 8.0)  // explicit outro pause -> MUST be preserved!
+        ]
+
+        let compiledLRC = CustomLyricsDocumentBuilder.buildLRC(from: entries)
+        XCTAssertTrue(compiledLRC.contains("•••{dur=6.5}"))
+        XCTAssertTrue(compiledLRC.contains("Я лечу к тебе || (I got love, I got love)"))
+        XCTAssertTrue(compiledLRC.contains("•••{dur=1.5}"))
+        XCTAssertTrue(compiledLRC.contains("•••{dur=8.0}"))
+
+        let parsed = LRCParser.parseSyncedLRC(compiledLRC, includeIntroDots: false)
+        XCTAssertEqual(parsed.count, 6, "All 6 user-authored entries (including short 1.5s pause and trailing 8.0s pause) must round-trip losslessly")
+
+        XCTAssertTrue(parsed[0].isInstrumental)
+        XCTAssertEqual(parsed[0].explicitDuration ?? 0, 6.5, accuracy: 0.01)
+
+        XCTAssertEqual(parsed[1].text, "Окутала меня")
+        XCTAssertNil(parsed[1].secondaryText)
+
+        XCTAssertEqual(parsed[2].text, "Я лечу к тебе")
+        XCTAssertEqual(parsed[2].secondaryText, "(I got love, I got love)")
+        XCTAssertFalse(parsed[2].isInstrumental)
+
+        XCTAssertTrue(parsed[3].isInstrumental)
+        XCTAssertEqual(parsed[3].explicitDuration ?? 0, 1.5, accuracy: 0.01)
+
+        XCTAssertEqual(parsed[4].text, "Финальный припев")
+
+        XCTAssertTrue(parsed[5].isInstrumental)
+        XCTAssertEqual(parsed[5].explicitDuration ?? 0, 8.0, accuracy: 0.01)
+    }
+
+    func testExplicitPauseDurationControlsAppleMusicInstrumentalDotsTiming() {
+        // User places an explicit 4.0s pause starting at t = 10.0s, even though the next lyric doesn't start until t = 25.0s
+        let lines = [
+            SyncedLyricLine(index: 0, timestamp: 10.0, text: "•••", isInstrumental: true, explicitDuration: 4.0),
+            SyncedLyricLine(index: 1, timestamp: 25.0, text: "Next verse", isInstrumental: false)
+        ]
+
+        // At t = 10.0 (+0.25s lead = 10.25s, progress = 0.25/4.0 = 6.25%) -> 0 dots
+        XCTAssertEqual(LyricSynchronizationEngine.litDotsCount(at: 10.0, forLineAt: 0, in: lines, trackDuration: 60.0), 0)
+        // At t = 11.2 (+0.25s lead = 11.45s, progress = 1.45/4.0 = 36.2%) -> 1 dot
+        XCTAssertEqual(LyricSynchronizationEngine.litDotsCount(at: 11.2, forLineAt: 0, in: lines, trackDuration: 60.0), 1)
+        // At t = 12.2 (+0.25s lead = 12.45s, progress = 2.45/4.0 = 61.2%) -> 2 dots
+        XCTAssertEqual(LyricSynchronizationEngine.litDotsCount(at: 12.2, forLineAt: 0, in: lines, trackDuration: 60.0), 2)
+        // At t = 13.5 (+0.25s lead = 13.75s, progress = 3.75/4.0 = 93.7%) -> all 3 dots lit right at user's 4.0s duration!
+        XCTAssertEqual(LyricSynchronizationEngine.litDotsCount(at: 13.5, forLineAt: 0, in: lines, trackDuration: 60.0), 3)
+    }
+
+    func testCustomLyricsBuilderSortsOutOfOrderEntriesImportsOriginalAndParsesBulkLines() {
+        // 1. Out-of-order entries compile strictly monotonically sorted
+        let unsorted = [
+            CustomLyricEntry(kind: .lyric, timestamp: 20.0, primaryText: "Third"),
+            CustomLyricEntry(kind: .lyric, timestamp: 5.0, primaryText: "First"),
+            CustomLyricEntry(kind: .lyric, timestamp: 12.5, primaryText: "Second", secondaryText: "Harmony")
+        ]
+        let lrc = CustomLyricsDocumentBuilder.buildLRC(from: unsorted)
+        let parsed = LRCParser.parseSyncedLRC(lrc, includeIntroDots: false)
+        XCTAssertEqual(parsed.map(\.text), ["First", "Second", "Third"])
+        XCTAssertEqual(parsed[1].secondaryText, "Harmony")
+
+        // 2. Bulk paste recognizes pauses (`•••` / `пауза`) and dual simultaneous lines (`||`)
+        let bulk = """
+        пауза
+        Первая строка
+        Главный голос || Второй голос
+        •••
+        Финал
+        """
+        let bulkEntries = CustomLyricsDocumentBuilder.parseBulkLines(bulk, startingAt: 0.0, stepSeconds: 3.0)
+        XCTAssertEqual(bulkEntries.count, 5)
+        XCTAssertEqual(bulkEntries[0].kind, .pause)
+        XCTAssertEqual(bulkEntries[1].primaryText, "Первая строка")
+        XCTAssertEqual(bulkEntries[2].primaryText, "Главный голос")
+        XCTAssertEqual(bulkEntries[2].secondaryText, "Второй голос")
+        XCTAssertTrue(bulkEntries[2].isDualText)
+        XCTAssertEqual(bulkEntries[3].kind, .pause)
+        XCTAssertEqual(bulkEntries[4].primaryText, "Финал")
+
+        // 3. Importing an existing document preserves pause durations & dual texts
+        let doc = TrackLyricsDocument(
+            trackTitle: "Test",
+            artistName: "Artist",
+            isSynchronized: true,
+            detectedLanguageCode: "ru",
+            detectedLanguageDisplayName: "Russian",
+            syncedLines: [
+                SyncedLyricLine(index: 0, timestamp: 0.0, text: "•••", isInstrumental: true, explicitDuration: 7.0),
+                SyncedLyricLine(index: 1, timestamp: 7.5, text: "Линия 1", secondaryText: "Линия 2", isInstrumental: false)
+            ],
+            plainLines: ["Линия 1"],
+            hasTranslationAvailable: false
+        )
+        let imported = CustomLyricsDocumentBuilder.entries(from: doc, trackDuration: 120.0)
+        XCTAssertEqual(imported.count, 2)
+        XCTAssertEqual(imported[0].kind, .pause)
+        XCTAssertEqual(imported[0].pauseDuration, 7.0, accuracy: 0.01)
+        XCTAssertEqual(imported[1].primaryText, "Линия 1")
+        XCTAssertEqual(imported[1].secondaryText, "Линия 2")
     }
 }

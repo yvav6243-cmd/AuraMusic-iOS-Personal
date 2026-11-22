@@ -717,6 +717,21 @@ public final class PersistenceController: ObservableObject {
         return range.startSeconds >= 0.5 || range.endSeconds != nil
     }
 
+    /// Returns the song's effective playable duration (trimmed length if trimmed, otherwise original duration)
+    /// so trimmed songs display their new length cleanly everywhere just like original songs.
+    public func effectiveDuration(for track: UniversalTrack) -> TimeInterval {
+        guard track.duration > 5,
+              let range = trimRange(for: track),
+              range.isEffectivelyTrimmed(for: track.duration) else {
+            return track.duration
+        }
+        return range.effectiveDuration(for: track.duration)
+    }
+
+    public func effectiveFormattedDuration(for track: UniversalTrack) -> String {
+        TrackTrimRange.formatClock(effectiveDuration(for: track))
+    }
+
     public func setTrimRange(_ range: TrackTrimRange?, for track: UniversalTrack) {
         let keys = trimLookupKeys(for: track)
         if let range {

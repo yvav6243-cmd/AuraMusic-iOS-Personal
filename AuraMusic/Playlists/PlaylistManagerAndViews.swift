@@ -589,7 +589,7 @@ public struct PlaylistDetailView: View {
                                     .scaleEffect(0.7)
                             }
 
-                            Text(track.formattedDuration)
+                            Text(persistence.effectiveFormattedDuration(for: track))
                                 .font(.system(size: 12, weight: .medium))
                                 .foregroundStyle(.secondary)
                         }

@@ -10,7 +10,11 @@ public struct SyncedLyricLine: Identifiable, Codable, Hashable, Sendable {
     public let index: Int
     public let timestamp: TimeInterval
     public let text: String
+    /// Optional second simultaneous lyric line (duet, backing vocals, ad-lib, or dual language)
+    public var secondaryText: String?
     public let isInstrumental: Bool
+    /// Optional user-defined duration for an instrumental pause (`•••{dur=6.5}`) controlling exact dot fill speed
+    public var explicitDuration: TimeInterval?
     public var translatedText: String?
 
     public init(
@@ -18,14 +22,19 @@ public struct SyncedLyricLine: Identifiable, Codable, Hashable, Sendable {
         index: Int,
         timestamp: TimeInterval,
         text: String,
+        secondaryText: String? = nil,
         isInstrumental: Bool? = nil,
+        explicitDuration: TimeInterval? = nil,
         translatedText: String? = nil
     ) {
         self.id = id
         self.index = index
         self.timestamp = timestamp
         self.text = text
+        let cleanSec = secondaryText?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.secondaryText = (cleanSec?.isEmpty == false) ? cleanSec : nil
         self.isInstrumental = isInstrumental ?? (text == "•••")
+        self.explicitDuration = explicitDuration
         self.translatedText = translatedText
     }
 }
@@ -96,12 +105,14 @@ public enum LRCParser {
         let timestampPattern = "\\[(\\d{1,3}):(\\d{2})(?:[\\.:](\\d{1,3}))?\\]"
         let offsetPattern = "\\[offset:\\s*([+-]?\\d+)\\s*\\]"
         let inlineWordTagPattern = "<\\d{1,3}:\\d{2}(?:[\\.:]\\d{1,3})?>"
+        let pauseDurPattern = "\\{dur=([0-9]+(?:\\.[0-9]+)?)\\}"
 
         guard let tsRegex = try? NSRegularExpression(pattern: timestampPattern, options: []) else {
             return []
         }
         let offsetRegex = try? NSRegularExpression(pattern: offsetPattern, options: [.caseInsensitive])
         let inlineTagRegex = try? NSRegularExpression(pattern: inlineWordTagPattern, options: [])
+        let pauseDurRegex = try? NSRegularExpression(pattern: pauseDurPattern, options: [.caseInsensitive])
 
         // 1. Extract optional [offset:±ms] header (positive offset shifts timestamps earlier per LRC spec)
         var offsetSeconds: TimeInterval = 0
@@ -121,8 +132,10 @@ public enum LRCParser {
         struct RawEntry {
             let timestamp: TimeInterval
             let text: String
+            let secondaryText: String?
             let translation: String?
             let isInstrumental: Bool
+            let explicitDuration: TimeInterval?
             let originalOrder: Int
         }
 
@@ -143,12 +156,40 @@ public enum LRCParser {
                 let cRange = NSRange(lyricContent.startIndex..<lyricContent.endIndex, in: lyricContent)
                 lyricContent = inlineTagRegex.stringByReplacingMatches(in: lyricContent, range: cRange, withTemplate: "")
             }
+
+            // Extract optional explicit pause duration tag `{dur=6.5}` written by CustomLyricsDocumentBuilder
+            var explicitDur: TimeInterval? = nil
+            if let pauseDurRegex {
+                let cRange = NSRange(lyricContent.startIndex..<lyricContent.endIndex, in: lyricContent)
+                if let durMatch = pauseDurRegex.firstMatch(in: lyricContent, options: [], range: cRange),
+                   let valRange = Range(durMatch.range(at: 1), in: lyricContent),
+                   let parsedDur = Double(lyricContent[valRange]),
+                   parsedDur > 0 {
+                    explicitDur = parsedDur
+                    lyricContent = pauseDurRegex.stringByReplacingMatches(in: lyricContent, range: cRange, withTemplate: "")
+                }
+            }
+
             lyricContent = lyricContent.trimmingCharacters(in: .whitespacesAndNewlines)
 
             let parts = lyricContent.components(separatedBy: " // ")
-            let original = (parts.first ?? lyricContent).trimmingCharacters(in: .whitespacesAndNewlines)
+            let originalRaw = (parts.first ?? lyricContent).trimmingCharacters(in: .whitespacesAndNewlines)
             let translation = parts.count > 1 ? parts[1].trimmingCharacters(in: .whitespacesAndNewlines) : nil
-            let instrumental = isInstrumentalMarker(original)
+
+            // Support dual simultaneous texts (`Primary || Secondary`) on a single timestamp!
+            let primaryText: String
+            let secondaryText: String?
+            if originalRaw.contains(" || ") {
+                let dualParts = originalRaw.components(separatedBy: " || ")
+                primaryText = (dualParts.first ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                let sec = dualParts.dropFirst().joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+                secondaryText = sec.isEmpty ? nil : sec
+            } else {
+                primaryText = originalRaw
+                secondaryText = nil
+            }
+
+            let instrumental = (secondaryText == nil) && (explicitDur != nil || isInstrumentalMarker(primaryText))
 
             for match in matches {
                 guard let minRange = Range(match.range(at: 1), in: rawLine),
@@ -175,9 +216,11 @@ public enum LRCParser {
                 rawEntries.append(
                     RawEntry(
                         timestamp: adjustedTime,
-                        text: instrumental ? "•••" : original,
+                        text: instrumental ? "•••" : primaryText,
+                        secondaryText: instrumental ? nil : secondaryText,
                         translation: instrumental ? nil : translation,
                         isInstrumental: instrumental,
+                        explicitDuration: instrumental ? explicitDur : nil,
                         originalOrder: orderCounter
                     )
                 )
@@ -199,31 +242,42 @@ public enum LRCParser {
         }
 
         // 4. Separate & clean:
-        //    - Merge simultaneous real lyric lines (within 0.05s) so neither line is skipped/unlit
-        //    - Drop any instrumental marker colliding within 0.50s of a real lyric line
-        //    - Collapse consecutive instrumental markers into one (keeping the earliest timestamp)
+        //    - Merge simultaneous real lyric lines (within 0.05s) into `primary + secondaryText` so BOTH display simultaneously!
+        //    - Drop implicit instrumental markers colliding within 0.50s of a real lyric line
+        //    - Collapse consecutive instrumental markers into one (keeping explicit duration if present)
         var cleaned: [RawEntry] = []
 
         for entry in sorted {
             if entry.isInstrumental {
-                // Skip if a real lyric already sits right at this timestamp
-                if let prev = cleaned.last, !prev.isInstrumental, abs(entry.timestamp - prev.timestamp) < collisionWindowSeconds {
+                // Skip implicit pause markers colliding right with a real lyric
+                if entry.explicitDuration == nil,
+                   let prev = cleaned.last, !prev.isInstrumental,
+                   abs(entry.timestamp - prev.timestamp) < collisionWindowSeconds {
                     continue
                 }
-                // Collapse consecutive instrumental markers
-                if let prev = cleaned.last, prev.isInstrumental {
+                // Collapse consecutive implicit instrumental markers
+                if entry.explicitDuration == nil,
+                   let prev = cleaned.last, prev.isInstrumental {
                     continue
                 }
                 cleaned.append(entry)
             } else {
-                // If previous entry was an instrumental marker colliding right on/before this real lyric, drop the marker!
-                if let prev = cleaned.last, prev.isInstrumental, abs(entry.timestamp - prev.timestamp) < collisionWindowSeconds {
+                // If previous entry was an implicit instrumental marker colliding right on/before this real lyric, drop the marker!
+                if let prev = cleaned.last,
+                   prev.isInstrumental,
+                   prev.explicitDuration == nil,
+                   abs(entry.timestamp - prev.timestamp) < collisionWindowSeconds {
                     cleaned.removeLast()
                 }
-                // Merge simultaneous real lyrics (e.g. overlapping lead + backing vocal at exact same timestamp)
+                // Merge simultaneous real lyrics (e.g. duet / overlapping lead + backing vocal at exact same timestamp)
                 if let prev = cleaned.last, !prev.isInstrumental, abs(entry.timestamp - prev.timestamp) <= simultaneousLyricWindowSeconds {
                     if prev.text.caseInsensitiveCompare(entry.text) != .orderedSame {
-                        let mergedText = "\(prev.text)\n\(entry.text)"
+                        let mergedSecondary: String
+                        if let existingSec = prev.secondaryText, !existingSec.isEmpty {
+                            mergedSecondary = "\(existingSec)\n\(entry.text)"
+                        } else {
+                            mergedSecondary = entry.text
+                        }
                         let mergedTranslation: String?
                         if let t1 = prev.translation, let t2 = entry.translation {
                             mergedTranslation = "\(t1)\n\(t2)"
@@ -232,9 +286,11 @@ public enum LRCParser {
                         }
                         cleaned[cleaned.count - 1] = RawEntry(
                             timestamp: prev.timestamp,
-                            text: mergedText,
+                            text: prev.text,
+                            secondaryText: mergedSecondary,
                             translation: mergedTranslation,
                             isInstrumental: false,
+                            explicitDuration: nil,
                             originalOrder: prev.originalOrder
                         )
                     }
@@ -244,16 +300,19 @@ public enum LRCParser {
             }
         }
 
-        // 5. Drop trailing instrumental markers after the final sung lyric (common end-of-song clear tags in LRCLIB)
-        while let last = cleaned.last, last.isInstrumental, cleaned.contains(where: { !$0.isInstrumental }) {
+        // 5. Drop trailing implicit instrumental markers after the final sung lyric (keep explicit user-defined pauses!)
+        while let last = cleaned.last,
+              last.isInstrumental,
+              last.explicitDuration == nil,
+              cleaned.contains(where: { !$0.isInstrumental }) {
             cleaned.removeLast()
         }
 
-        // 6. Drop short micro-pause instrumental markers (< 2.2s before the next real lyric line)
+        // 6. Drop short implicit micro-pause markers (< 2.2s before next lyric); ALWAYS keep explicit user-defined pauses!
         var withoutMicroPauses: [RawEntry] = []
         for idx in cleaned.indices {
             let entry = cleaned[idx]
-            if entry.isInstrumental {
+            if entry.isInstrumental && entry.explicitDuration == nil {
                 if idx + 1 < cleaned.count {
                     let gap = cleaned[idx + 1].timestamp - entry.timestamp
                     if gap < minimumPauseDuration {
@@ -264,21 +323,22 @@ public enum LRCParser {
             withoutMicroPauses.append(entry)
         }
 
-        // 7. Handle leading intro dots cleanly so SynchronizedLyricsView never inserts/removes views mid-scroll
-        if includeIntroDots, let firstRealIdx = withoutMicroPauses.firstIndex(where: { !$0.isInstrumental }) {
+        // 7. Handle leading intro dots cleanly (only when caller requests auto-intro dots AND no explicit user intro pause exists)
+        let hasExplicitLeadingPause = withoutMicroPauses.first?.explicitDuration != nil
+        if includeIntroDots, !hasExplicitLeadingPause, let firstRealIdx = withoutMicroPauses.firstIndex(where: { !$0.isInstrumental }) {
             let firstRealTimestamp = withoutMicroPauses[firstRealIdx].timestamp
-            // Remove any raw leading instrumental entries before the first real lyric
             if firstRealIdx > 0 {
                 withoutMicroPauses.removeFirst(firstRealIdx)
             }
-            // If the song has a meaningful instrumental intro (>= 3.0s), insert one clean intro "•••" row at t = 0.0
             if firstRealTimestamp >= minimumIntroDotsDuration {
                 withoutMicroPauses.insert(
                     RawEntry(
                         timestamp: 0.0,
                         text: "•••",
+                        secondaryText: nil,
                         translation: nil,
                         isInstrumental: true,
+                        explicitDuration: nil,
                         originalOrder: -1
                     ),
                     at: 0
@@ -299,7 +359,9 @@ public enum LRCParser {
                     index: idx,
                     timestamp: safeTimestamp,
                     text: item.text,
+                    secondaryText: item.secondaryText,
                     isInstrumental: item.isInstrumental,
+                    explicitDuration: item.explicitDuration,
                     translatedText: item.translation
                 )
             )
@@ -381,9 +443,18 @@ public enum LyricSynchronizationEngine {
             return 0
         }
         let start = lines[index].timestamp
-        let end: TimeInterval = (index + 1 < lines.count)
+        let nextBoundary: TimeInterval = (index + 1 < lines.count)
             ? lines[index + 1].timestamp
-            : max(trackDuration, start + 6.0)
+            : max(trackDuration, start + (lines[index].explicitDuration ?? 6.0))
+        let end: TimeInterval
+        if let explicit = lines[index].explicitDuration, explicit > 0.2 {
+            let explicitEnd = start + explicit
+            end = (index + 1 < lines.count && nextBoundary > start + 0.2)
+                ? min(nextBoundary, explicitEnd)
+                : explicitEnd
+        } else {
+            end = nextBoundary
+        }
         let effectiveTime = max(0, currentTime) + leadTimeSeconds
         return AppleMusicInstrumentalDotsView.calculateLitDots(
             currentTime: effectiveTime,
@@ -421,13 +492,13 @@ public final class LyricsService: ObservableObject {
     public static let shared = LyricsService()
 
     @Published public private(set) var currentDocument: TrackLyricsDocument?
-    @Published public private(set) var aiDocument: TrackLyricsDocument?
+    @Published public private(set) var customDocument: TrackLyricsDocument?
     @Published public var lyricsMode: LyricsDisplayMode = .standard
     @Published public private(set) var isLoading: Bool = false
     @Published public private(set) var errorMessage: String?
 
     public var activeDocument: TrackLyricsDocument? {
-        lyricsMode == .aiAudio ? aiDocument : currentDocument
+        lyricsMode == .custom ? customDocument : currentDocument
     }
 
     private let session: URLSession
@@ -443,8 +514,12 @@ public final class LyricsService: ObservableObject {
         guard let doc = activeDocument else { return nil }
         if doc.isSynchronized {
             if let activeIdx = LyricSynchronizationEngine.activeLineIndex(at: currentTime, in: doc.syncedLines) {
-                if !doc.syncedLines[activeIdx].isInstrumental {
-                    return doc.syncedLines[activeIdx].text
+                let line = doc.syncedLines[activeIdx]
+                if !line.isInstrumental {
+                    if let sec = line.secondaryText, !sec.isEmpty {
+                        return "\(line.text) / \(sec)"
+                    }
+                    return line.text
                 }
                 // During a pause, preview the most recent sung line or upcoming first sung line
                 for idx in stride(from: activeIdx - 1, through: 0, by: -1) {
@@ -464,30 +539,30 @@ public final class LyricsService: ObservableObject {
         return "\(parsedArtist.lowercased())::\(parsedTitle.lowercased())"
     }
 
-    nonisolated public static func aiLyricsCacheKey(for track: UniversalTrack) -> String {
-        "ai::\(lyricsCacheKey(for: track))"
+    nonisolated public static func customLyricsCacheKey(for track: UniversalTrack) -> String {
+        "custom::\(lyricsCacheKey(for: track))"
     }
 
     private static let preferredModeDefaultsKey = "AuraMusic.PreferredLyricsModeByTrackKey"
 
-    public func setActiveAIDocument(_ document: TrackLyricsDocument?) {
-        self.aiDocument = document
+    public func setActiveCustomDocument(_ document: TrackLyricsDocument?) {
+        self.customDocument = document
     }
 
     /// Returns the last-used lyrics mode for THIS specific song:
-    /// `.aiAudio` ONLY if the user previously listened to this song in AI mode; otherwise `.standard` (original lyrics).
+    /// `.custom` ONLY if the user previously enabled their own custom lyrics for this song; otherwise `.standard` (original lyrics).
     public func preferredLyricsMode(for track: UniversalTrack) -> LyricsDisplayMode {
         let key = Self.lyricsCacheKey(for: track)
         let map = UserDefaults.standard.dictionary(forKey: Self.preferredModeDefaultsKey) as? [String: String]
-        return (map?[key] == "ai") ? .aiAudio : .standard
+        return (map?[key] == "custom") ? .custom : .standard
     }
 
-    /// Persists the user's chosen lyrics mode (`.aiAudio` vs `.standard`) strictly for THIS song across app restarts.
+    /// Persists the user's chosen lyrics mode (`.custom` vs `.standard`) strictly for THIS song across app restarts.
     public func setPreferredLyricsMode(_ mode: LyricsDisplayMode, for track: UniversalTrack) {
         let key = Self.lyricsCacheKey(for: track)
         var map = (UserDefaults.standard.dictionary(forKey: Self.preferredModeDefaultsKey) as? [String: String]) ?? [:]
-        if mode == .aiAudio {
-            map[key] = "ai"
+        if mode == .custom {
+            map[key] = "custom"
         } else {
             map.removeValue(forKey: key)
         }
@@ -496,11 +571,11 @@ public final class LyricsService: ObservableObject {
         OfflineDownloadManager.shared.notifyLyricsChanged(for: track)
     }
 
-    /// Computes a stable content fingerprint for the track's currently active lyrics (AI or standard)
+    /// Computes a stable content fingerprint for the track's currently active lyrics (custom or standard)
     /// so `OfflineDownloadManager` knows immediately when lyrics changed and offers "Докачать / Обновить лирику".
     public func activeLyricsFingerprint(for track: UniversalTrack) -> String? {
         let mode = preferredLyricsMode(for: track)
-        let key = (mode == .aiAudio) ? Self.aiLyricsCacheKey(for: track) : Self.lyricsCacheKey(for: track)
+        let key = (mode == .custom) ? Self.customLyricsCacheKey(for: track) : Self.lyricsCacheKey(for: track)
         let context = PersistenceController.shared.context
         let descriptor = FetchDescriptor<PersistedCachedLyricsEntity>(
             predicate: #Predicate { $0.cacheKey == key }
@@ -511,8 +586,7 @@ public final class LyricsService: ObservableObject {
                 return "\(mode.rawValue)::\(content.count)::\(content.prefix(64))::\(content.suffix(32))"
             }
         }
-        // Fallback to standard lyrics key if AI mode was selected before finishing
-        if mode == .aiAudio {
+        if mode == .custom {
             let stdKey = Self.lyricsCacheKey(for: track)
             let stdDesc = FetchDescriptor<PersistedCachedLyricsEntity>(
                 predicate: #Predicate { $0.cacheKey == stdKey }
@@ -527,8 +601,8 @@ public final class LyricsService: ObservableObject {
         return nil
     }
 
-    public func loadCachedAILyrics(for track: UniversalTrack) -> TrackLyricsDocument? {
-        let key = Self.aiLyricsCacheKey(for: track)
+    public func loadCachedCustomLyrics(for track: UniversalTrack) -> TrackLyricsDocument? {
+        let key = Self.customLyricsCacheKey(for: track)
         let context = PersistenceController.shared.context
         let descriptor = FetchDescriptor<PersistedCachedLyricsEntity>(
             predicate: #Predicate { $0.cacheKey == key }
@@ -542,15 +616,21 @@ public final class LyricsService: ObservableObject {
             artist: track.artist,
             syncedLRC: cached.syncedLRC,
             plainLyrics: cached.plainLyrics,
-            trackDuration: track.duration
+            trackDuration: track.duration,
+            includeIntroDots: false
         )
     }
 
     @discardableResult
-    public func saveAILyrics(syncedLRC: String, for track: UniversalTrack) -> TrackLyricsDocument? {
-        let key = Self.aiLyricsCacheKey(for: track)
-        let parsed = LRCParser.parseSyncedLRC(syncedLRC, includeIntroDots: true)
-        let plain = parsed.filter { !$0.isInstrumental }.map(\.text).joined(separator: "\n")
+    public func saveCustomLyrics(syncedLRC: String, for track: UniversalTrack) -> TrackLyricsDocument? {
+        let key = Self.customLyricsCacheKey(for: track)
+        let parsed = LRCParser.parseSyncedLRC(syncedLRC, includeIntroDots: false)
+        let plain = parsed.filter { !$0.isInstrumental }.map { line -> String in
+            if let sec = line.secondaryText, !sec.isEmpty {
+                return "\(line.text) || \(sec)"
+            }
+            return line.text
+        }.joined(separator: "\n")
         cacheLyrics(
             cacheKey: key,
             title: track.title,
@@ -558,73 +638,36 @@ public final class LyricsService: ObservableObject {
             syncedLRC: syncedLRC,
             plainLyrics: plain.isEmpty ? nil : plain
         )
-        return buildDocument(
+        let doc = buildDocument(
             title: track.title,
             artist: track.artist,
             syncedLRC: syncedLRC,
             plainLyrics: plain.isEmpty ? nil : plain,
-            trackDuration: track.duration
+            trackDuration: track.duration,
+            includeIntroDots: false
         )
+        if loadedTrackID == track.id {
+            self.customDocument = doc
+        }
+        return doc
     }
 
-    /// Provides optional reference lyric lines & vocabulary hints (cached or fast <=3.5s lookup) so AI speech recognition
-    /// can bias Apple Speech `contextualStrings` and verify heard words against real audio timestamps without ever stalling.
-    public func fetchReferenceLyricsForAI(
-        for track: UniversalTrack,
-        timeoutSeconds: TimeInterval = 3.5
-    ) async -> (plainLines: [String], syncedLines: [SyncedLyricLine])? {
-        // 1. Instant hit if already loaded for this track
-        if loadedTrackID == track.id, let doc = currentDocument {
-            let cleanPlain = doc.plainLines.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !LRCParser.isInstrumentalMarker($0) }
-            if !cleanPlain.isEmpty {
-                return (cleanPlain, doc.isSynchronized ? doc.syncedLines : [])
-            }
-        }
-        // 2. Instant SwiftData offline cache hit
-        let cacheKey = Self.lyricsCacheKey(for: track)
+    public func deleteCustomLyrics(for track: UniversalTrack) {
+        let key = Self.customLyricsCacheKey(for: track)
         let context = PersistenceController.shared.context
         let descriptor = FetchDescriptor<PersistedCachedLyricsEntity>(
-            predicate: #Predicate { $0.cacheKey == cacheKey }
+            predicate: #Predicate { $0.cacheKey == key }
         )
-        if let cached = try? context.fetch(descriptor).first,
-           let doc = buildDocument(
-               title: track.title,
-               artist: track.artist,
-               syncedLRC: cached.syncedLRC,
-               plainLyrics: cached.plainLyrics,
-               trackDuration: track.duration
-           ) {
-            let cleanPlain = doc.plainLines.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !LRCParser.isInstrumentalMarker($0) }
-            if !cleanPlain.isEmpty {
-                return (cleanPlain, doc.isSynchronized ? doc.syncedLines : [])
+        if let entities = try? context.fetch(descriptor) {
+            for entity in entities {
+                context.delete(entity)
             }
+            try? context.save()
         }
-        // 3. Fast time-capped remote lookup across our 6 databases
-        let candidate: LRCLIBEntryDTO? = await withTaskGroup(of: LRCLIBEntryDTO?.self) { group in
-            group.addTask { @MainActor in
-                await self.fetchBestRemoteLyricsCandidate(for: track)
-            }
-            group.addTask {
-                try? await Task.sleep(nanoseconds: UInt64(max(0.5, timeoutSeconds) * 1_000_000_000))
-                return nil
-            }
-            let first = await group.next() ?? nil
-            group.cancelAll()
-            return first
+        if loadedTrackID == track.id {
+            self.customDocument = nil
         }
-        guard let dto = candidate,
-              let doc = buildDocument(
-                  title: track.title,
-                  artist: track.artist,
-                  syncedLRC: dto.syncedLyrics,
-                  plainLyrics: dto.plainLyrics,
-                  trackDuration: track.duration
-              ) else {
-            return nil
-        }
-        let cleanPlain = doc.plainLines.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !LRCParser.isInstrumentalMarker($0) }
-        guard !cleanPlain.isEmpty else { return nil }
-        return (cleanPlain, doc.isSynchronized ? doc.syncedLines : [])
+        setPreferredLyricsMode(.standard, for: track)
     }
 
     public func hasCachedLyrics(for track: UniversalTrack) -> Bool {
@@ -675,17 +718,16 @@ public final class LyricsService: ObservableObject {
     }
 
     public func loadLyrics(for track: UniversalTrack, forceReload: Bool = false) async {
-        // Restore per-track persistent mode: AI lyrics ONLY if the user last listened to THIS song in AI mode; otherwise original lyrics!
+        // Restore per-track persistent mode: user's custom lyrics ONLY if previously enabled for THIS song; otherwise original lyrics!
         if loadedTrackID != track.id || forceReload {
-            AILyricsTranscriptionEngine.shared.resetForNewTrack(track.id)
-            let savedAI = loadCachedAILyrics(for: track)
-            self.aiDocument = savedAI
+            let savedCustom = loadCachedCustomLyrics(for: track)
+            self.customDocument = savedCustom
             let preferred = preferredLyricsMode(for: track)
-            self.lyricsMode = (preferred == .aiAudio && savedAI != nil) ? .aiAudio : .standard
+            self.lyricsMode = (preferred == .custom && savedCustom != nil) ? .custom : .standard
         }
 
         // Avoid wiping and reloading already-loaded lyrics when re-opening the Lyrics panel for the same track
-        if !forceReload, loadedTrackID == track.id, (currentDocument != nil || (lyricsMode == .aiAudio && aiDocument != nil)) {
+        if !forceReload, loadedTrackID == track.id, (currentDocument != nil || (lyricsMode == .custom && customDocument != nil)) {
             isLoading = false
             return
         }
@@ -1665,10 +1707,11 @@ public final class LyricsService: ObservableObject {
         artist: String,
         syncedLRC: String?,
         plainLyrics: String?,
-        trackDuration: TimeInterval = 200
+        trackDuration: TimeInterval = 200,
+        includeIntroDots: Bool = true
     ) -> TrackLyricsDocument? {
         if let syncedLRC, !syncedLRC.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            let parsedLines = LRCParser.parseSyncedLRC(syncedLRC, includeIntroDots: true)
+            let parsedLines = LRCParser.parseSyncedLRC(syncedLRC, includeIntroDots: includeIntroDots)
             if !parsedLines.isEmpty {
                 let fullSample = parsedLines.filter { !$0.isInstrumental }.map(\.text).joined(separator: "\n")
                 let lang = LRCParser.detectScriptLanguage(for: fullSample.isEmpty ? title : fullSample)
@@ -1801,32 +1844,46 @@ public struct AppleMusicInstrumentalDotsView: View, Equatable {
 
 private struct SyncedLyricTextRowView: View, Equatable {
     let text: String
+    let secondaryText: String?
     let isCurrent: Bool
     let isPast: Bool
 
     static func == (lhs: SyncedLyricTextRowView, rhs: SyncedLyricTextRowView) -> Bool {
         lhs.isCurrent == rhs.isCurrent &&
         lhs.isPast == rhs.isPast &&
-        lhs.text == rhs.text
+        lhs.text == rhs.text &&
+        lhs.secondaryText == rhs.secondaryText
     }
 
     var body: some View {
-        Text(text)
-            .font(.system(size: 25, weight: .bold))
-            .foregroundStyle(.white.opacity(isCurrent ? 1.0 : (isPast ? 0.24 : 0.45)))
-            .scaleEffect(isCurrent ? 1.05 : 0.96, anchor: .leading)
-            .shadow(color: isCurrent ? .white.opacity(0.22) : .clear, radius: isCurrent ? 10 : 0)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.vertical, 8)
-            .padding(.horizontal, 14)
-            .background(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .fill(isCurrent ? Color.white.opacity(0.14) : Color.clear)
-            )
-            .contentShape(Rectangle())
-            .animation(.easeOut(duration: 0.22), value: isCurrent)
-            .animation(.easeOut(duration: 0.22), value: isPast)
-            .animation(.interpolatingSpring(stiffness: 170, damping: 24), value: isCurrent)
+        VStack(alignment: .leading, spacing: 5) {
+            Text(text)
+                .font(.system(size: 25, weight: .bold))
+                .foregroundStyle(.white.opacity(isCurrent ? 1.0 : (isPast ? 0.24 : 0.45)))
+
+            if let secondaryText, !secondaryText.isEmpty {
+                Text(secondaryText)
+                    .font(.system(size: 19, weight: .semibold))
+                    .italic()
+                    .foregroundStyle(
+                        Color(red: 0.95, green: 0.86, blue: 1.0)
+                            .opacity(isCurrent ? 0.92 : (isPast ? 0.20 : 0.38))
+                    )
+            }
+        }
+        .scaleEffect(isCurrent ? 1.05 : 0.96, anchor: .leading)
+        .shadow(color: isCurrent ? .white.opacity(0.22) : .clear, radius: isCurrent ? 10 : 0)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, 8)
+        .padding(.horizontal, 14)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(isCurrent ? Color.white.opacity(0.14) : Color.clear)
+        )
+        .contentShape(Rectangle())
+        .animation(.easeOut(duration: 0.22), value: isCurrent)
+        .animation(.easeOut(duration: 0.22), value: isPast)
+        .animation(.interpolatingSpring(stiffness: 170, damping: 24), value: isCurrent)
     }
 }
 
@@ -1860,13 +1917,14 @@ private struct SyncedInstrumentalDotsRowView: View, Equatable {
 public struct SynchronizedLyricsView: View {
     @ObservedObject var player: UniversalAudioPlayerEngine
     @ObservedObject var lyricsService: LyricsService = .shared
-    @ObservedObject var aiEngine: AILyricsTranscriptionEngine = .shared
 
     @State private var activeLineIndex: Int? = nil
     @State private var activeDotStage: Int = 0
     @State private var isUserManualScrolling: Bool = false
     @State private var showTranslationOverlay: Bool = false
     @State private var showManualSearchSheet: Bool = false
+    @State private var showCustomLyricsStudio: Bool = false
+    @State private var pendingOpenCustomStudio: Bool = false
     @State private var manualSongQuery: String = ""
     @State private var manualArtistQuery: String = ""
     @State private var manualSearchResults: [LRCLIBEntryDTO] = []
@@ -1880,8 +1938,12 @@ public struct SynchronizedLyricsView: View {
         VStack(spacing: 0) {
             lyricsHeaderBar
 
-            if lyricsService.lyricsMode == .aiAudio {
-                aiLyricsModeContent
+            if lyricsService.lyricsMode == .custom {
+                if let customDoc = lyricsService.customDocument {
+                    synchronizedLyricsScroll(doc: customDoc)
+                } else {
+                    customLyricsEmptyView
+                }
             } else if lyricsService.isLoading {
                 Spacer()
                 ProgressView()
@@ -1911,14 +1973,9 @@ public struct SynchronizedLyricsView: View {
                         .padding(.horizontal, 32)
 
                     Button {
-                        if let track = player.currentTrack {
-                            withAnimation(AuraTheme.springInteractive) {
-                                lyricsService.setPreferredLyricsMode(.aiAudio, for: track)
-                            }
-                            aiEngine.startListening(for: track)
-                        }
+                        showCustomLyricsStudio = true
                     } label: {
-                        Label("Определить текст через ИИ (10 раз)", systemImage: "sparkles")
+                        Label("Создать свою лирику", systemImage: "pencil.and.outline")
                             .font(.system(size: 14, weight: .bold))
                             .foregroundStyle(.white)
                             .padding(.horizontal, 20)
@@ -1933,6 +1990,7 @@ public struct SynchronizedLyricsView: View {
                                 )
                             )
                     }
+                    .disabled(player.currentTrack == nil)
 
                     Button {
                         let cleaned = LyricsService.extractCleanTitleAndArtist(
@@ -1959,219 +2017,46 @@ public struct SynchronizedLyricsView: View {
                 await lyricsService.loadLyrics(for: track)
             }
         }
-        .sheet(isPresented: $showManualSearchSheet) {
+        .sheet(
+            isPresented: $showManualSearchSheet,
+            onDismiss: {
+                if pendingOpenCustomStudio {
+                    pendingOpenCustomStudio = false
+                    showCustomLyricsStudio = true
+                }
+            }
+        ) {
             manualLyricsSearchSheet
         }
-    }
-
-    @ViewBuilder
-    private var aiLyricsModeContent: some View {
-        if aiEngine.state.isRunning {
-            aiListeningProgressView
-        } else if let aiDoc = lyricsService.aiDocument {
-            synchronizedLyricsScroll(doc: aiDoc)
-        } else {
-            aiReadyOrErrorView
-        }
-    }
-
-    private var aiListeningProgressView: some View {
-        let st = aiEngine.state
-        let percent = Int((max(0, min(1, st.progress)) * 100).rounded())
-        let elapsedInt = Int(min(st.maxBudgetSeconds, max(0, st.elapsedSeconds)).rounded())
-        let maxInt = Int(st.maxBudgetSeconds.rounded())
-
-        return ScrollView(.vertical, showsIndicators: false) {
-            VStack(spacing: 20) {
-                Spacer().frame(height: 16)
-
-                ZStack {
-                    Circle()
-                        .fill(
-                            RadialGradient(
-                                colors: [AuraTheme.accentPink.opacity(0.45), Color.purple.opacity(0.15), .clear],
-                                center: .center,
-                                startRadius: 6,
-                                endRadius: 56
-                            )
-                        )
-                        .frame(width: 96, height: 96)
-
-                    Image(systemName: "sparkles")
-                        .font(.system(size: 36, weight: .bold))
-                        .foregroundStyle(.white)
-                        .symbolEffect(.pulse, isActive: st.isRunning)
-                }
-
-                VStack(spacing: 6) {
-                    Text("ИИ слушает песню")
-                        .font(.system(size: 22, weight: .bold))
-                        .foregroundStyle(.white)
-
-                    HStack(spacing: 8) {
-                        Text("Прослушивание \(max(1, st.currentPass)) / \(st.totalPasses)")
-                            .font(.system(size: 13, weight: .bold, design: .rounded))
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 5)
-                            .background(Capsule().fill(AuraTheme.accentPink.opacity(0.85)))
-
-                        Text(String(format: "0:%02d / 0:%02d", elapsedInt, maxInt))
-                            .font(.system(size: 13, weight: .semibold, design: .rounded))
-                            .monospacedDigit()
-                            .foregroundStyle(.white.opacity(0.85))
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 5)
-                            .background(Capsule().fill(.white.opacity(0.16)))
-                    }
-                }
-
-                // Animated Loading Progress Bar (загрузочная строка)
-                VStack(spacing: 10) {
-                    GeometryReader { geo in
-                        let width = max(geo.size.width, 1)
-                        let clamped = max(0.03, min(1.0, st.progress))
-                        ZStack(alignment: .leading) {
-                            Capsule(style: .continuous)
-                                .fill(Color.white.opacity(0.18))
-                                .frame(height: 10)
-
-                            Capsule(style: .continuous)
-                                .fill(
-                                    LinearGradient(
-                                        colors: [AuraTheme.accentPink, Color.purple, Color.white],
-                                        startPoint: .leading,
-                                        endPoint: .trailing
-                                    )
-                                )
-                                .frame(width: width * CGFloat(clamped), height: 10)
-                                .shadow(color: AuraTheme.accentPink.opacity(0.6), radius: 8, x: 0, y: 0)
-                                .animation(.easeOut(duration: 0.25), value: st.progress)
-                        }
-                    }
-                    .frame(height: 10)
-
-                    HStack {
-                        Text(st.stageTitle)
-                            .font(.system(size: 13, weight: .bold))
-                            .foregroundStyle(.white)
-                            .lineLimit(1)
-                        Spacer()
-                        Text("\(percent)%")
-                            .font(.system(size: 13, weight: .bold, design: .rounded))
-                            .monospacedDigit()
-                            .foregroundStyle(.white.opacity(0.9))
-                    }
-
-                    Text(st.stageDetail)
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.78))
-                        .multilineTextAlignment(.leading)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-
-                    // 10-Pass Visual Step Indicators (Pass 1 = analysis, Passes 2–10 = write & verify)
-                    HStack(spacing: 6) {
-                        ForEach(1...st.totalPasses, id: \.self) { passIdx in
-                            let isDone = passIdx < st.currentPass
-                            let isActive = passIdx == st.currentPass
-                            Capsule(style: .continuous)
-                                .fill(
-                                    isDone
-                                        ? Color.white
-                                        : (isActive ? AuraTheme.accentPink : Color.white.opacity(0.22))
-                                )
-                                .frame(height: isActive ? 6 : 4)
-                                .animation(.easeInOut(duration: 0.2), value: st.currentPass)
-                        }
-                    }
-                    .padding(.top, 4)
-                }
-                .padding(18)
-                .background(
-                    RoundedRectangle(cornerRadius: 20, style: .continuous)
-                        .fill(Color.white.opacity(0.12))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 20, style: .continuous)
-                                .strokeBorder(Color.white.opacity(0.18), lineWidth: 1)
-                        )
-                )
-                .padding(.horizontal, 24)
-
-                // Pass 1 Detected Language / Pause / Foreign-Insert Chips
-                if st.detectedPrimaryLanguage != nil || st.detectedPauseCount > 0 {
-                    HStack(spacing: 8) {
-                        if let lang = st.detectedPrimaryLanguage {
-                            aiInfoChip(icon: "globe", text: lang)
-                        }
-                        if let sec = st.detectedSecondaryLanguage {
-                            aiInfoChip(icon: "character.bubble", text: "+\(sec)")
-                        }
-                        aiInfoChip(icon: "pause.circle", text: "Пауз: \(st.detectedPauseCount)")
-                    }
-                    .padding(.horizontal, 20)
-                }
-
-                Button {
-                    aiEngine.cancel()
-                    if lyricsService.aiDocument == nil, let track = player.currentTrack {
-                        lyricsService.setPreferredLyricsMode(.standard, for: track)
-                    }
-                } label: {
-                    Text("Отменить")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(.white.opacity(0.9))
-                        .padding(.horizontal, 22)
-                        .padding(.vertical, 9)
-                        .background(Capsule().fill(.white.opacity(0.16)))
-                }
-                .padding(.top, 4)
-
-                Spacer().frame(height: 40)
+        .sheet(isPresented: $showCustomLyricsStudio) {
+            if let track = player.currentTrack {
+                CustomLyricsStudioSheet(track: track)
             }
         }
     }
 
-    private func aiInfoChip(icon: String, text: String) -> some View {
-        HStack(spacing: 5) {
-            Image(systemName: icon)
-                .font(.system(size: 11, weight: .bold))
-            Text(text)
-                .font(.system(size: 12, weight: .semibold))
-                .lineLimit(1)
-        }
-        .foregroundStyle(.white.opacity(0.95))
-        .padding(.horizontal, 10)
-        .padding(.vertical, 6)
-        .background(Capsule().fill(Color.white.opacity(0.16)))
-    }
-
-    private var aiReadyOrErrorView: some View {
+    private var customLyricsEmptyView: some View {
         VStack(spacing: 16) {
             Spacer()
 
-            Image(systemName: "sparkles.rectangle.stack.fill")
+            Image(systemName: "pencil.and.outline")
                 .font(.system(size: 42, weight: .medium))
                 .foregroundStyle(.white.opacity(0.9))
 
-            Text("ИИ-лирика по аудио")
+            Text("Своя лирика")
                 .font(.system(size: 21, weight: .bold))
                 .foregroundStyle(.white)
 
-            Text(
-                aiEngine.state.errorMessage
-                    ?? "ИИ прослушает песню 10 раз за ≤30 сек:\n1-й раз — определит язык, паузы и иноязычные вставки.\n2–10-й раз — напишет, сверит и синхронизирует текст."
-            )
-            .font(.system(size: 14, weight: .medium))
-            .foregroundStyle(.white.opacity(0.82))
-            .multilineTextAlignment(.center)
-            .padding(.horizontal, 30)
+            Text("Создайте собственный синхронизированный текст: добавляйте строки с точным таймингом, паузы ••• любой длительности и два текста одновременно.")
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(.white.opacity(0.82))
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 30)
 
             Button {
-                if let track = player.currentTrack {
-                    aiEngine.startListening(for: track, forceReanalyze: true)
-                }
+                showCustomLyricsStudio = true
             } label: {
-                Label("Запустить ИИ (10 прослушиваний)", systemImage: "sparkles")
+                Label("Открыть редактор лирики", systemImage: "pencil.and.outline")
                     .font(.system(size: 15, weight: .bold))
                     .foregroundStyle(.white)
                     .padding(.horizontal, 22)
@@ -2194,21 +2079,28 @@ public struct SynchronizedLyricsView: View {
     }
 
     private var lyricsHeaderBar: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 8) {
             if let doc = lyricsService.activeDocument {
-                HStack(spacing: 6) {
-                    Image(systemName: lyricsService.lyricsMode == .aiAudio ? "sparkles" : (doc.isSynchronized ? "waveform" : "text.alignleft"))
-                        .font(.system(size: 11, weight: .bold))
-                    Text(lyricsService.lyricsMode == .aiAudio ? "ИИ ЛИРИКА" : (doc.isSynchronized ? "APPLE MUSIC SING SYNC" : "LYRICS"))
-                        .font(.system(size: 10, weight: .bold, design: .rounded))
-                    Text("• \(doc.detectedLanguageDisplayName.uppercased())")
-                        .font(.system(size: 10, weight: .bold, design: .rounded))
-                        .lineLimit(1)
+                Button {
+                    if lyricsService.lyricsMode == .custom {
+                        showCustomLyricsStudio = true
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: lyricsService.lyricsMode == .custom ? "pencil.and.outline" : (doc.isSynchronized ? "waveform" : "text.alignleft"))
+                            .font(.system(size: 11, weight: .bold))
+                        Text(lyricsService.lyricsMode == .custom ? "МОЯ ЛИРИКА" : (doc.isSynchronized ? "APPLE MUSIC SING SYNC" : "LYRICS"))
+                            .font(.system(size: 10, weight: .bold, design: .rounded))
+                        Text("• \(doc.detectedLanguageDisplayName.uppercased())")
+                            .font(.system(size: 10, weight: .bold, design: .rounded))
+                            .lineLimit(1)
+                    }
+                    .foregroundStyle(.white.opacity(0.92))
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 5)
+                    .background(Capsule().fill(.white.opacity(0.18)))
                 }
-                .foregroundStyle(.white.opacity(0.92))
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(Capsule().fill(.white.opacity(0.18)))
+                .buttonStyle(.plain)
 
                 if doc.hasTranslationAvailable && lyricsService.lyricsMode == .standard {
                     Button {
@@ -2242,7 +2134,21 @@ public struct SynchronizedLyricsView: View {
                 }
             }
 
-            // Magnifying glass (лупа): opens both AI Lyrics Mode controls AND manual lyrics search!
+            // 1-Tap Quick Open Custom Lyrics Studio
+            if player.currentTrack != nil {
+                Button {
+                    showCustomLyricsStudio = true
+                } label: {
+                    Image(systemName: "pencil")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(.white)
+                        .padding(8)
+                        .background(Circle().fill(.white.opacity(0.16)))
+                }
+                .accessibilityLabel("Редактор своей лирики")
+            }
+
+            // Magnifying glass (лупа): opens Custom Lyrics controls, offline lyrics sync & manual LRCLIB search!
             Button {
                 let cleaned = LyricsService.extractCleanTitleAndArtist(
                     rawTitle: player.currentTrack?.title ?? "",
@@ -2306,6 +2212,7 @@ public struct SynchronizedLyricsView: View {
                             } else {
                                 SyncedLyricTextRowView(
                                     text: line.text,
+                                    secondaryText: line.secondaryText,
                                     isCurrent: isCurrent,
                                     isPast: isPast
                                 )
@@ -2389,15 +2296,10 @@ public struct SynchronizedLyricsView: View {
             List {
                 if let track = player.currentTrack {
                     Section {
-                        // Option 1: AI Audio-Listening Lyrics Mode (saved per song!)
+                        // Option 1: Open Full Interactive Manual Lyrics Creator Studio
                         Button {
-                            withAnimation(AuraTheme.springInteractive) {
-                                lyricsService.setPreferredLyricsMode(.aiAudio, for: track)
-                            }
+                            pendingOpenCustomStudio = true
                             showManualSearchSheet = false
-                            if lyricsService.aiDocument == nil && !aiEngine.state.isRunning {
-                                aiEngine.startListening(for: track)
-                            }
                         } label: {
                             HStack(spacing: 12) {
                                 ZStack {
@@ -2410,52 +2312,73 @@ public struct SynchronizedLyricsView: View {
                                             )
                                         )
                                         .frame(width: 36, height: 36)
-                                    Image(systemName: "sparkles")
+                                    Image(systemName: "pencil.and.outline")
                                         .font(.system(size: 16, weight: .bold))
                                         .foregroundStyle(.white)
                                 }
 
                                 VStack(alignment: .leading, spacing: 3) {
-                                    Text("Режим ИИ-лирики")
-                                        .font(.system(size: 16, weight: .semibold))
-                                        .foregroundStyle(.primary)
                                     Text(
-                                        lyricsService.aiDocument != nil
-                                            ? "ИИ-субтитры созданы и сохранены для этой песни"
-                                            : "ИИ слушает песню 10 раз (≤30 сек) и сам создаёт субтитры по голосу"
+                                        lyricsService.customDocument != nil
+                                            ? "Редактировать свою лирику"
+                                            : "Создать свою лирику"
                                     )
-                                    .font(.system(size: 12))
-                                    .foregroundStyle(.secondary)
+                                    .font(.system(size: 16, weight: .semibold))
+                                    .foregroundStyle(.primary)
+                                    Text("Паузы ••• с выбором секунд, два текста сразу и Tap-Sync")
+                                        .font(.system(size: 12))
+                                        .foregroundStyle(.secondary)
                                 }
 
                                 Spacer()
 
-                                if lyricsService.lyricsMode == .aiAudio {
-                                    Image(systemName: "checkmark.circle.fill")
-                                        .font(.system(size: 20))
-                                        .foregroundStyle(AuraTheme.accentPink)
-                                }
+                                Image(systemName: "chevron.right")
+                                    .font(.system(size: 13, weight: .semibold))
+                                    .foregroundStyle(.secondary)
                             }
                             .padding(.vertical, 3)
                         }
 
-                        if lyricsService.aiDocument != nil || lyricsService.lyricsMode == .aiAudio {
+                        if lyricsService.customDocument != nil {
                             Button {
                                 withAnimation(AuraTheme.springInteractive) {
-                                    lyricsService.setPreferredLyricsMode(.aiAudio, for: track)
+                                    lyricsService.setPreferredLyricsMode(.custom, for: track)
                                 }
                                 showManualSearchSheet = false
-                                aiEngine.startListening(for: track, forceReanalyze: true)
                             } label: {
-                                Label("Переслушать песню через ИИ заново (10 раз)", systemImage: "arrow.clockwise")
-                                    .font(.system(size: 14, weight: .semibold))
-                                    .foregroundStyle(AuraTheme.accentPink)
+                                HStack(spacing: 12) {
+                                    ZStack {
+                                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                            .fill(AuraTheme.accentPink.opacity(0.14))
+                                            .frame(width: 36, height: 36)
+                                        Image(systemName: "text.badge.checkmark")
+                                            .font(.system(size: 16, weight: .bold))
+                                            .foregroundStyle(AuraTheme.accentPink)
+                                    }
+
+                                    VStack(alignment: .leading, spacing: 3) {
+                                        Text("Моя лирика")
+                                            .font(.system(size: 16, weight: .semibold))
+                                            .foregroundStyle(.primary)
+                                        Text("Использовать ваш созданный текст для этой песни")
+                                            .font(.system(size: 12))
+                                            .foregroundStyle(.secondary)
+                                    }
+
+                                    Spacer()
+
+                                    if lyricsService.lyricsMode == .custom {
+                                        Image(systemName: "checkmark.circle.fill")
+                                            .font(.system(size: 20))
+                                            .foregroundStyle(AuraTheme.accentPink)
+                                    }
+                                }
+                                .padding(.vertical, 3)
                             }
                         }
 
-                        // Option 2: Original Database Lyrics (default for tracks where AI was never enabled)
+                        // Option 2: Original Database Lyrics
                         Button {
-                            aiEngine.cancel()
                             withAnimation(AuraTheme.springInteractive) {
                                 lyricsService.setPreferredLyricsMode(.standard, for: track)
                             }
@@ -2490,6 +2413,17 @@ public struct SynchronizedLyricsView: View {
                             }
                             .padding(.vertical, 3)
                         }
+
+                        if lyricsService.customDocument != nil {
+                            Button(role: .destructive) {
+                                lyricsService.deleteCustomLyrics(for: track)
+                                showManualSearchSheet = false
+                            } label: {
+                                Label("Удалить свою лирику", systemImage: "trash")
+                                    .font(.system(size: 14, weight: .semibold))
+                            }
+                        }
+
                         // Option 3: Update / Download Changed Lyrics for Offline Song
                         if OfflineDownloadManager.shared.isDownloaded(track) {
                             let needsSync = OfflineDownloadManager.shared.hasLyricsUpdateAvailable(for: track)
@@ -2511,9 +2445,9 @@ public struct SynchronizedLyricsView: View {
                             }
                         }
                     } header: {
-                        Text("Режим лирики для этой песни")
+                        Text("Своя лирика и режим отображения")
                     } footer: {
-                        Text("ИИ не ищет текст в интернете — он слушает голос и создаёт субтитры напрямую из аудио (как субтитры YouTube, но точнее и с паузами •••). Выбор режима запоминается отдельно для каждой песни.")
+                        Text("Создавайте собственный текст песни с точными секундами, паузами ••• и двумя строками одновременно. Выбор (моя или оригинальная лирика) запоминается отдельно для каждой песни.")
                     }
                 }
 
