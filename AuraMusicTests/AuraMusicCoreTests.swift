@@ -2440,7 +2440,8 @@ final class AuraMusicCoreTests: XCTestCase {
             try? FileManager.default.removeItem(at: destM4A)
         }
 
-        try UniversalAudioPlayerEngine.buildSubAudibleKeepAliveWAVData().write(to: sourceWAV, options: .atomic)
+        let wavData = await UniversalAudioPlayerEngine.buildSubAudibleKeepAliveWAVData()
+        try wavData.write(to: sourceWAV, options: .atomic)
         let success = await OfflineDownloadManager.extractAudioOnlyM4A(from: sourceWAV, to: destM4A)
         XCTAssertTrue(success, "extractAudioOnlyM4A must convert audio source into a valid .m4a file")
         XCTAssertTrue(FileManager.default.fileExists(atPath: destM4A.path))
@@ -2560,8 +2561,8 @@ final class AuraMusicCoreTests: XCTestCase {
             title: "Nonexistent Track XYZ987654",
             artist: "Nobody XYZ987654",
             album: "None",
-            streamURL: URL(string: "https://example.com/not-an-audio-file.html"),
             duration: 210.0,
+            streamURL: URL(string: "https://example.com/not-an-audio-file.html"),
             isStreamable: true
         )
         defer { manager.removeDownload(trackID: invalidTrack.id) }
