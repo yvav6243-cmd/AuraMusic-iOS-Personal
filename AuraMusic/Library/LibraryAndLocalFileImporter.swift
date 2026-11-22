@@ -505,6 +505,7 @@ public struct LibrarySongsListView: View {
     public let onlyFavorites: Bool
     @ObservedObject var persistence: PersistenceController = .shared
     @ObservedObject var player: UniversalAudioPlayerEngine = .shared
+    @ObservedObject var downloadManager: OfflineDownloadManager = .shared
     @State private var sortOrder: SongSortOption = .recentlyAdded
     @State private var filterText: String = ""
 
@@ -543,50 +544,115 @@ public struct LibrarySongsListView: View {
         List {
             if !filteredTracks.isEmpty {
                 Section {
-                    HStack(spacing: 12) {
-                        Button {
-                            if let first = filteredTracks.first {
-                                player.play(first, queue: filteredTracks)
+                    VStack(spacing: 10) {
+                        HStack(spacing: 12) {
+                            Button {
+                                if let first = filteredTracks.first {
+                                    player.isShuffled = false
+                                    player.play(first, queue: filteredTracks)
+                                }
+                            } label: {
+                                Label("Play", systemImage: "play.fill")
+                                    .font(.system(size: 15, weight: .bold))
+                                    .foregroundStyle(AuraTheme.accentPink)
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 10)
+                                    .background(RoundedRectangle(cornerRadius: 10).fill(Color.secondary.opacity(0.14)))
                             }
-                        } label: {
-                            Label("Play", systemImage: "play.fill")
-                                .font(.system(size: 15, weight: .bold))
-                                .foregroundStyle(AuraTheme.accentPink)
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 10)
-                                .background(RoundedRectangle(cornerRadius: 10).fill(Color.secondary.opacity(0.14)))
-                        }
-                        .buttonStyle(.plain)
+                            .buttonStyle(.plain)
 
-                        Button {
-                            let shuffled = filteredTracks.shuffled()
-                            if let first = shuffled.first {
-                                player.isShuffled = true
-                                player.play(first, queue: shuffled)
+                            Button {
+                                let shuffled = filteredTracks.shuffled()
+                                if let first = shuffled.first {
+                                    player.isShuffled = true
+                                    player.play(first, queue: shuffled)
+                                }
+                            } label: {
+                                Label("Shuffle", systemImage: "shuffle")
+                                    .font(.system(size: 15, weight: .bold))
+                                    .foregroundStyle(AuraTheme.accentPink)
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 10)
+                                    .background(RoundedRectangle(cornerRadius: 10).fill(Color.secondary.opacity(0.14)))
                             }
+                            .buttonStyle(.plain)
+                        }
+
+                        // Prominent One-Tap Download Offline Button for Favourite Songs / Songs (Full Audio + Synced Lyrics!)
+                        let summary = downloadManager.playlistDownloadSummary(for: filteredTracks)
+                        let allDone = summary.total > 0 && summary.completed == summary.total
+                        Button {
+                            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                            downloadManager.enqueuePlaylistDownload(tracks: filteredTracks)
                         } label: {
-                            Label("Shuffle", systemImage: "shuffle")
-                                .font(.system(size: 15, weight: .bold))
-                                .foregroundStyle(AuraTheme.accentPink)
-                                .frame(maxWidth: .infinity)
-                                .padding(.vertical, 10)
-                                .background(RoundedRectangle(cornerRadius: 10).fill(Color.secondary.opacity(0.14)))
+                            HStack(spacing: 8) {
+                                if summary.active > 0 {
+                                    ProgressView()
+                                        .scaleEffect(0.85)
+                                        .tint(AuraTheme.accentPink)
+                                    Text("Скачивание: \(summary.completed) / \(summary.total)")
+                                        .font(.system(size: 14, weight: .bold))
+                                        .foregroundStyle(AuraTheme.accentPink)
+                                } else if allDone {
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .font(.system(size: 16, weight: .bold))
+                                        .foregroundStyle(.green)
+                                    Text("Все песни скачаны офлайн (\(summary.completed)/\(summary.total))")
+                                        .font(.system(size: 14, weight: .bold))
+                                        .foregroundStyle(.green)
+                                } else {
+                                    Image(systemName: "arrow.down.circle.fill")
+                                        .font(.system(size: 16, weight: .bold))
+                                        .foregroundStyle(.white)
+                                    Text(summary.completed > 0
+                                         ? "Докачать офлайн (\(summary.total - summary.completed) осталось)"
+                                         : (onlyFavorites
+                                            ? "Скачать весь Favourite Songs (\(summary.total))"
+                                            : "Скачать все песни офлайн (\(summary.total))"))
+                                        .font(.system(size: 14, weight: .bold))
+                                        .foregroundStyle(.white)
+                                }
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 11)
+                            .background(
+                                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                    .fill(allDone ? Color.green.opacity(0.16) : (summary.active > 0 ? AuraTheme.accentPink.opacity(0.14) : AuraTheme.accentPink))
+                            )
                         }
                         .buttonStyle(.plain)
                     }
+                    .padding(.vertical, 2)
                 }
             }
 
             Section {
                 ForEach(filteredTracks) { track in
-                    TrackRowView(track: track, queueContext: filteredTracks)
+                    TrackRowView(
+                        track: track,
+                        queueContext: filteredTracks,
+                        isDownloaded: downloadManager.isDownloaded(track),
+                        isDownloading: downloadManager.isDownloadingOrQueued(track)
+                    )
                 }
             }
         }
         .searchable(text: $filterText, prompt: "Find in Songs")
-        .navigationTitle(onlyFavorites ? "Favorite Songs" : "Songs")
+        .navigationTitle(onlyFavorites ? "Favourite Songs" : "Songs")
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                if !filteredTracks.isEmpty {
+                    let summary = downloadManager.playlistDownloadSummary(for: filteredTracks)
+                    let allDone = summary.total > 0 && summary.completed == summary.total
+                    Button {
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        downloadManager.enqueuePlaylistDownload(tracks: filteredTracks)
+                    } label: {
+                        Image(systemName: allDone ? "checkmark.circle.fill" : "arrow.down.circle")
+                            .foregroundStyle(allDone ? Color.green : AuraTheme.accentPink)
+                    }
+                    .accessibilityLabel("Download All Offline")
+                }
                 Menu {
                     Picker("Sort By", selection: $sortOrder) {
                         ForEach(SongSortOption.allCases) { opt in
@@ -1005,6 +1071,8 @@ public struct ListeningReplayStatsView: View {
 public struct TrackRowView: View {
     public let track: UniversalTrack
     public var queueContext: [UniversalTrack] = []
+    public var isDownloaded: Bool = false
+    public var isDownloading: Bool = false
 
     @ObservedObject var player: UniversalAudioPlayerEngine = .shared
     @ObservedObject var persistence: PersistenceController = .shared
@@ -1013,9 +1081,16 @@ public struct TrackRowView: View {
     @State private var showCustomCoverPicker: Bool = false
     @State private var selectedCoverPhotoItem: PhotosPickerItem?
 
-    public init(track: UniversalTrack, queueContext: [UniversalTrack] = []) {
+    public init(
+        track: UniversalTrack,
+        queueContext: [UniversalTrack] = [],
+        isDownloaded: Bool = false,
+        isDownloading: Bool = false
+    ) {
         self.track = track
         self.queueContext = queueContext
+        self.isDownloaded = isDownloaded
+        self.isDownloading = isDownloading
     }
 
     private var effectiveCoverURL: URL? {
@@ -1056,6 +1131,15 @@ public struct TrackRowView: View {
 
             Spacer()
 
+            if isDownloaded {
+                Image(systemName: "arrow.down.circle.fill")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(.green)
+            } else if isDownloading {
+                ProgressView()
+                    .scaleEffect(0.7)
+            }
+
             Menu {
                 trackContextMenuItems
             } label: {
@@ -1081,7 +1165,7 @@ public struct TrackRowView: View {
         .photosPicker(isPresented: $showCustomCoverPicker, selection: $selectedCoverPhotoItem, matching: .images)
         .onChange(of: selectedCoverPhotoItem) { _, newItem in
             guard let newItem else { return }
-            Task {
+            Task { @MainActor in
                 if let data = try? await newItem.loadTransferable(type: Data.self) {
                     let newURL = persistence.setCustomTrackArtwork(
                         imageData: data,
@@ -1090,6 +1174,7 @@ public struct TrackRowView: View {
                     )
                     player.applyUpdatedArtworkURL(newURL, forTrackID: track.id)
                 }
+                selectedCoverPhotoItem = nil
             }
         }
     }
@@ -1116,7 +1201,7 @@ public struct TrackRowView: View {
             Label("Change Song Cover (Photos)…", systemImage: "photo.badge.plus")
         }
 
-        if persistence.hasCustomArtwork(for: track.id) {
+        if persistence.hasCustomArtwork(for: track) {
             Button {
                 let restoredURL = persistence.setCustomTrackArtwork(imageData: nil, for: track)
                 player.applyUpdatedArtworkURL(restoredURL, forTrackID: track.id)
@@ -1151,9 +1236,10 @@ public struct TrackRowView: View {
         Button {
             OfflineDownloadManager.shared.enqueueDownload(for: track)
         } label: {
+            let downloaded = OfflineDownloadManager.shared.isDownloaded(track)
             Label(
-                OfflineDownloadManager.shared.isDownloaded(track.id) ? "Downloaded Offline ✓" : "Download Offline",
-                systemImage: OfflineDownloadManager.shared.isDownloaded(track.id) ? "checkmark.circle.fill" : "arrow.down.circle"
+                downloaded ? "Downloaded Offline ✓" : "Download Offline",
+                systemImage: downloaded ? "checkmark.circle.fill" : "arrow.down.circle"
             )
         }
 
