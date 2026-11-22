@@ -1580,8 +1580,16 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
             }
 
             let minRequired = lineUnits.count <= 2 ? 1 : max(2, Int(ceil(Double(lineUnits.count) * 0.34)))
-            if bestScore >= minRequired, let firstIdx = bestFirstMatchedIdx, let lastIdx = bestLastMatchedIdx {
-                // Anchor to the EXACT first matched audio token of THIS line (never a leftover token from the previous line!)
+            if bestScore >= minRequired, var firstIdx = bestFirstMatchedIdx, let lastIdx = bestLastMatchedIdx {
+                // If the line starts with a 1-letter word ("I", "Я", "В", "A") that sits immediately before `firstIdx`,
+                // anchor right on that leading word so the line illuminates on beat 1 instead of 300ms late!
+                if firstIdx > tokenCursor,
+                   let firstLineWord = lineText.lowercased().components(separatedBy: CharacterSet.alphanumerics.inverted).first(where: { !$0.isEmpty }),
+                   firstLineWord.count == 1,
+                   sortedTokens[firstIdx - 1].text.lowercased().trimmingCharacters(in: CharacterSet.alphanumerics.inverted) == firstLineWord,
+                   (sortedTokens[firstIdx].timestamp - sortedTokens[firstIdx - 1].timestamp) <= 0.7 {
+                    firstIdx -= 1
+                }
                 anchors[lineIdx] = sortedTokens[firstIdx].timestamp
                 tokenCursor = min(sortedTokens.count, lastIdx + 1)
             }
