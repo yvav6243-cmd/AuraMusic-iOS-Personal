@@ -411,10 +411,7 @@ public struct UnifiedSearchView: View {
             // Render Sections Based on Scope
             if viewModel.selectedScope == .all || viewModel.selectedScope == .songs {
                 if !filteredGroups.isEmpty {
-                    AppleMusicSectionHeader(
-                        title: "Songs (Grouped by Match)",
-                        subtitle: "Tap a provider badge on any song to play from that specific source"
-                    )
+                    AppleMusicSectionHeader(title: "Songs")
                     VStack(spacing: 10) {
                         ForEach(filteredGroups) { group in
                             GroupedTrackResultCard(
@@ -567,7 +564,7 @@ public struct GroupedTrackResultCard: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
 
-                    Text("\(activeVariant.formattedDuration) • \(activeVariant.playbackCapability.rawValue)")
+                    Text(persistence.effectiveFormattedDuration(for: activeVariant))
                         .font(.system(size: 11, weight: .medium))
                         .foregroundStyle(.secondary)
                 }
@@ -581,7 +578,7 @@ public struct GroupedTrackResultCard: View {
                             player.play(variant, queue: allQueueTracks)
                         } label: {
                             Label(
-                                "Play via \(variant.provider.displayName) (\(variant.playbackCapability.rawValue))",
+                                "Play via \(variant.provider.displayName)",
                                 systemImage: variant.provider.systemIconName
                             )
                         }
@@ -621,39 +618,6 @@ public struct GroupedTrackResultCard: View {
             .contentShape(Rectangle())
             .onTapGesture {
                 player.play(activeVariant, queue: allQueueTracks)
-            }
-
-            // Provider Switcher Chips when song exists across multiple providers
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 6) {
-                    ForEach(group.variants) { variant in
-                        let isSelected = (activeVariant.id == variant.id)
-                        Button {
-                            selectedVariant = variant
-                            player.play(variant, queue: allQueueTracks)
-                        } label: {
-                            HStack(spacing: 4) {
-                                Image(systemName: variant.provider.systemIconName)
-                                    .font(.system(size: 9, weight: .bold))
-                                Text(ProviderBadgePill.formattedLabel(provider: variant.provider, capability: variant.playbackCapability))
-                                    .font(.system(size: 9.5, weight: .bold, design: .rounded))
-                                    .lineLimit(1)
-                            }
-                            .foregroundStyle(isSelected ? .white : variant.provider.badgeColor)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 3.5)
-                            .background(
-                                Capsule().fill(
-                                    isSelected
-                                        ? variant.provider.badgeColor
-                                        : variant.provider.badgeColor.opacity(0.14)
-                                )
-                            )
-                            .fixedSize(horizontal: true, vertical: false)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
             }
         }
         .padding(10)

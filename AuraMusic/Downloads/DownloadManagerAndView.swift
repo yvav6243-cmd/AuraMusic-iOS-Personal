@@ -1414,25 +1414,23 @@ public struct DownloadsManagementView: View {
                                         .lineLimit(2)
                                 } else {
                                     HStack(spacing: 6) {
-                                        ProviderBadgePill(provider: item.track.provider)
-                                        OfflineStatusBadgePill()
-                                        if item.hasOfflineLyrics && !downloadManager.hasLyricsUpdateAvailable(for: item.track) {
-                                            HStack(spacing: 3) {
-                                                Image(systemName: "quote.bubble.fill")
-                                                    .font(.system(size: 8.5, weight: .bold))
-                                                Text("LYRICS")
-                                                    .font(.system(size: 8.5, weight: .bold, design: .rounded))
-                                                    .lineLimit(1)
-                                            }
-                                            .foregroundStyle(.green)
-                                            .fixedSize(horizontal: true, vertical: false)
-                                        }
                                         if item.fileSizeBytes > 0 {
                                             Text(ByteCountFormatter.string(fromByteCount: item.fileSizeBytes, countStyle: .file))
                                                 .font(.system(size: 11))
                                                 .foregroundStyle(.secondary)
                                                 .lineLimit(1)
                                                 .fixedSize(horizontal: true, vertical: false)
+                                        }
+                                        if item.hasOfflineLyrics && !downloadManager.hasLyricsUpdateAvailable(for: item.track) {
+                                            HStack(spacing: 3) {
+                                                Image(systemName: "quote.bubble.fill")
+                                                    .font(.system(size: 8.5, weight: .bold))
+                                                Text("Текст сохранён")
+                                                    .font(.system(size: 10, weight: .semibold))
+                                                    .lineLimit(1)
+                                            }
+                                            .foregroundStyle(.secondary)
+                                            .fixedSize(horizontal: true, vertical: false)
                                         }
                                     }
 

@@ -1980,7 +1980,8 @@ final class AuraMusicCoreTests: XCTestCase {
         let engine = UniversalAudioPlayerEngine.shared
         engine.play(ytTrack)
         XCTAssertNil(engine.activeYouTubeVideoID, "Downloaded offline song MUST play natively via AVPlayer without loading WKWebView")
-        XCTAssertEqual(engine.playbackStatusBanner, "Offline Audio")
+        XCTAssertTrue(engine.isPlayingOfflineFile, "Engine must record offline local file playback internally")
+        XCTAssertNil(engine.playbackStatusBanner, "No 'Offline Audio' banner text should appear above transport controls")
         XCTAssertTrue(engine.isPlaying)
         engine.pause()
     }
@@ -2391,7 +2392,8 @@ final class AuraMusicCoreTests: XCTestCase {
         XCTAssertTrue(manager.isDownloaded(track))
         engine.play(track)
         XCTAssertNil(engine.activeYouTubeVideoID, "Downloaded track MUST play natively via AVPlayer without WKWebView")
-        XCTAssertEqual(engine.playbackStatusBanner, "Offline Audio")
+        XCTAssertTrue(engine.isPlayingOfflineFile)
+        XCTAssertNil(engine.playbackStatusBanner, "No 'Offline Audio' banner text should appear in player")
         XCTAssertTrue(engine.isPlaying)
     }
 
@@ -2606,7 +2608,8 @@ final class AuraMusicCoreTests: XCTestCase {
         engine.play(offlineTrack)
 
         XCTAssertNil(engine.activeYouTubeVideoID, "Downloaded offline track MUST completely unmount YouTube WebKit engine")
-        XCTAssertEqual(engine.playbackStatusBanner, "Offline Audio")
+        XCTAssertTrue(engine.isPlayingOfflineFile)
+        XCTAssertNil(engine.playbackStatusBanner, "No 'Offline Audio' text should appear above transport controls")
         XCTAssertTrue(engine.isPlaying)
     }
 

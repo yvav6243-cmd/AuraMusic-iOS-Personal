@@ -142,6 +142,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     @Published public var activeYouTubeVideoID: String? = nil
     @Published public var isYouTubeVideoVisible: Bool = false
     @Published public var playbackStatusBanner: String? = nil
+    @Published public private(set) var isPlayingOfflineFile: Bool = false
     @Published public private(set) var activeTrackTrimRange: TrackTrimRange? = nil
     public private(set) var capturedYouTubeAudioStreamURLs: [String: URL] = [:]
 
@@ -1134,6 +1135,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         lastUserResumeWallTime = 0
         playPauseCooldownGate.reset()
         playbackStatusBanner = nil
+        isPlayingOfflineFile = false
         // ALWAYS prefer local offline downloaded audio FIRST — even when internet is available (instant start + 0 ads + native AVPlayer)!
         let offlineRelativePath = OfflineDownloadManager.shared.completedLocalRelativePath(for: track)
         let offlineFileURL = offlineRelativePath.flatMap { resolveLocalFileURL(relativePath: $0) }
@@ -1163,7 +1165,8 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
 
         // If full-length offline audio is already downloaded, start native AVPlayer IMMEDIATELY on frame 0!
         if let localURL = offlineFileURL, hasOfflineFile {
-            startAVPlayer(with: localURL, for: trackWithCustomArt, banner: "Offline Audio")
+            isPlayingOfflineFile = true
+            startAVPlayer(with: localURL, for: trackWithCustomArt, banner: nil)
             return
         }
 
@@ -1185,7 +1188,8 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         if let localRelative = offlinePath,
            let fileURL = resolveLocalFileURL(relativePath: localRelative),
            FileManager.default.fileExists(atPath: fileURL.path) {
-            startAVPlayer(with: fileURL, for: track, banner: "Offline Audio")
+            isPlayingOfflineFile = true
+            startAVPlayer(with: fileURL, for: track, banner: nil)
             return
         }
 
@@ -1276,7 +1280,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
             }
             guard generation == playbackGeneration, !isUserPaused else { return }
             if let preview = track.previewURL {
-                startAVPlayer(with: preview, for: track, banner: "Spotify 30s Preview")
+                startAVPlayer(with: preview, for: track, banner: nil)
             } else {
                 await attemptCrossProviderFallback(for: track, generation: generation)
             }
@@ -1417,7 +1421,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
             startAVPlayer(
                 with: preview,
                 for: track,
-                banner: "Matched Apple Music AAC Preview"
+                banner: nil
             )
             return
         }

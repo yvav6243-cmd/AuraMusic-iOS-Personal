@@ -1098,6 +1098,19 @@ public struct TrackRowView: View {
         persistence.effectiveArtworkURL(for: track)
     }
 
+    private var trackSubtitle: String {
+        let dur = persistence.effectiveFormattedDuration(for: track)
+        let cleanAlbum = track.album.trimmingCharacters(in: .whitespacesAndNewlines)
+        let showAlbum = !cleanAlbum.isEmpty
+            && cleanAlbum.caseInsensitiveCompare("Single") != .orderedSame
+            && !cleanAlbum.localizedCaseInsensitiveContains("YouTube")
+            && !cleanAlbum.localizedCaseInsensitiveContains("Audius")
+        if showAlbum {
+            return "\(track.artist) • \(cleanAlbum) • \(dur)"
+        }
+        return "\(track.artist) • \(dur)"
+    }
+
     public var body: some View {
         HStack(spacing: 12) {
             AuraArtworkView(url: effectiveCoverURL, size: 50, cornerRadius: 8)
@@ -1121,17 +1134,11 @@ public struct TrackRowView: View {
                     }
                 }
 
-                HStack(spacing: 5) {
-                    ProviderBadgePill(provider: track.provider)
-                    if isDownloaded {
-                        OfflineStatusBadgePill()
-                    }
-                    Text("\(track.artist) • \(persistence.effectiveFormattedDuration(for: track))")
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                }
+                Text(trackSubtitle)
+                    .font(.system(size: 13))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
             }
 
             Spacer()

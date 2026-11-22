@@ -78,19 +78,11 @@ public struct AppleMusicPlayerOverlayView: View {
                         .font(.system(size: 15, weight: .semibold))
                         .foregroundStyle(.primary)
                         .lineLimit(1)
-                    HStack(spacing: 5) {
-                        Text(track.artist)
-                            .font(.system(size: 12))
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                        let isOffline = downloadManager.isDownloaded(track)
-                        Text("• \(isOffline ? "OFFLINE" : track.provider.shortBadgeName)")
-                            .font(.system(size: 9, weight: .bold, design: .rounded))
-                            .foregroundStyle(isOffline ? Color.green : track.provider.badgeColor)
-                            .lineLimit(1)
-                            .fixedSize(horizontal: true, vertical: false)
-                    }
+                    Text(track.artist)
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
                 }
 
                 Spacer(minLength: 4)
@@ -288,14 +280,6 @@ public struct AppleMusicPlayerOverlayView: View {
             .scaleEffect(player.isPlaying ? 1.0 : 0.84)
             .animation(AuraTheme.springBouncy, value: player.isPlaying)
 
-            if let banner = player.playbackStatusBanner {
-                Text(banner)
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.82))
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal, 28)
-            }
-
             // Live Synchronized Lyric Line Preview Pill (isolated from main player redraws -> 120 FPS!)
             LiveLyricPreviewPillView {
                 withAnimation(AuraTheme.springInteractive) {
@@ -361,26 +345,11 @@ public struct AppleMusicPlayerOverlayView: View {
                     }
                 }
 
-                HStack(spacing: 6) {
-                    Text(track.artist)
-                        .font(.system(size: 17, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.78))
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-
-                    let isOffline = downloadManager.isDownloaded(track)
-                    Text(isOffline ? "OFFLINE" : (track.audioQualityBadge ?? track.provider.shortBadgeName))
-                        .font(.system(size: 9, weight: .bold, design: .rounded))
-                        .foregroundStyle(isOffline ? Color.green : .white.opacity(0.92))
-                        .lineLimit(1)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2.5)
-                        .background(
-                            RoundedRectangle(cornerRadius: 4, style: .continuous)
-                                .fill(isOffline ? Color.green.opacity(0.22) : .white.opacity(0.18))
-                        )
-                        .fixedSize(horizontal: true, vertical: false)
-                }
+                Text(track.artist)
+                    .font(.system(size: 17, weight: .medium))
+                    .foregroundStyle(.white.opacity(0.78))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
             }
 
             Spacer()
@@ -717,7 +686,7 @@ public struct AppleMusicPlayerOverlayView: View {
                                     .font(.system(size: 15, weight: .semibold))
                                     .foregroundStyle(.white)
                                     .lineLimit(1)
-                                Text("\(queuedTrack.artist) • \(queuedTrack.provider.shortBadgeName)")
+                                Text(queuedTrack.artist)
                                     .font(.system(size: 12))
                                     .foregroundStyle(.white.opacity(0.7))
                                     .lineLimit(1)
@@ -805,15 +774,6 @@ private struct ExpandedPlaybackScrubberView: View {
                     .font(.system(size: 11, weight: .semibold, design: .rounded))
                     .monospacedDigit()
                     .foregroundStyle(.white.opacity(isScrubbing ? 0.95 : 0.65))
-
-                Spacer()
-
-                let isOffline = OfflineDownloadManager.shared.isDownloaded(track)
-                Text(isOffline ? "OFFLINE AUDIO" : track.provider.shortBadgeName)
-                    .font(.system(size: 10, weight: .bold, design: .rounded))
-                    .foregroundStyle(isOffline ? Color.green.opacity(0.95) : .white.opacity(0.75))
-                    .lineLimit(1)
-                    .fixedSize(horizontal: true, vertical: false)
 
                 Spacer()
 
