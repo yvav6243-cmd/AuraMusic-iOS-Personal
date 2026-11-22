@@ -1458,7 +1458,8 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
                        startSec >= 0.5 {
                         self.appliedStartTrimForGeneration = targetGen
                         let target = CMTime(seconds: startSec, preferredTimescale: 600)
-                        self.primaryPlayer.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
+                        _ = await self.primaryPlayer.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
+                        guard self.playbackGeneration == targetGen else { return }
                         self.currentTime = startSec
                     }
                     self.isBuffering = false
