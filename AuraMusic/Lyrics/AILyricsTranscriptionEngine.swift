@@ -604,13 +604,12 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
         }
 
         // 3. Fast temporary audio fetch capped strictly inside the 30-second budget
-        var candidateURLs: [(url: URL, ytHeaders: Bool)] = []
-        var cookieHeader: String? = nil
+        var candidates: [ResolvedAudioStreamCandidate] = []
 
         if track.provider == .audius, let stream = try? await audiusProvider.resolvePlayableStreamURL(for: track) {
-            candidateURLs.append((stream, false))
+            candidates.append(ResolvedAudioStreamCandidate(url: stream, mimeType: "audio/mpeg"))
         } else if track.provider == .soundCloud, let stream = track.streamURL {
-            candidateURLs.append((stream, false))
+            candidates.append(ResolvedAudioStreamCandidate(url: stream, mimeType: "audio/mpeg"))
         } else {
             var targetVideoID: String? = (track.provider == .youtubeMusic || track.provider == .youtube)
                 ? track.providerTrackID
@@ -621,29 +620,37 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
                 }
             }
             if let vid = targetVideoID, !vid.isEmpty {
-                if let captured = UniversalAudioPlayerEngine.shared.capturedYouTubeAudioStreamURLs[vid],
-                   let clean = YouTubeWebKitAudioExtractor.sanitizeFullLengthYouTubeStreamURL(captured.absoluteString) ?? Optional(captured) {
-                    candidateURLs.append((clean, true))
-                }
-                let extractBudget = min(4.5, max(0, deadline.timeIntervalSinceNow - 2.0))
-                if candidateURLs.isEmpty && extractBudget >= 1.5 {
+                // PRIMARY: Ultra-fast direct YouTube ANDROID Innertube HTTP-200 progressive stream (~0.3s!)
+                let directStreams = await YouTubeInnertubeAudioResolver.resolvePlayableStreams(
+                    videoID: vid,
+                    timeoutSeconds: min(4.0, max(1.5, deadline.timeIntervalSinceNow - 2.0))
+                )
+                candidates.append(contentsOf: directStreams)
+
+                // FALLBACK: Silent muted WebKit extractor only if Innertube returned empty
+                let extractBudget = min(4.0, max(0, deadline.timeIntervalSinceNow - 2.0))
+                if candidates.isEmpty && extractBudget >= 1.5 {
                     let extracted = await YouTubeWebKitAudioExtractor.shared.extractAudioStreams(videoID: vid, timeoutSeconds: extractBudget)
-                    cookieHeader = extracted.cookieHeader
+                    var safariHeaders: [String: String] = [
+                        "User-Agent": Self.safariUserAgent,
+                        "Referer": "https://m.youtube.com/",
+                        "Origin": "https://m.youtube.com"
+                    ]
+                    if let c = extracted.cookieHeader, !c.isEmpty { safariHeaders["Cookie"] = c }
                     for u in extracted.candidateURLs {
-                        candidateURLs.append((u, true))
+                        candidates.append(ResolvedAudioStreamCandidate(url: u, mimeType: "video/mp4", isProgressiveMP4: true, headers: safariHeaders))
                     }
                 }
             }
         }
 
-        for cand in candidateURLs {
+        for cand in candidates {
             let remaining = deadline.timeIntervalSinceNow
             guard remaining >= 1.2, !Task.isCancelled else { break }
             if let tempURL = await Self.downloadTempAudioFile(
                 from: cand.url,
-                useSafariHeaders: cand.ytHeaders,
-                cookieHeader: cookieHeader,
-                timeoutSeconds: min(6.0, remaining)
+                headers: cand.headers,
+                timeoutSeconds: min(6.5, remaining)
             ) {
                 return ResolvedAudioSource(url: tempURL, isTemporary: true)
             }
@@ -654,19 +661,13 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
 
     private nonisolated static func downloadTempAudioFile(
         from url: URL,
-        useSafariHeaders: Bool,
-        cookieHeader: String?,
+        headers: [String: String],
         timeoutSeconds: TimeInterval
     ) async -> URL? {
         var req = URLRequest(url: url)
         req.timeoutInterval = max(2.0, timeoutSeconds)
-        if useSafariHeaders {
-            req.setValue(Self.safariUserAgent, forHTTPHeaderField: "User-Agent")
-            req.setValue("https://m.youtube.com/", forHTTPHeaderField: "Referer")
-            req.setValue("https://m.youtube.com", forHTTPHeaderField: "Origin")
-            if let cookieHeader, !cookieHeader.isEmpty {
-                req.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
-            }
+        for (k, v) in headers {
+            req.setValue(v, forHTTPHeaderField: k)
         }
         do {
             let (tmp, resp) = try await URLSession.shared.download(for: req)
@@ -675,6 +676,10 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
                 return nil
             }
             let mime = (http.mimeType ?? "").lowercased()
+            if mime.contains("text/html") || mime.contains("application/json") {
+                try? FileManager.default.removeItem(at: tmp)
+                return nil
+            }
             let ext = mime.contains("mpeg") ? "mp3" : (mime.contains("video/mp4") ? "mp4" : "m4a")
             let dest = FileManager.default.temporaryDirectory.appendingPathComponent("aura_ai_\(UUID().uuidString).\(ext)")
             try FileManager.default.moveItem(at: tmp, to: dest)
