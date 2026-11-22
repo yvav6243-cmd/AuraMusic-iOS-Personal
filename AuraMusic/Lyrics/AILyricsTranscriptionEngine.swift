@@ -147,7 +147,7 @@ public enum VocalIsolationDSP {
         guard count > 0 else { return ([], []) }
 
         let sr = Float(sampleRate)
-        let hp = highPassCoeffs(cutoffHz: 190.0, sampleRate: sr)
+        let hp = highPassCoeffs(cutoffHz: 220.0, sampleRate: sr)
         let lp = lowPassCoeffs(cutoffHz: 3800.0, sampleRate: sr)
         let presence = peakingEQCoeffs(centerHz: 2200.0, sampleRate: sr, gainDB: 4.5, q: 1.1)
 
@@ -163,13 +163,16 @@ public enum VocalIsolationDSP {
             sideEnergyTotal += Double(s * s)
         }
 
-        // Bandpass Mid & Side FIRST so bass/hi-hat energy never skews the vocal Mid/Side mask!
-        let midBand = applyBiquad(applyBiquad(applyBiquad(mid, coeffs: hp), coeffs: lp), coeffs: presence)
+        // 4th-order (-24 dB/oct) High-Pass @ 220 Hz + Low-Pass @ 3800 Hz + Presence EQ @ 2200 Hz
+        // Eliminates 808 sub-bass & kick rumble by >40 dB so instrumental bass drops never fool Speech AI or pause detection!
+        let midHP = applyBiquad(applyBiquad(mid, coeffs: hp), coeffs: hp)
+        let midBand = applyBiquad(applyBiquad(midHP, coeffs: lp), coeffs: presence)
         let isTrueStereo = (sideEnergyTotal / Double(count)) > 1e-6
 
         let vocalFloat: [Float]
         if isTrueStereo {
-            let sideBand = applyBiquad(applyBiquad(side, coeffs: hp), coeffs: lp)
+            let sideHP = applyBiquad(applyBiquad(side, coeffs: hp), coeffs: hp)
+            let sideBand = applyBiquad(sideHP, coeffs: lp)
             let frameLen = max(64, Int(sampleRate * 0.02)) // 20ms frames
             let numFrames = (count + frameLen - 1) / frameLen
             var frameGains = [Float](repeating: 1.0, count: numFrames)
@@ -201,7 +204,7 @@ public enum VocalIsolationDSP {
             vocalFloat = midBand
         }
 
-        // Stage 4: Smooth Automatic Gain Control (AGC) + soft-clip normalization into Int16
+        // Stage 4: Noise-Gated Smooth Automatic Gain Control (AGC) + soft-clip normalization into Int16
         let vocalInt16 = normalizeAGC(vocalFloat, sampleRate: sampleRate)
         let cleanMidInt16 = normalizeAGC(midBand, sampleRate: sampleRate)
         return (vocalInt16, cleanMidInt16)
@@ -211,28 +214,47 @@ public enum VocalIsolationDSP {
         guard !signal.isEmpty else { return [] }
         let blockSize = max(160, Int(sampleRate * 0.25)) // 250ms AGC window
         let targetRMS: Float = 0.20
-        var out = [Int16](repeating: 0, count: signal.count)
-        var currentGain: Float = 1.0
 
-        var idx = 0
+        // Compute block RMS values first so we can gate quiet/bass-filtered instrumental pauses (NEVER boost silence!)
+        var blockRMSList: [Float] = []
+        blockRMSList.reserveCapacity(signal.count / blockSize + 1)
         signal.withUnsafeBufferPointer { buf in
             guard let base = buf.baseAddress else { return }
+            var idx = 0
             while idx < signal.count {
                 let end = min(signal.count, idx + blockSize)
                 let len = end - idx
                 var sumSq: Float = 0
                 vDSP_svesq(base + idx, 1, &sumSq, vDSP_Length(len))
-                let blockRMS = sqrt(sumSq / Float(max(1, len)))
-                let desiredGain: Float = (blockRMS > 0.004)
-                    ? min(6.0, max(0.25, targetRMS / blockRMS))
-                    : 1.0
-                for i in idx..<end {
-                    currentGain = currentGain * 0.995 + desiredGain * 0.005
-                    // Soft-clip via tanh so loud transients never distort consonants
+                blockRMSList.append(sqrt(sumSq / Float(max(1, len))))
+                idx = end
+            }
+        }
+        let sortedRMS = blockRMSList.sorted()
+        let p90RMS = sortedRMS[Int(Double(max(0, sortedRMS.count - 1)) * 0.90)]
+        let noiseGate = max(0.025, p90RMS * 0.14)
+
+        var out = [Int16](repeating: 0, count: signal.count)
+        var currentGain: Float = 1.0
+
+        signal.withUnsafeBufferPointer { buf in
+            guard let base = buf.baseAddress else { return }
+            for bIdx in 0..<blockRMSList.count {
+                let start = bIdx * blockSize
+                let end = min(signal.count, start + blockSize)
+                let blockRMS = blockRMSList[bIdx]
+                let desiredGain: Float
+                if blockRMS < noiseGate {
+                    // Below vocal gate -> never amplify residual filtered bass/noise into fake vocal energy
+                    desiredGain = 1.0
+                } else {
+                    desiredGain = min(3.2, max(0.30, targetRMS / blockRMS))
+                }
+                for i in start..<end {
+                    currentGain = currentGain * 0.992 + desiredGain * 0.008
                     let sample = tanh(base[i] * currentGain)
                     out[i] = Int16(max(-32767.0, min(32767.0, sample * 30_000.0)))
                 }
-                idx = end
             }
         }
         return out
@@ -1525,31 +1547,43 @@ public final class AILyricsTranscriptionEngine: ObservableObject {
             // Look ahead over a reasonable window of heard tokens so a single missed line never blocks later matches
             let searchEnd = min(sortedTokens.count, tokenCursor + 24)
             var bestScore = 0
-            var bestStartIdx: Int? = nil
+            var bestFirstMatchedIdx: Int? = nil
+            var bestLastMatchedIdx: Int? = nil
 
             for startIdx in tokenCursor..<searchEnd {
                 let spanEnd = min(sortedTokens.count, startIdx + max(4, lineUnits.count + 3))
                 var matchedCount = 0
                 var matchedUnits = Set<String>()
+                var firstMatchIdx: Int? = nil
+                var lastMatchIdx: Int? = nil
+
                 for tIdx in startIdx..<spanEnd {
                     let heardUnits = normalizedMatchUnits(for: sortedTokens[tIdx].text)
+                    var tokenMatchedLine = false
                     for hu in heardUnits where !matchedUnits.contains(hu) {
                         if lineUnits.contains(where: { wordsFuzzyMatch($0, hu) }) {
                             matchedUnits.insert(hu)
                             matchedCount += 1
+                            tokenMatchedLine = true
                         }
                     }
+                    if tokenMatchedLine {
+                        if firstMatchIdx == nil { firstMatchIdx = tIdx }
+                        lastMatchIdx = tIdx
+                    }
                 }
-                if matchedCount > bestScore {
+                if matchedCount > bestScore, let fm = firstMatchIdx, let lm = lastMatchIdx {
                     bestScore = matchedCount
-                    bestStartIdx = startIdx
+                    bestFirstMatchedIdx = fm
+                    bestLastMatchedIdx = lm
                 }
             }
 
             let minRequired = lineUnits.count <= 2 ? 1 : max(2, Int(ceil(Double(lineUnits.count) * 0.34)))
-            if bestScore >= minRequired, let matchedIdx = bestStartIdx {
-                anchors[lineIdx] = sortedTokens[matchedIdx].timestamp
-                tokenCursor = min(sortedTokens.count, matchedIdx + max(1, bestScore))
+            if bestScore >= minRequired, let firstIdx = bestFirstMatchedIdx, let lastIdx = bestLastMatchedIdx {
+                // Anchor to the EXACT first matched audio token of THIS line (never a leftover token from the previous line!)
+                anchors[lineIdx] = sortedTokens[firstIdx].timestamp
+                tokenCursor = min(sortedTokens.count, lastIdx + 1)
             }
         }
 
