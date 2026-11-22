@@ -43,6 +43,7 @@ targets:
       - WebKit
       - ActivityKit
       - NaturalLanguage
+      - Speech
 
   AuraMusicTests:
     type: bundle.unit-test

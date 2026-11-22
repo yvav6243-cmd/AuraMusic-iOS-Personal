@@ -2103,4 +2103,269 @@ final class AuraMusicCoreTests: XCTestCase {
         XCTAssertEqual(restored, defaultRemoteURL)
         XCTAssertFalse(persistence.hasCustomArtwork(for: track))
     }
+
+    // MARK: - External App Auto-Pause (TikTok / YouTube) & 10-Pass <=30s AI Audio Lyrics Tests
+
+    @MainActor
+    func testTikTokOrYouTubeSilenceSecondaryAudioHintImmediatelyPausesPlaybackWithoutFighting() async throws {
+        let engine = UniversalAudioPlayerEngine.shared
+        let track = UniversalTrack(
+            provider: .youtubeMusic,
+            providerTrackID: "TIKTOK_PAUSE_01",
+            title: "Midnight City",
+            artist: "M83",
+            album: "Hurry Up",
+            duration: 243.0,
+            isStreamable: true
+        )
+        defer {
+            engine.pause()
+            engine.activeYouTubeVideoID = nil
+        }
+
+        engine.play(track)
+        engine.activeYouTubeVideoID = track.providerTrackID
+        XCTAssertTrue(engine.isPlaying)
+
+        // 1. In foreground within first 2.5s of track start, own WKWebView startup hint MUST NOT pause the song
+        engine.handleSilenceSecondaryAudioHint(type: .begin, at: CACurrentMediaTime() + 0.3, isAppActive: true)
+        XCTAssertTrue(engine.isPlaying, "Foreground WKWebView startup must not self-pause via secondary audio hint")
+
+        // 2. When user switches to TikTok or YouTube (AuraMusic in background -> isAppActive == false),
+        // iOS fires silenceSecondaryAudioHint (.begin) -> AuraMusic MUST pause IMMEDIATELY!
+        engine.handleSilenceSecondaryAudioHint(type: .begin, at: CACurrentMediaTime() + 0.4, isAppActive: false)
+        XCTAssertFalse(engine.isPlaying, "Opening TikTok or YouTube video MUST immediately pause AuraMusic")
+        XCTAssertEqual(MPNowPlayingInfoCenter.default().playbackState, .paused)
+
+        // 3. Resume works cleanly after user closes TikTok/YouTube, and WebKit externalAudioPause bridge also pauses immediately
+        engine.resume()
+        XCTAssertTrue(engine.isPlaying)
+
+        let playerView = AuthorizedYouTubeIFramePlayerView(videoID: track.providerTrackID)
+        let coord = playerView.makeCoordinator()
+        coord.loadedVideoID = track.providerTrackID
+        coord.handleBridgePayload(["type": "externalAudioPause"])
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertFalse(engine.isPlaying, "WebKit externalAudioPause (navigator.audioSession interrupted) MUST immediately pause AuraMusic")
+        XCTAssertEqual(MPNowPlayingInfoCenter.default().playbackState, .paused)
+    }
+
+    @MainActor
+    func testWebKitExternalAudioInterruptionPausesVideoAndNeverAutoResumesOverTikTok() async throws {
+        let playerView = AuthorizedYouTubeIFramePlayerView(videoID: "YkY4X_OaF6o")
+        let coordinator = playerView.makeCoordinator()
+        let webView = AuthorizedYouTubeIFramePlayerView.makeConfiguredWebView(coordinator: coordinator)
+        let navWaiter = TestWKNavigationWaiter()
+        webView.navigationDelegate = navWaiter
+        defer {
+            webView.navigationDelegate = nil
+            webView.configuration.userContentController.removeScriptMessageHandler(forName: "auraYT")
+        }
+
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            navWaiter.continuation = cont
+            webView.loadHTMLString(
+                "<!doctype html><html><body><div id='movie_player'></div><video id='v' playsinline></video></body></html>",
+                baseURL: URL(string: "https://m.youtube.com/watch?v=YkY4X_OaF6o")
+            )
+        }
+
+        var ready = false
+        for _ in 0..<15 {
+            if let ok = try? await webView.evaluateJavaScript("typeof window.auraControl === 'object' && typeof window.auraControl.pauseForExternalApp === 'function'") as? Bool, ok {
+                ready = true
+                break
+            }
+            try await Task.sleep(nanoseconds: 150_000_000)
+        }
+        XCTAssertTrue(ready, "WebKit bridge must expose window.auraControl.pauseForExternalApp")
+
+        // Simulate background playback interrupted by TikTok/YouTube -> pauseForExternalApp + keepAliveInBackground MUST stay paused!
+        let interruptedState = try await webView.evaluateJavaScript("""
+        (function() {
+          window.auraControl.enterBackground(8000);
+          window.auraControl.pauseForExternalApp();
+          window.auraControl.keepAliveInBackground();
+          return {
+            externalInterrupted: window._auraExternalInterrupted === true,
+            userPaused: window._auraUserPaused === true,
+            softPaused: window._auraSoftPaused === true
+          };
+        })()
+        """) as? [String: Any]
+        XCTAssertEqual(interruptedState?["externalInterrupted"] as? Bool, true)
+        XCTAssertEqual(interruptedState?["userPaused"] as? Bool, true, "External app pause must mark song paused")
+        XCTAssertEqual(interruptedState?["softPaused"] as? Bool, false, "External app pause must genuinely pause instead of soft-playing")
+
+        // Resuming later must cleanly clear _auraExternalInterrupted
+        let resumedState = try await webView.evaluateJavaScript("""
+        (function() {
+          window.auraControl.resume();
+          return {
+            externalInterrupted: window._auraExternalInterrupted === true,
+            userPaused: window._auraUserPaused === true
+          };
+        })()
+        """) as? [String: Any]
+        XCTAssertEqual(resumedState?["externalInterrupted"] as? Bool, false)
+        XCTAssertEqual(resumedState?["userPaused"] as? Bool, false)
+    }
+
+    func testAILyricsPass1PauseDetectorIdentifiesIntroAndMidSongPausesFromRMSEnvelope() {
+        // Build 30.0s RMS envelope at 0.1s per frame (300 frames):
+        // 0.0-4.0s intro silence | 4.0-12.0s verse | 12.0-13.0s 1s short breath | 13.0-19.0s chorus | 19.0-24.0s 5s bridge pause | 24.0-30.0s outro
+        var rms = [Float]()
+        for i in 0..<300 {
+            let t = Double(i) * 0.1
+            if t < 4.0 {
+                rms.append(0.002)
+            } else if t < 12.0 {
+                rms.append(0.35)
+            } else if t < 13.0 {
+                rms.append(0.004) // short 1.0s breath -> must be ignored (< 2.4s)
+            } else if t < 19.0 {
+                rms.append(0.42)
+            } else if t < 24.0 {
+                rms.append(0.003) // 5.0s instrumental break -> must be detected!
+            } else {
+                rms.append(0.33)
+            }
+        }
+
+        let pauses = AILyricsTranscriptionEngine.detectPauseIntervals(
+            rmsFrames: rms,
+            frameDuration: 0.1,
+            trackDuration: 30.0,
+            minPauseDuration: 2.4
+        )
+        XCTAssertEqual(pauses.count, 2, "Pass 1 DSP must detect intro pause and 5s mid-song pause while ignoring 1s breath")
+        XCTAssertEqual(pauses[0].start, 0.0, accuracy: 0.15)
+        XCTAssertEqual(pauses[0].end, 4.0, accuracy: 0.15)
+        XCTAssertEqual(pauses[1].start, 19.0, accuracy: 0.15)
+        XCTAssertEqual(pauses[1].end, 24.0, accuracy: 0.15)
+    }
+
+    func testAILyricsForeignWordMergerReplacesLowConfidenceSegmentsAndPreservesNativeWords() {
+        let primaryTokens: [AIWordToken] = [
+            AIWordToken(text: "Окутала", timestamp: 5.0, duration: 0.5, confidence: 0.92, languageCode: "ru"),
+            AIWordToken(text: "меня", timestamp: 5.6, duration: 0.4, confidence: 0.90, languageCode: "ru"),
+            AIWordToken(text: "ай", timestamp: 8.0, duration: 0.25, confidence: 0.34, languageCode: "ru"),
+            AIWordToken(text: "гат", timestamp: 8.35, duration: 0.25, confidence: 0.31, languageCode: "ru"),
+            AIWordToken(text: "лав", timestamp: 8.70, duration: 0.35, confidence: 0.38, languageCode: "ru")
+        ]
+        let secondaryTokens: [AIWordToken] = [
+            AIWordToken(text: "Oh", timestamp: 5.05, duration: 0.4, confidence: 0.55, languageCode: "en"), // weaker than Russian 0.92 -> MUST NOT replace!
+            AIWordToken(text: "I", timestamp: 8.02, duration: 0.22, confidence: 0.89, languageCode: "en"),
+            AIWordToken(text: "got", timestamp: 8.36, duration: 0.24, confidence: 0.91, languageCode: "en"),
+            AIWordToken(text: "love", timestamp: 8.72, duration: 0.34, confidence: 0.94, languageCode: "en")
+        ]
+
+        let result = AILyricsTranscriptionEngine.mergeForeignLanguageTokens(
+            primaryTokens: primaryTokens,
+            secondaryTokens: secondaryTokens
+        )
+        XCTAssertEqual(result.foreignReplacements, 3, "All 3 low-confidence English hook words must be replaced cleanly")
+        XCTAssertEqual(result.merged.map(\.text), ["Окутала", "меня", "I", "got", "love"])
+    }
+
+    @MainActor
+    func testAILyricsMultiPassConsensusAndSyncedLRCBuilderProducesValidMonotonicLyricsWithPauses() throws {
+        // Overlapping passes with a boundary duplicate and slight timestamp jitter
+        let passA: [AIWordToken] = [
+            AIWordToken(text: "Небо", timestamp: 6.0, duration: 0.4, confidence: 0.85, languageCode: "ru"),
+            AIWordToken(text: "в", timestamp: 6.5, duration: 0.15, confidence: 0.82, languageCode: "ru"),
+            AIWordToken(text: "алмазах", timestamp: 6.75, duration: 0.55, confidence: 0.88, languageCode: "ru"),
+            AIWordToken(text: "I", timestamp: 16.0, duration: 0.2, confidence: 0.90, languageCode: "en"),
+            AIWordToken(text: "got", timestamp: 16.3, duration: 0.25, confidence: 0.91, languageCode: "en"),
+            AIWordToken(text: "love", timestamp: 16.65, duration: 0.4, confidence: 0.94, languageCode: "en")
+        ]
+        let passB: [AIWordToken] = [
+            AIWordToken(text: "алмазах", timestamp: 6.80, duration: 0.52, confidence: 0.91, languageCode: "ru"), // boundary overlap
+            AIWordToken(text: "I", timestamp: 16.02, duration: 0.22, confidence: 0.88, languageCode: "en")
+        ]
+
+        let reconciled = AILyricsTranscriptionEngine.reconcileMultiPassTokens(passes: [passA, passB])
+        XCTAssertEqual(reconciled.map(\.text), ["Небо", "в", "алмазах", "I", "got", "love"])
+
+        let pauses = [
+            AIPauseInterval(start: 0.0, end: 5.8),
+            AIPauseInterval(start: 8.2, end: 15.6)
+        ]
+        let lrc = AILyricsTranscriptionEngine.buildSyncedLRCFromTokens(
+            tokens: reconciled,
+            pauses: pauses,
+            trackDuration: 25.0
+        )
+        let parsed = LRCParser.parseSyncedLRC(lrc, includeIntroDots: true)
+        XCTAssertGreaterThanOrEqual(parsed.count, 4, "Must include intro dots, verse line, mid-song pause dots, and hook line")
+        XCTAssertTrue(parsed[0].isInstrumental, "Intro pause must render as ••• dots")
+        XCTAssertTrue(parsed.contains(where: { $0.text == "Небо в алмазах" }))
+        XCTAssertTrue(parsed.contains(where: { $0.text == "I got love" }))
+        XCTAssertTrue(parsed.filter(\.isInstrumental).count >= 2, "Both intro and mid-song pause must be marked with •••")
+
+        // Verify strictly increasing timestamps
+        for idx in 1..<parsed.count {
+            XCTAssertGreaterThan(parsed[idx].timestamp, parsed[idx - 1].timestamp)
+        }
+
+        // Verify SwiftData AI cache round-trip using separate "ai::" namespace (never overwrites standard lyrics!)
+        let track = UniversalTrack(
+            provider: .youtubeMusic,
+            providerTrackID: "AI_LRC_TEST_01",
+            title: "I Got Love",
+            artist: "Miyagi",
+            album: "Single",
+            duration: 25.0
+        )
+        XCTAssertTrue(LyricsService.aiLyricsCacheKey(for: track).hasPrefix("ai::"))
+        let saved = try XCTUnwrap(LyricsService.shared.saveAILyrics(syncedLRC: lrc, for: track))
+        XCTAssertTrue(saved.isSynchronized)
+        let reloaded = try XCTUnwrap(LyricsService.shared.loadCachedAILyrics(for: track))
+        XCTAssertEqual(reloaded.syncedLines.count, saved.syncedLines.count)
+    }
+
+    func testAILyricsTenPassContractAnd30SecondHardBudgetEnforced() {
+        XCTAssertEqual(AILyricsTranscriptionEngine.totalRequiredPasses, 10)
+        XCTAssertEqual(AILyricsTranscriptionEngine.maxDurationBudgetSeconds, 30.0, accuracy: 0.001)
+
+        // Pass 1 must explain language, pauses, and foreign-language word detection
+        let p1 = AILyricsTranscriptionEngine.passDescriptor(for: 1, primaryLang: nil, secondaryLang: nil, pauseCount: 0, foreignCount: 0)
+        XCTAssertTrue(p1.title.contains("1/10"))
+        XCTAssertTrue(p1.detail.lowercased().contains("язык"))
+        XCTAssertTrue(p1.detail.lowercased().contains("пауз"))
+
+        // Passes 2...10 must all have valid Russian descriptors
+        for pass in 2...10 {
+            let desc = AILyricsTranscriptionEngine.passDescriptor(for: pass, primaryLang: "Русский", secondaryLang: "English", pauseCount: 3, foreignCount: 5)
+            XCTAssertTrue(desc.title.contains("\(pass)/10"), "Pass \(pass) title must display \(pass)/10")
+            XCTAssertFalse(desc.detail.isEmpty)
+        }
+
+        // Budget enforcement: remaining time strictly caps per-pass timeout and stops at 0 when expired
+        let now = Date()
+        let deadline = now.addingTimeInterval(28.5)
+        XCTAssertEqual(
+            AILyricsTranscriptionEngine.computePassTimeout(hardDeadline: deadline, preferred: 4.0, reserveForLater: 6.0, now: now),
+            4.0,
+            accuracy: 0.01
+        )
+        XCTAssertEqual(
+            AILyricsTranscriptionEngine.computePassTimeout(hardDeadline: deadline, preferred: 4.0, reserveForLater: 27.0, now: now),
+            1.5,
+            accuracy: 0.01
+        )
+        XCTAssertEqual(
+            AILyricsTranscriptionEngine.computePassTimeout(hardDeadline: deadline, preferred: 4.0, reserveForLater: 28.4, now: now),
+            0.0,
+            accuracy: 0.001
+        )
+    }
+
+    func testInfoPlistDeclaresSpeechRecognitionUsageDescriptionForAILyrics() {
+        let appBundle = Bundle(for: UniversalAudioPlayerEngine.self)
+        let usage = appBundle.object(forInfoDictionaryKey: "NSSpeechRecognitionUsageDescription") as? String
+        XCTAssertNotNil(usage, "NSSpeechRecognitionUsageDescription MUST be present in Info.plist so Speech permission never crashes on iOS")
+        XCTAssertFalse((usage ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+    }
 }

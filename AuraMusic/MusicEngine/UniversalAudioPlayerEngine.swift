@@ -179,6 +179,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     private var nativeHandoffObservation: NSKeyValueObservation?
     private var attemptedNativeHandoffVideoIDs: Set<String> = []
     private var isUserPaused: Bool = false
+    private var secondaryAudioWasAlreadySilencedOnBackground: Bool = false
     private var lastUserPauseWallTime: TimeInterval = 0
     private var lastUserResumeWallTime: TimeInterval = 0
     private var lastTrackStartWallTime: TimeInterval = 0
@@ -607,6 +608,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     }
 
     private func activateBackgroundTransitionProtection() {
+        secondaryAudioWasAlreadySilencedOnBackground = AVAudioSession.sharedInstance().secondaryAudioShouldBeSilencedHint
         if activeYouTubeVideoID != nil {
             evaluateYouTubeJS("if(window.auraControl){window.auraControl.enterBackground(8000);}")
         }
@@ -620,6 +622,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         }
 
         // Continuous background watchdog: immediately recovers if iOS WebKit suspends <video> on transition or mid-song
+        // while immediately yielding to TikTok / YouTube / Instagram / Calls whenever external audio begins!
         backgroundProtectTask = Task { @MainActor in
             let initialDelaysNs: [UInt64] = [200_000_000, 500_000_000, 1_100_000_000]
             for delay in initialDelaysNs {
@@ -637,11 +640,16 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
 
     private func enforceBackgroundPlaybackAlive() {
         guard isPlaying, !isUserPaused else { return }
+        // If another app (TikTok, YouTube, Instagram, Telegram, Phone) started primary audio, pause immediately instead of fighting it!
+        if !secondaryAudioWasAlreadySilencedOnBackground && AVAudioSession.sharedInstance().secondaryAudioShouldBeSilencedHint {
+            pauseForExternalAppAudio()
+            return
+        }
         if activeYouTubeVideoID != nil {
             if !(backgroundKeepAliveAudioPlayer?.isPlaying ?? false) {
                 setBackgroundKeepAliveActive(true, mixWithWebKit: true)
             }
-            evaluateYouTubeJS("if(window.auraControl && !window._auraUserPaused && !window._auraSoftPaused){window.auraControl.keepAliveInBackground();}")
+            evaluateYouTubeJS("if(window.auraControl && !window._auraUserPaused && !window._auraSoftPaused && !window._auraExternalInterrupted){window.auraControl.keepAliveInBackground();}")
         } else if primaryPlayer.currentItem != nil && primaryPlayer.timeControlStatus == .paused {
             configureAudioSession(mixWithWebKit: false)
             primaryPlayer.play()
@@ -743,7 +751,24 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         if activeYouTubeVideoID != nil && (now - lastTrackStartWallTime) < 2.5 {
             return
         }
-        pause()
+        pauseForExternalAppAudio()
+    }
+
+    /// Handles iOS `silenceSecondaryAudioHintNotification` (fired whenever TikTok, YouTube, Instagram, Telegram, or
+    /// any other non-mixing audio app starts playing while AuraMusic has `.mixWithOthers` active for WebKit playback).
+    internal func handleSilenceSecondaryAudioHint(
+        type: AVAudioSession.SilenceSecondaryAudioHintType,
+        at now: TimeInterval = CACurrentMediaTime(),
+        isAppActive: Bool = UIApplication.shared.applicationState == .active
+    ) {
+        guard type == .begin else { return }
+        // Protect only against our own foreground WKWebView activating right as a track launches
+        if activeYouTubeVideoID != nil && isAppActive && (now - lastTrackStartWallTime) < 2.5 {
+            return
+        }
+        if isPlaying || isBuffering {
+            pauseForExternalAppAudio()
+        }
     }
 
     private func configureAudioNotifications() {
@@ -839,6 +864,22 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
                 @unknown default:
                     break
                 }
+            }
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: AVAudioSession.silenceSecondaryAudioHintNotification,
+            object: AVAudioSession.sharedInstance(),
+            queue: .main
+        ) { [weak self] notification in
+            guard let self,
+                  let userInfo = notification.userInfo,
+                  let typeValue = userInfo[AVAudioSessionSilenceSecondaryAudioHintTypeKey] as? UInt,
+                  let hintType = AVAudioSession.SilenceSecondaryAudioHintType(rawValue: typeValue) else {
+                return
+            }
+            Task { @MainActor in
+                self.handleSilenceSecondaryAudioHint(type: hintType)
             }
         }
 
@@ -1370,6 +1411,29 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         }
         refreshNowPlayingMetadata()
         reassertNowPlayingOwnershipAfterDelay()
+    }
+
+    /// Cleanly pauses AuraMusic when an external app (TikTok, YouTube, Instagram, Telegram, Phone Call) begins audio playback.
+    /// Unlike user-initiated background pause, this stops our background keep-alive completely and NEVER switches AVAudioSession
+    /// to non-mixing `.playback` so TikTok/YouTube plays smoothly without ever being interrupted back!
+    public func pauseForExternalAppAudio() {
+        backgroundProtectTask?.cancel()
+        delayedKeepAliveStopTask?.cancel()
+        isUserPaused = true
+        lastUserPauseWallTime = CACurrentMediaTime()
+        isPlaying = false
+        isBuffering = false
+
+        primaryPlayer.pause()
+        crossfadeSecondaryPlayer?.pause()
+        ApplicationMusicPlayer.shared.pause()
+
+        if activeYouTubeVideoID != nil {
+            evaluateYouTubeJS("if(window.auraControl && window.auraControl.pauseForExternalApp){window.auraControl.pauseForExternalApp();}else if(window.auraControl){window.auraControl.pause();}")
+            youtubeWebView?.pauseAllMediaPlayback(completionHandler: nil)
+        }
+        setBackgroundKeepAliveActive(false)
+        updateNowPlayingElapsedTime()
     }
 
     public func resume() {

@@ -897,6 +897,12 @@ private struct LiveLyricPreviewPillView: View {
         .onChange(of: lyricsService.currentDocument?.id) { _, _ in
             displayedLine = lyricsService.activeLyricLineText(at: PlaybackClock.shared.currentTime)
         }
+        .onChange(of: lyricsService.aiDocument?.id) { _, _ in
+            displayedLine = lyricsService.activeLyricLineText(at: PlaybackClock.shared.currentTime)
+        }
+        .onChange(of: lyricsService.lyricsMode) { _, _ in
+            displayedLine = lyricsService.activeLyricLineText(at: PlaybackClock.shared.currentTime)
+        }
         .onReceive(PlaybackClock.shared.$currentTime) { newTime in
             let nextLine = lyricsService.activeLyricLineText(at: newTime)
             if nextLine != displayedLine {

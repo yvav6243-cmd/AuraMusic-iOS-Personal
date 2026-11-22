@@ -421,8 +421,14 @@ public final class LyricsService: ObservableObject {
     public static let shared = LyricsService()
 
     @Published public private(set) var currentDocument: TrackLyricsDocument?
+    @Published public private(set) var aiDocument: TrackLyricsDocument?
+    @Published public var lyricsMode: LyricsDisplayMode = .standard
     @Published public private(set) var isLoading: Bool = false
     @Published public private(set) var errorMessage: String?
+
+    public var activeDocument: TrackLyricsDocument? {
+        lyricsMode == .aiAudio ? aiDocument : currentDocument
+    }
 
     private let session: URLSession
     private var loadedTrackID: String?
@@ -434,7 +440,7 @@ public final class LyricsService: ObservableObject {
 
     /// Returns the currently active synchronized lyric line for live preview on the Apple Music player card
     public func activeLyricLineText(at currentTime: TimeInterval) -> String? {
-        guard let doc = currentDocument else { return nil }
+        guard let doc = activeDocument else { return nil }
         if doc.isSynchronized {
             if let activeIdx = LyricSynchronizationEngine.activeLineIndex(at: currentTime, in: doc.syncedLines) {
                 if !doc.syncedLines[activeIdx].isInstrumental {
@@ -456,6 +462,54 @@ public final class LyricsService: ObservableObject {
     nonisolated public static func lyricsCacheKey(for track: UniversalTrack) -> String {
         let (parsedTitle, parsedArtist) = extractCleanTitleAndArtist(rawTitle: track.title, rawArtist: track.artist)
         return "\(parsedArtist.lowercased())::\(parsedTitle.lowercased())"
+    }
+
+    nonisolated public static func aiLyricsCacheKey(for track: UniversalTrack) -> String {
+        "ai::\(lyricsCacheKey(for: track))"
+    }
+
+    public func setActiveAIDocument(_ document: TrackLyricsDocument?) {
+        self.aiDocument = document
+    }
+
+    public func loadCachedAILyrics(for track: UniversalTrack) -> TrackLyricsDocument? {
+        let key = Self.aiLyricsCacheKey(for: track)
+        let context = PersistenceController.shared.context
+        let descriptor = FetchDescriptor<PersistedCachedLyricsEntity>(
+            predicate: #Predicate { $0.cacheKey == key }
+        )
+        guard let cached = try? context.fetch(descriptor).first,
+              !(cached.syncedLRC ?? "").isEmpty else {
+            return nil
+        }
+        return buildDocument(
+            title: track.title,
+            artist: track.artist,
+            syncedLRC: cached.syncedLRC,
+            plainLyrics: cached.plainLyrics,
+            trackDuration: track.duration
+        )
+    }
+
+    @discardableResult
+    public func saveAILyrics(syncedLRC: String, for track: UniversalTrack) -> TrackLyricsDocument? {
+        let key = Self.aiLyricsCacheKey(for: track)
+        let parsed = LRCParser.parseSyncedLRC(syncedLRC, includeIntroDots: true)
+        let plain = parsed.filter { !$0.isInstrumental }.map(\.text).joined(separator: "\n")
+        cacheLyrics(
+            cacheKey: key,
+            title: track.title,
+            artist: track.artist,
+            syncedLRC: syncedLRC,
+            plainLyrics: plain.isEmpty ? nil : plain
+        )
+        return buildDocument(
+            title: track.title,
+            artist: track.artist,
+            syncedLRC: syncedLRC,
+            plainLyrics: plain.isEmpty ? nil : plain,
+            trackDuration: track.duration
+        )
     }
 
     public func hasCachedLyrics(for track: UniversalTrack) -> Bool {
@@ -506,6 +560,12 @@ public final class LyricsService: ObservableObject {
     }
 
     public func loadLyrics(for track: UniversalTrack, forceReload: Bool = false) async {
+        // Refresh cached AI document when switching tracks so AI mode stays scoped to the current song
+        if loadedTrackID != track.id {
+            AILyricsTranscriptionEngine.shared.resetForNewTrack(track.id)
+            self.aiDocument = loadCachedAILyrics(for: track)
+        }
+
         // Avoid wiping and reloading already-loaded lyrics when re-opening the Lyrics panel for the same track
         if !forceReload, loadedTrackID == track.id, currentDocument != nil {
             isLoading = false
@@ -1681,6 +1741,7 @@ private struct SyncedInstrumentalDotsRowView: View, Equatable {
 public struct SynchronizedLyricsView: View {
     @ObservedObject var player: UniversalAudioPlayerEngine
     @ObservedObject var lyricsService: LyricsService = .shared
+    @ObservedObject var aiEngine: AILyricsTranscriptionEngine = .shared
 
     @State private var activeLineIndex: Int? = nil
     @State private var activeDotStage: Int = 0
@@ -1700,7 +1761,9 @@ public struct SynchronizedLyricsView: View {
         VStack(spacing: 0) {
             lyricsHeaderBar
 
-            if lyricsService.isLoading {
+            if lyricsService.lyricsMode == .aiAudio {
+                aiLyricsModeContent
+            } else if lyricsService.isLoading {
                 Spacer()
                 ProgressView()
                     .tint(.white)
@@ -1727,6 +1790,30 @@ public struct SynchronizedLyricsView: View {
                         .foregroundStyle(.white.opacity(0.8))
                         .multilineTextAlignment(.center)
                         .padding(.horizontal, 32)
+
+                    Button {
+                        if let track = player.currentTrack {
+                            withAnimation(AuraTheme.springInteractive) {
+                                lyricsService.lyricsMode = .aiAudio
+                            }
+                            aiEngine.startListening(for: track)
+                        }
+                    } label: {
+                        Label("Определить текст через ИИ (10 раз)", systemImage: "sparkles")
+                            .font(.system(size: 14, weight: .bold))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 20)
+                            .padding(.vertical, 11)
+                            .background(
+                                Capsule().fill(
+                                    LinearGradient(
+                                        colors: [AuraTheme.accentPink, Color.purple],
+                                        startPoint: .leading,
+                                        endPoint: .trailing
+                                    )
+                                )
+                            )
+                    }
 
                     Button {
                         let cleaned = LyricsService.extractCleanTitleAndArtist(
@@ -1758,71 +1845,336 @@ public struct SynchronizedLyricsView: View {
         }
     }
 
-    private var lyricsHeaderBar: some View {
-        HStack(spacing: 10) {
-            if let doc = lyricsService.currentDocument {
-                HStack(spacing: 6) {
-                    Image(systemName: doc.isSynchronized ? "waveform" : "text.alignleft")
-                        .font(.system(size: 11, weight: .bold))
-                    Text(doc.isSynchronized ? "APPLE MUSIC SING SYNC" : "LYRICS")
-                        .font(.system(size: 10, weight: .bold, design: .rounded))
-                    Text("• \(doc.detectedLanguageDisplayName.uppercased())")
-                        .font(.system(size: 10, weight: .bold, design: .rounded))
-                }
-                .foregroundStyle(.white.opacity(0.92))
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(Capsule().fill(.white.opacity(0.18)))
+    @ViewBuilder
+    private var aiLyricsModeContent: some View {
+        if aiEngine.state.isRunning {
+            aiListeningProgressView
+        } else if let aiDoc = lyricsService.aiDocument {
+            synchronizedLyricsScroll(doc: aiDoc)
+        } else {
+            aiReadyOrErrorView
+        }
+    }
 
-                if doc.hasTranslationAvailable {
-                    Button {
-                        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-                            showTranslationOverlay.toggle()
+    private var aiListeningProgressView: some View {
+        let st = aiEngine.state
+        let percent = Int((max(0, min(1, st.progress)) * 100).rounded())
+        let elapsedInt = Int(min(st.maxBudgetSeconds, max(0, st.elapsedSeconds)).rounded())
+        let maxInt = Int(st.maxBudgetSeconds.rounded())
+
+        return ScrollView(.vertical, showsIndicators: false) {
+            VStack(spacing: 20) {
+                Spacer().frame(height: 16)
+
+                ZStack {
+                    Circle()
+                        .fill(
+                            RadialGradient(
+                                colors: [AuraTheme.accentPink.opacity(0.45), Color.purple.opacity(0.15), .clear],
+                                center: .center,
+                                startRadius: 6,
+                                endRadius: 56
+                            )
+                        )
+                        .frame(width: 96, height: 96)
+
+                    Image(systemName: "sparkles")
+                        .font(.system(size: 36, weight: .bold))
+                        .foregroundStyle(.white)
+                        .symbolEffect(.pulse, isActive: st.isRunning)
+                }
+
+                VStack(spacing: 6) {
+                    Text("ИИ слушает песню")
+                        .font(.system(size: 22, weight: .bold))
+                        .foregroundStyle(.white)
+
+                    HStack(spacing: 8) {
+                        Text("Прослушивание \(max(1, st.currentPass)) / \(st.totalPasses)")
+                            .font(.system(size: 13, weight: .bold, design: .rounded))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 5)
+                            .background(Capsule().fill(AuraTheme.accentPink.opacity(0.85)))
+
+                        Text(String(format: "0:%02d / 0:%02d", elapsedInt, maxInt))
+                            .font(.system(size: 13, weight: .semibold, design: .rounded))
+                            .monospacedDigit()
+                            .foregroundStyle(.white.opacity(0.85))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .background(Capsule().fill(.white.opacity(0.16)))
+                    }
+                }
+
+                // Animated Loading Progress Bar (загрузочная строка)
+                VStack(spacing: 10) {
+                    GeometryReader { geo in
+                        let width = max(geo.size.width, 1)
+                        let clamped = max(0.03, min(1.0, st.progress))
+                        ZStack(alignment: .leading) {
+                            Capsule(style: .continuous)
+                                .fill(Color.white.opacity(0.18))
+                                .frame(height: 10)
+
+                            Capsule(style: .continuous)
+                                .fill(
+                                    LinearGradient(
+                                        colors: [AuraTheme.accentPink, Color.purple, Color.white],
+                                        startPoint: .leading,
+                                        endPoint: .trailing
+                                    )
+                                )
+                                .frame(width: width * CGFloat(clamped), height: 10)
+                                .shadow(color: AuraTheme.accentPink.opacity(0.6), radius: 8, x: 0, y: 0)
+                                .animation(.easeOut(duration: 0.25), value: st.progress)
                         }
-                    } label: {
-                        Image(systemName: "character.bubble.fill")
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundStyle(showTranslationOverlay ? Color.black : Color.white)
-                            .padding(7)
-                            .background(Circle().fill(showTranslationOverlay ? Color.white : Color.white.opacity(0.18)))
                     }
-                }
-            }
+                    .frame(height: 10)
 
-            Spacer()
-
-            if isUserManualScrolling {
-                Button {
-                    withAnimation(AuraTheme.springInteractive) {
-                        isUserManualScrolling = false
+                    HStack {
+                        Text(st.stageTitle)
+                            .font(.system(size: 13, weight: .bold))
+                            .foregroundStyle(.white)
+                            .lineLimit(1)
+                        Spacer()
+                        Text("\(percent)%")
+                            .font(.system(size: 13, weight: .bold, design: .rounded))
+                            .monospacedDigit()
+                            .foregroundStyle(.white.opacity(0.9))
                     }
-                } label: {
-                    Label("Resume Sync", systemImage: "arrow.up.and.down.circle.fill")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(.black)
-                        .padding(.horizontal, 11)
-                        .padding(.vertical, 5)
-                        .background(Capsule().fill(.white))
-                }
-            }
 
-            Button {
-                let cleaned = LyricsService.extractCleanTitleAndArtist(
-                    rawTitle: player.currentTrack?.title ?? "",
-                    rawArtist: player.currentTrack?.artist ?? ""
+                    Text(st.stageDetail)
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(.white.opacity(0.78))
+                        .multilineTextAlignment(.leading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+
+                    // 10-Pass Visual Step Indicators (Pass 1 = analysis, Passes 2–10 = write & verify)
+                    HStack(spacing: 6) {
+                        ForEach(1...st.totalPasses, id: \.self) { passIdx in
+                            let isDone = passIdx < st.currentPass
+                            let isActive = passIdx == st.currentPass
+                            Capsule(style: .continuous)
+                                .fill(
+                                    isDone
+                                        ? Color.white
+                                        : (isActive ? AuraTheme.accentPink : Color.white.opacity(0.22))
+                                )
+                                .frame(height: isActive ? 6 : 4)
+                                .animation(.easeInOut(duration: 0.2), value: st.currentPass)
+                        }
+                    }
+                    .padding(.top, 4)
+                }
+                .padding(18)
+                .background(
+                    RoundedRectangle(cornerRadius: 20, style: .continuous)
+                        .fill(Color.white.opacity(0.12))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                                .strokeBorder(Color.white.opacity(0.18), lineWidth: 1)
+                        )
                 )
-                manualSongQuery = cleaned.title
-                manualArtistQuery = cleaned.artist
-                showManualSearchSheet = true
-            } label: {
-                Image(systemName: "magnifyingglass")
-                    .font(.system(size: 13, weight: .bold))
-                    .foregroundStyle(.white)
-                    .padding(8)
-                    .background(Circle().fill(.white.opacity(0.16)))
+                .padding(.horizontal, 24)
+
+                // Pass 1 Detected Language / Pause / Foreign-Insert Chips
+                if st.detectedPrimaryLanguage != nil || st.detectedPauseCount > 0 {
+                    HStack(spacing: 8) {
+                        if let lang = st.detectedPrimaryLanguage {
+                            aiInfoChip(icon: "globe", text: lang)
+                        }
+                        if let sec = st.detectedSecondaryLanguage {
+                            aiInfoChip(icon: "character.bubble", text: "+\(sec)")
+                        }
+                        aiInfoChip(icon: "pause.circle", text: "Пауз: \(st.detectedPauseCount)")
+                    }
+                    .padding(.horizontal, 20)
+                }
+
+                Button {
+                    aiEngine.cancel()
+                } label: {
+                    Text("Отменить")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.9))
+                        .padding(.horizontal, 22)
+                        .padding(.vertical, 9)
+                        .background(Capsule().fill(.white.opacity(0.16)))
+                }
+                .padding(.top, 4)
+
+                Spacer().frame(height: 40)
             }
         }
-        .padding(.horizontal, 24)
+    }
+
+    private func aiInfoChip(icon: String, text: String) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: icon)
+                .font(.system(size: 11, weight: .bold))
+            Text(text)
+                .font(.system(size: 12, weight: .semibold))
+                .lineLimit(1)
+        }
+        .foregroundStyle(.white.opacity(0.95))
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(Capsule().fill(Color.white.opacity(0.16)))
+    }
+
+    private var aiReadyOrErrorView: some View {
+        VStack(spacing: 16) {
+            Spacer()
+
+            Image(systemName: "sparkles.rectangle.stack.fill")
+                .font(.system(size: 42, weight: .medium))
+                .foregroundStyle(.white.opacity(0.9))
+
+            Text("ИИ-лирика по аудио")
+                .font(.system(size: 21, weight: .bold))
+                .foregroundStyle(.white)
+
+            Text(
+                aiEngine.state.errorMessage
+                    ?? "ИИ прослушает песню 10 раз за ≤30 сек:\n1-й раз — определит язык, паузы и иноязычные вставки.\n2–10-й раз — напишет, сверит и синхронизирует текст."
+            )
+            .font(.system(size: 14, weight: .medium))
+            .foregroundStyle(.white.opacity(0.82))
+            .multilineTextAlignment(.center)
+            .padding(.horizontal, 30)
+
+            Button {
+                if let track = player.currentTrack {
+                    aiEngine.startListening(for: track, forceReanalyze: true)
+                }
+            } label: {
+                Label("Запустить ИИ (10 прослушиваний)", systemImage: "sparkles")
+                    .font(.system(size: 15, weight: .bold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 22)
+                    .padding(.vertical, 12)
+                    .background(
+                        Capsule().fill(
+                            LinearGradient(
+                                colors: [AuraTheme.accentPink, Color.purple],
+                                startPoint: .leading,
+                                endPoint: .trailing
+                            )
+                        )
+                    )
+                    .shadow(color: AuraTheme.accentPink.opacity(0.45), radius: 10, x: 0, y: 4)
+            }
+            .disabled(player.currentTrack == nil)
+
+            Spacer()
+        }
+    }
+
+    private var lyricsHeaderBar: some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 10) {
+                // Sleek Glass Mode Selector: База vs ✨ ИИ
+                HStack(spacing: 3) {
+                    ForEach(LyricsDisplayMode.allCases, id: \.self) { mode in
+                        let isSelected = (lyricsService.lyricsMode == mode)
+                        Button {
+                            withAnimation(AuraTheme.springInteractive) {
+                                lyricsService.lyricsMode = mode
+                            }
+                            if mode == .aiAudio, let track = player.currentTrack {
+                                if lyricsService.aiDocument == nil && !aiEngine.state.isRunning {
+                                    aiEngine.startListening(for: track)
+                                }
+                            }
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: mode == .aiAudio ? "sparkles" : "waveform")
+                                    .font(.system(size: 11, weight: .bold))
+                                Text(mode.rawValue)
+                                    .font(.system(size: 12, weight: .bold, design: .rounded))
+                            }
+                            .foregroundStyle(isSelected ? Color.black : Color.white.opacity(0.88))
+                            .padding(.horizontal, 11)
+                            .padding(.vertical, 6)
+                            .background(
+                                Capsule(style: .continuous)
+                                    .fill(isSelected ? Color.white : Color.clear)
+                            )
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(3)
+                .background(Capsule(style: .continuous).fill(Color.white.opacity(0.16)))
+
+                if let doc = lyricsService.activeDocument {
+                    HStack(spacing: 4) {
+                        if lyricsService.lyricsMode == .aiAudio {
+                            Text("ИИ 10/10")
+                                .font(.system(size: 10, weight: .bold, design: .rounded))
+                        }
+                        Text("• \(doc.detectedLanguageDisplayName.uppercased())")
+                            .font(.system(size: 10, weight: .bold, design: .rounded))
+                            .lineLimit(1)
+                    }
+                    .foregroundStyle(.white.opacity(0.9))
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 5)
+                    .background(Capsule().fill(.white.opacity(0.14)))
+                }
+
+                Spacer()
+
+                if isUserManualScrolling {
+                    Button {
+                        withAnimation(AuraTheme.springInteractive) {
+                            isUserManualScrolling = false
+                        }
+                    } label: {
+                        Label("Sync", systemImage: "arrow.up.and.down.circle.fill")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(.black)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .background(Capsule().fill(.white))
+                    }
+                }
+
+                if lyricsService.lyricsMode == .aiAudio {
+                    Button {
+                        if let track = player.currentTrack {
+                            aiEngine.startListening(for: track, forceReanalyze: true)
+                        }
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.system(size: 13, weight: .bold))
+                            .foregroundStyle(.white)
+                            .padding(8)
+                            .background(Circle().fill(.white.opacity(0.16)))
+                    }
+                    .disabled(aiEngine.state.isRunning || player.currentTrack == nil)
+                    .opacity(aiEngine.state.isRunning ? 0.4 : 1.0)
+                } else {
+                    Button {
+                        let cleaned = LyricsService.extractCleanTitleAndArtist(
+                            rawTitle: player.currentTrack?.title ?? "",
+                            rawArtist: player.currentTrack?.artist ?? ""
+                        )
+                        manualSongQuery = cleaned.title
+                        manualArtistQuery = cleaned.artist
+                        showManualSearchSheet = true
+                    } label: {
+                        Image(systemName: "magnifyingglass")
+                            .font(.system(size: 13, weight: .bold))
+                            .foregroundStyle(.white)
+                            .padding(8)
+                            .background(Circle().fill(.white.opacity(0.16)))
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 20)
         .padding(.vertical, 8)
     }
 

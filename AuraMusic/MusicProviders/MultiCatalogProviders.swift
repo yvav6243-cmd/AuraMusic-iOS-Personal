@@ -1142,7 +1142,7 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
               }
 
               // Start playback if not yet playing; once actively playing (!v.paused && currentTime > 0.15 && readyState >= 2), skip playVideo()/play() so audio never stutters
-              if (!window._auraUserPaused && !window._auraSoftPaused && !v.ended) {
+              if (!window._auraUserPaused && !window._auraSoftPaused && !window._auraExternalInterrupted && !v.ended) {
                 var isActuallyPlaying = (!v.paused && v.currentTime > 0.15 && v.readyState >= 2);
                 if (!isActuallyPlaying) {
                   v._auraStartAttempts = (v._auraStartAttempts || 0) + 1;
@@ -1183,11 +1183,34 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
           var lastTickPostAt = 0;
           var lastTickState = -999;
           window._auraPausedTickPostCount = 0;
+          window._auraExternalInterrupted = false;
+
+          // Configure iOS 17/18 WebKit Audio Session so external apps (TikTok, YouTube, Instagram, Calls) immediately signal 'interrupted'
+          function setupWebKitAudioSessionMonitoring() {
+            try {
+              if (!navigator.audioSession || navigator.audioSession._auraHooked) return;
+              navigator.audioSession._auraHooked = true;
+              try { navigator.audioSession.type = 'playback'; } catch(e) {}
+              navigator.audioSession.addEventListener('statechange', function() {
+                try {
+                  if (navigator.audioSession.state === 'interrupted') {
+                    window._auraExternalInterrupted = true;
+                    if (window.auraControl && window.auraControl.pauseForExternalApp) {
+                      window.auraControl.pauseForExternalApp();
+                    }
+                    postMessageToSwift({ type: 'externalAudioPause' });
+                  }
+                } catch(e) {}
+              });
+            } catch(e) {}
+          }
+          setupWebKitAudioSessionMonitoring();
 
           window.auraControl = {
             play: function() {
               window._auraSoftPaused = false;
               window._auraUserPaused = false;
+              window._auraExternalInterrupted = false;
               window._auraAllowPause = false;
               window._auraPendingUserResumeUntil = Date.now() + 2500;
               lastTickState = 1;
@@ -1199,6 +1222,30 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
                 applyNativeMute(v, false);
                 forceUnmuteAndPlayIfNeeded(v, true);
               }
+            },
+            pauseForExternalApp: function() {
+              // Genuine pause & mute when TikTok, YouTube, Instagram, or a call takes audio focus — NEVER fight the external app!
+              window._auraExternalInterrupted = true;
+              window._auraSoftPaused = false;
+              window._auraUserPaused = true;
+              window._auraAllowPause = true;
+              window._auraStartupProtectUntil = 0;
+              window._auraBgProtectUntil = 0;
+              window._auraPendingUserResumeUntil = 0;
+              lastTickState = 2;
+              lastTickPostAt = Date.now();
+              try { if (navigator.mediaSession) navigator.mediaSession.playbackState = 'paused'; } catch(e) {}
+              var v = document.querySelector('video');
+              if (v) {
+                try { v.playbackRate = 1.0; } catch(e) {}
+                applyNativeMute(v, true);
+                try {
+                  if (window._auraOrigPause) { window._auraOrigPause.call(v); }
+                  else { v.pause(); }
+                } catch(e) {}
+              }
+              var mp = document.getElementById('movie_player');
+              if (mp && mp.pauseVideo) { try { mp.pauseVideo(); } catch(e) {} }
             },
             pauseInBackground: function() {
               // Soft-pause while backgrounded: immediately silences audio via native muted=true & freezes reported time
@@ -1272,6 +1319,7 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
               var wasSoftPaused = (window._auraSoftPaused === true);
               window._auraSoftPaused = false;
               window._auraUserPaused = false;
+              window._auraExternalInterrupted = false;
               window._auraAllowPause = false;
               window._auraPendingUserResumeUntil = Date.now() + 2500;
               window._auraBgProtectUntil = Date.now() + 1800;
@@ -1292,7 +1340,7 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
                   try { v.play().catch(function(){}); } catch(e) {}
                 }
                 setTimeout(function() {
-                  if (!window._auraUserPaused && !window._auraSoftPaused && v && v.paused && !v.ended) {
+                  if (!window._auraUserPaused && !window._auraSoftPaused && !window._auraExternalInterrupted && v && v.paused && !v.ended) {
                     applyNativeMute(v, false);
                     var mp2 = document.getElementById('movie_player');
                     if (mp2 && mp2.playVideo) { try { mp2.playVideo(); } catch(e) {} }
@@ -1311,7 +1359,12 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
             },
             enterBackground: function(ms) {
               window._auraAppInBackground = true;
-              if (window._auraUserPaused === true || window._auraSoftPaused === true) return;
+              if (window._auraUserPaused === true || window._auraSoftPaused === true || window._auraExternalInterrupted === true) return;
+              if (navigator.audioSession && navigator.audioSession.state === 'interrupted') {
+                window.auraControl.pauseForExternalApp();
+                postMessageToSwift({ type: 'externalAudioPause' });
+                return;
+              }
               window._auraBgProtectUntil = Date.now() + (ms || 8000);
               var v = document.querySelector('video');
               if (v && v.paused && !v.ended) {
@@ -1321,7 +1374,12 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
             },
             keepAliveInBackground: function() {
               window._auraAppInBackground = true;
-              if (window._auraUserPaused === true || window._auraSoftPaused === true) return;
+              if (window._auraUserPaused === true || window._auraSoftPaused === true || window._auraExternalInterrupted === true) return;
+              if (navigator.audioSession && navigator.audioSession.state === 'interrupted') {
+                window.auraControl.pauseForExternalApp();
+                postMessageToSwift({ type: 'externalAudioPause' });
+                return;
+              }
               installMediaSessionHandlers();
               var v = document.querySelector('video');
               if (v && !v.ended) {
@@ -1339,6 +1397,7 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
                 if (mp && typeof mp.loadVideoById === 'function') {
                   window._auraSoftPaused = false;
                   window._auraUserPaused = false;
+                  window._auraExternalInterrupted = false;
                   window._auraAllowPause = false;
                   window._auraStartupProtectUntil = Date.now() + 4500;
                   window._auraPendingUserResumeUntil = Date.now() + 3000;
@@ -1578,6 +1637,11 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
                   postCurrentVideoTick(v);
                   return;
                 }
+                if (window._auraExternalInterrupted === true || (navigator.audioSession && navigator.audioSession.state === 'interrupted')) {
+                  window.auraControl.pauseForExternalApp();
+                  postMessageToSwift({ type: 'externalAudioPause' });
+                  return;
+                }
                 if (window._auraSoftPaused === true) {
                   // Keep alive muted while soft-paused
                   try { v.play().catch(function(){}); } catch(e) {}
@@ -1587,8 +1651,8 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
                 var inStartupProtect = Date.now() < (window._auraStartupProtectUntil || 0);
                 var inBgProtect = Date.now() < (window._auraBgProtectUntil || 0);
                 var inResumeProtect = Date.now() < (window._auraPendingUserResumeUntil || 0);
-                // While app is in background, the user cannot tap the hidden 8x8 <video>; any unsolicited pause
-                // without _auraUserPaused/_auraAllowPause is iOS WebKit trying to suspend background audio -> keep playing!
+                // While app is in background (and NOT interrupted by TikTok/YouTube/external audio),
+                // unsolicited iOS WebKit suspension pauses are blocked so background playback never disconnects!
                 if ((inBgActive || inStartupProtect || inBgProtect || inResumeProtect) && !window._auraUserPaused && !window._auraAllowPause) {
                   forceUnmuteAndPlayIfNeeded(v, false);
                   try { v.play().catch(function(){}); } catch(e) {}
@@ -1616,6 +1680,17 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
                 }
                 postCurrentVideoTick(v);
               });
+            }
+
+            if (navigator.audioSession && navigator.audioSession.state === 'interrupted') {
+              if (!window._auraExternalInterrupted) {
+                window.auraControl.pauseForExternalApp();
+                postMessageToSwift({ type: 'externalAudioPause' });
+              }
+              return;
+            }
+            if (window._auraExternalInterrupted === true) {
+              return;
             }
 
             if (window._auraSoftPaused === true) {
@@ -1731,6 +1806,12 @@ public struct AuthorizedYouTubeIFramePlayerView: UIViewRepresentable {
                     Task { @MainActor in
                         if let vid = messageVideoID, self.playerEngine?.activeYouTubeVideoID != vid { return }
                         self.playerEngine?.pause()
+                    }
+                    return
+                case "externalAudioPause":
+                    Task { @MainActor in
+                        if let vid = messageVideoID, self.playerEngine?.activeYouTubeVideoID != vid { return }
+                        self.playerEngine?.pauseForExternalAppAudio()
                     }
                     return
                 case "remotePlay":
