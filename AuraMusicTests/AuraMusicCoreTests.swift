@@ -2877,4 +2877,20 @@ final class AuraMusicCoreTests: XCTestCase {
         XCTAssertEqual(imported[1].primaryText, "Линия 1")
         XCTAssertEqual(imported[1].secondaryText, "Линия 2")
     }
+
+    @MainActor
+    func testExpandedPlayerSwipeToDismissDisabledWhileScrollingLyricsOrQueue() {
+        XCTAssertTrue(
+            AppleMusicPlayerOverlayView.shouldAllowFullScreenSwipeDismiss(for: .none),
+            "Artwork screen has no vertical scroll so swipe-to-dismiss should remain active"
+        )
+        XCTAssertFalse(
+            AppleMusicPlayerOverlayView.shouldAllowFullScreenSwipeDismiss(for: .lyrics),
+            "Dragging lyrics up or down MUST NEVER trigger player swipe-to-dismiss"
+        )
+        XCTAssertFalse(
+            AppleMusicPlayerOverlayView.shouldAllowFullScreenSwipeDismiss(for: .upNext),
+            "Dragging Up Next queue MUST NEVER trigger player swipe-to-dismiss"
+        )
+    }
 }

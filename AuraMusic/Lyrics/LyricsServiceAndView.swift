@@ -1921,6 +1921,7 @@ public struct SynchronizedLyricsView: View {
     @State private var activeLineIndex: Int? = nil
     @State private var activeDotStage: Int = 0
     @State private var isUserManualScrolling: Bool = false
+    @State private var manualScrollResumeTask: Task<Void, Never>? = nil
     @State private var showTranslationOverlay: Bool = false
     @State private var showManualSearchSheet: Bool = false
     @State private var showCustomLyricsStudio: Bool = false
@@ -2121,6 +2122,7 @@ public struct SynchronizedLyricsView: View {
 
             if isUserManualScrolling {
                 Button {
+                    manualScrollResumeTask?.cancel()
                     withAnimation(AuraTheme.springInteractive) {
                         isUserManualScrolling = false
                     }
@@ -2221,6 +2223,7 @@ public struct SynchronizedLyricsView: View {
                         }
                         .id(line.index)
                         .onTapGesture {
+                            manualScrollResumeTask?.cancel()
                             isUserManualScrolling = false
                             activeLineIndex = line.index
                             activeDotStage = 0
@@ -2239,6 +2242,26 @@ public struct SynchronizedLyricsView: View {
                 .id(doc.id)
                 .padding(.horizontal, 20)
             }
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 12)
+                    .onChanged { _ in
+                        manualScrollResumeTask?.cancel()
+                        if !isUserManualScrolling {
+                            isUserManualScrolling = true
+                        }
+                    }
+                    .onEnded { _ in
+                        manualScrollResumeTask?.cancel()
+                        manualScrollResumeTask = Task { @MainActor in
+                            try? await Task.sleep(nanoseconds: 5_000_000_000)
+                            guard !Task.isCancelled else { return }
+                            isUserManualScrolling = false
+                        }
+                    }
+            )
+            .onDisappear {
+                manualScrollResumeTask?.cancel()
+            }
             .onAppear {
                 let initial = syncActiveLineAndDots(at: PlaybackClock.shared.currentTime, in: doc)
                 if !doc.syncedLines.isEmpty {
@@ -2246,6 +2269,7 @@ public struct SynchronizedLyricsView: View {
                 }
             }
             .onChange(of: doc.id) { _, _ in
+                manualScrollResumeTask?.cancel()
                 isUserManualScrolling = false
                 let initial = syncActiveLineAndDots(at: PlaybackClock.shared.currentTime, in: doc)
                 if !doc.syncedLines.isEmpty {

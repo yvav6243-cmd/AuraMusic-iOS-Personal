@@ -161,35 +161,73 @@ public struct AppleMusicPlayerOverlayView: View {
 
     // MARK: - 2. Full-Screen Expanded Apple Music Player
 
+    /// Full-screen vertical swipe-to-dismiss MUST only be enabled on the non-scrolling artwork view (`.none`).
+    /// When `.lyrics` or `.upNext` is open, vertical drags in the content area belong 100% to the `ScrollView`
+    /// so pulling lyrics up/down NEVER triggers player dismissal; users can still drag the top grabber/header to dismiss.
+    public static func shouldAllowFullScreenSwipeDismiss(
+        for activeOverlayTab: UniversalAudioPlayerEngine.ExpandedOverlayTab
+    ) -> Bool {
+        activeOverlayTab == .none
+    }
+
+    private var dismissHandleDragGesture: some Gesture {
+        DragGesture(minimumDistance: 24)
+            .onChanged { value in
+                if value.translation.height > 16 && abs(value.translation.height) > abs(value.translation.width) * 1.3 {
+                    dragOffset = value.translation.height
+                }
+            }
+            .onEnded { value in
+                if value.translation.height > 120 && abs(value.translation.height) > abs(value.translation.width) * 1.1 {
+                    withAnimation(AuraTheme.springInteractive) {
+                        dragOffset = 0
+                        player.isPlayerExpanded = false
+                    }
+                } else {
+                    withAnimation(AuraTheme.springInteractive) {
+                        dragOffset = 0
+                    }
+                }
+            }
+    }
+
     private func expandedFullScreenPlayer(track: UniversalTrack) -> some View {
         ZStack {
             DynamicArtworkMeshBackground(artworkURL: track.artworkURL, isAnimating: player.isPlaying)
                 .equatable()
 
             VStack(spacing: 0) {
-                // Grabber Pill
-                Capsule()
-                    .fill(Color.white.opacity(0.4))
-                    .frame(width: 38, height: 5)
-                    .padding(.top, 12)
-                    .padding(.bottom, 10)
-                    .onTapGesture {
-                        withAnimation(AuraTheme.springInteractive) {
-                            player.isPlayerExpanded = false
+                // Top Dismiss Handle Zone (Grabber Pill + Compact Header) — always allows clean swipe-down to close
+                VStack(spacing: 0) {
+                    Capsule()
+                        .fill(Color.white.opacity(0.4))
+                        .frame(width: 38, height: 5)
+                        .padding(.top, 12)
+                        .padding(.bottom, 10)
+                        .frame(maxWidth: .infinity)
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            withAnimation(AuraTheme.springInteractive) {
+                                player.isPlayerExpanded = false
+                            }
                         }
-                    }
 
-                // Compact Header when Lyrics or Up Next is active
-                if player.activeOverlayTab != .none {
-                    compactNowPlayingHeader(track: track)
-                        .padding(.horizontal, 24)
-                        .padding(.bottom, 8)
+                    // Compact Header when Lyrics or Up Next is active
+                    if player.activeOverlayTab != .none {
+                        compactNowPlayingHeader(track: track)
+                            .padding(.horizontal, 24)
+                            .padding(.bottom, 8)
+                    }
                 }
+                .contentShape(Rectangle())
+                .simultaneousGesture(dismissHandleDragGesture)
 
                 // Main Content Area: Standard Artwork View OR Synchronized Lyrics OR Up Next Queue
                 switch player.activeOverlayTab {
                 case .none:
                     standardArtworkCenterSection(track: track)
+                        .contentShape(Rectangle())
+                        .simultaneousGesture(dismissHandleDragGesture)
                 case .lyrics:
                     SynchronizedLyricsView(player: player)
                 case .upNext:
@@ -218,26 +256,9 @@ public struct AppleMusicPlayerOverlayView: View {
             .offset(y: max(0, dragOffset))
         }
         .environment(\.colorScheme, .dark)
-        .simultaneousGesture(
-            DragGesture(minimumDistance: 32)
-                .onChanged { value in
-                    if value.translation.height > 20 && abs(value.translation.height) > abs(value.translation.width) * 1.4 {
-                        dragOffset = value.translation.height
-                    }
-                }
-                .onEnded { value in
-                    if value.translation.height > 130 && abs(value.translation.height) > abs(value.translation.width) * 1.2 {
-                        withAnimation(AuraTheme.springInteractive) {
-                            dragOffset = 0
-                            player.isPlayerExpanded = false
-                        }
-                    } else {
-                        withAnimation(AuraTheme.springInteractive) {
-                            dragOffset = 0
-                        }
-                    }
-                }
-        )
+        .onChange(of: player.activeOverlayTab) { _, _ in
+            dragOffset = 0
+        }
         .sheet(isPresented: $showAddToPlaylistSheet) {
             AddToPlaylistPickerSheet(track: track)
         }
