@@ -2084,7 +2084,8 @@ final class AuraMusicCoreTests: XCTestCase {
         )
 
         // 3. Base64 JPEG data URI for WKWebView navigator.mediaSession (since WebKit blocks file:// URLs!)
-        let dataURI = try XCTUnwrap(await ArtworkCacheManager.shared.base64JPEGDataURI(for: firstURL))
+        let rawDataURI = await ArtworkCacheManager.shared.base64JPEGDataURI(for: firstURL)
+        let dataURI = try XCTUnwrap(rawDataURI)
         XCTAssertTrue(dataURI.hasPrefix("data:image/jpeg;base64,"), "Custom photo must encode to data:image/jpeg;base64 URI for WebKit Lock Screen")
 
         // 4. Replace with second custom photo -> must get a fresh versioned URL & update Lock Screen immediately
