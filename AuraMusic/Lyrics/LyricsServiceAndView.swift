@@ -2106,22 +2106,6 @@ public struct SynchronizedLyricsView: View {
 
             Spacer()
 
-            if isUserManualScrolling {
-                Button {
-                    manualScrollResumeTask?.cancel()
-                    withAnimation(AuraTheme.springInteractive) {
-                        isUserManualScrolling = false
-                    }
-                } label: {
-                    Label("Resume Sync", systemImage: "arrow.up.and.down.circle.fill")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(.black)
-                        .padding(.horizontal, 11)
-                        .padding(.vertical, 5)
-                        .background(Capsule().fill(.white))
-                }
-            }
-
             // 1-Tap Quick Open Custom Lyrics Studio
             if player.currentTrack != nil {
                 Button {
