@@ -2932,8 +2932,8 @@ final class AuraMusicCoreTests: XCTestCase {
         XCTAssertEqual(squared.size.width, 600, accuracy: 1.0)
         XCTAssertEqual(squared.size.height, 600, accuracy: 1.0)
 
-        // 2. Verify playing an offline audio file immediately sets .playback/.longFormAudio + complete MPNowPlayingInfoCenter
-        //    required for native iPhone Dynamic Island (song cover on left + live audio bass waveform on right)!
+        // 2. Verify playing an offline audio file with real artwork immediately sets .playback/.longFormAudio
+        //    and publishes the TRUE square original cover on frame 0 (ZERO pink fallback placeholder flash!)
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
         let dlDir = docs.appendingPathComponent("AuraDownloads", isDirectory: true)
         try FileManager.default.createDirectory(at: dlDir, withIntermediateDirectories: true)
@@ -2941,13 +2941,27 @@ final class AuraMusicCoreTests: XCTestCase {
         let fullURL = docs.appendingPathComponent(relPath)
         try UniversalAudioPlayerEngine.buildSubAudibleKeepAliveWAVData().write(to: fullURL, options: .atomic)
 
+        let coverFileURL = dlDir.appendingPathComponent("dynamic_island_test_cover.jpg")
+        try XCTUnwrap(wideCover.jpegData(compressionQuality: 0.85)).write(to: coverFileURL, options: .atomic)
+
         let track = UniversalTrack(
             provider: .youtubeMusic,
             providerTrackID: "ISLAND_TEST_01",
             title: "Starboy",
             artist: "The Weeknd",
             album: "Starboy",
+            artworkURL: coverFileURL,
             duration: 210.0,
+            isStreamable: true
+        )
+        let trackWithoutCover = UniversalTrack(
+            provider: .youtubeMusic,
+            providerTrackID: "ISLAND_NO_ART_02",
+            title: "No Cover Track",
+            artist: "Test Artist",
+            album: "Single",
+            artworkURL: nil,
+            duration: 180.0,
             isStreamable: true
         )
         let engine = UniversalAudioPlayerEngine.shared
@@ -2955,7 +2969,9 @@ final class AuraMusicCoreTests: XCTestCase {
             engine.pause()
             engine.teardownYouTubeWebViewCompletely()
             OfflineDownloadManager.shared.removeDownload(trackID: track.id)
+            OfflineDownloadManager.shared.removeDownload(trackID: trackWithoutCover.id)
             try? FileManager.default.removeItem(at: fullURL)
+            try? FileManager.default.removeItem(at: coverFileURL)
         }
 
         OfflineDownloadManager.shared.registerCompletedDownloadForTesting(track: track, relativePath: relPath)
@@ -2971,8 +2987,14 @@ final class AuraMusicCoreTests: XCTestCase {
         XCTAssertEqual(info[MPNowPlayingInfoPropertyMediaType] as? UInt, MPNowPlayingInfoMediaType.audio.rawValue)
         XCTAssertEqual(info[MPNowPlayingInfoPropertyIsLiveStream] as? Bool, false)
         XCTAssertEqual(info[MPNowPlayingInfoPropertyPlaybackRate] as? Double ?? 0, 1.0, accuracy: 0.01)
-        XCTAssertNotNil(info[MPMediaItemPropertyArtwork] as? MPMediaItemArtwork, "Dynamic Island leading slot MUST always receive square artwork on frame 0")
+        XCTAssertNotNil(info[MPMediaItemPropertyArtwork] as? MPMediaItemArtwork, "Cached/local original cover MUST publish immediately on frame 0")
         XCTAssertEqual(MPNowPlayingInfoCenter.default().playbackState, .playing)
+
+        // Playing a track without any cached cover MUST NOT flash a synthetic pink placeholder in Dynamic Island
+        OfflineDownloadManager.shared.registerCompletedDownloadForTesting(track: trackWithoutCover, relativePath: relPath)
+        engine.play(trackWithoutCover)
+        let noArtInfo = try XCTUnwrap(MPNowPlayingInfoCenter.default().nowPlayingInfo)
+        XCTAssertNil(noArtInfo[MPMediaItemPropertyArtwork], "Must never publish a synthetic pink placeholder when original artwork isn't loaded yet")
     }
 
     @MainActor
@@ -2994,6 +3016,23 @@ final class AuraMusicCoreTests: XCTestCase {
 
     @MainActor
     func testExpandedPlayerSheetDismissThresholdAndCornerRadiusProgression() {
+        // Continuous offset drives silky slide-up and slide-down with zero abrupt cut-off
+        XCTAssertEqual(
+            AppleMusicPlayerOverlayView.sheetVerticalOffset(isExpanded: true, dragOffset: 0, screenHeight: 852),
+            0,
+            accuracy: 0.01
+        )
+        XCTAssertEqual(
+            AppleMusicPlayerOverlayView.sheetVerticalOffset(isExpanded: true, dragOffset: 145, screenHeight: 852),
+            145,
+            accuracy: 0.01
+        )
+        XCTAssertEqual(
+            AppleMusicPlayerOverlayView.sheetVerticalOffset(isExpanded: false, dragOffset: 0, screenHeight: 852),
+            884,
+            accuracy: 0.01
+        )
+
         // Resting expanded sheet is flush edge-to-edge (0pt corners); dragging downward smoothly rounds corners
         XCTAssertEqual(
             AppleMusicPlayerOverlayView.sheetCornerRadius(isExpanded: true, dragOffset: 0, screenHeight: 852),

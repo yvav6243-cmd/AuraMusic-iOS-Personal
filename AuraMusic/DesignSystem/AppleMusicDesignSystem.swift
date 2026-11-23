@@ -15,6 +15,7 @@ public enum AuraTheme {
 
     public static let springInteractive = Animation.spring(response: 0.42, dampingFraction: 0.86, blendDuration: 0.12)
     public static let springPlayerSheet = Animation.spring(response: 0.44, dampingFraction: 0.90, blendDuration: 0.10)
+    public static let springPlayerDismiss = Animation.spring(response: 0.48, dampingFraction: 0.92, blendDuration: 0.08)
     public static let springBouncy = Animation.spring(response: 0.36, dampingFraction: 0.78, blendDuration: 0.1)
 }
 

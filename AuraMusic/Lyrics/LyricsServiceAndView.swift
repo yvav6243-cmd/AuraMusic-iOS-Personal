@@ -2086,40 +2086,18 @@ public struct SynchronizedLyricsView: View {
 
     private var lyricsHeaderBar: some View {
         HStack(spacing: 8) {
-            if let doc = lyricsService.activeDocument {
+            if let doc = lyricsService.activeDocument,
+               doc.hasTranslationAvailable && lyricsService.lyricsMode == .standard {
                 Button {
-                    if lyricsService.lyricsMode == .custom {
-                        showCustomLyricsStudio = true
+                    withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
+                        showTranslationOverlay.toggle()
                     }
                 } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: lyricsService.lyricsMode == .custom ? "pencil.and.outline" : (doc.isSynchronized ? "waveform" : "text.alignleft"))
-                            .font(.system(size: 11, weight: .bold))
-                        Text(lyricsService.lyricsMode == .custom ? "МОЯ ЛИРИКА" : (doc.isSynchronized ? "APPLE MUSIC SING SYNC" : "LYRICS"))
-                            .font(.system(size: 10, weight: .bold, design: .rounded))
-                        Text("• \(doc.detectedLanguageDisplayName.uppercased())")
-                            .font(.system(size: 10, weight: .bold, design: .rounded))
-                            .lineLimit(1)
-                    }
-                    .foregroundStyle(.white.opacity(0.92))
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 5)
-                    .background(Capsule().fill(.white.opacity(0.18)))
-                }
-                .buttonStyle(.plain)
-
-                if doc.hasTranslationAvailable && lyricsService.lyricsMode == .standard {
-                    Button {
-                        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) {
-                            showTranslationOverlay.toggle()
-                        }
-                    } label: {
-                        Image(systemName: "character.bubble.fill")
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundStyle(showTranslationOverlay ? Color.black : Color.white)
-                            .padding(7)
-                            .background(Circle().fill(showTranslationOverlay ? Color.white : Color.white.opacity(0.18)))
-                    }
+                    Image(systemName: "character.bubble.fill")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(showTranslationOverlay ? Color.black : Color.white)
+                        .padding(7)
+                        .background(Circle().fill(showTranslationOverlay ? Color.white : Color.white.opacity(0.18)))
                 }
             }
 
@@ -2173,7 +2151,7 @@ public struct SynchronizedLyricsView: View {
             }
         }
         .padding(.horizontal, 24)
-        .padding(.vertical, 8)
+        .padding(.vertical, 6)
     }
 
     private func syncActiveLineAndDots(at time: TimeInterval, in doc: TrackLyricsDocument) -> Int? {
@@ -2308,16 +2286,6 @@ public struct SynchronizedLyricsView: View {
     private func unsynchronizedLyricsScroll(doc: TrackLyricsDocument) -> some View {
         ScrollView(.vertical, showsIndicators: false) {
             VStack(alignment: .leading, spacing: 14) {
-                HStack(spacing: 6) {
-                    Image(systemName: "info.circle.fill")
-                    Text("Time-synchronized lyrics are unavailable for this track. Displaying original unsynchronized lyrics.")
-                }
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(.white.opacity(0.75))
-                .padding(10)
-                .background(RoundedRectangle(cornerRadius: 10).fill(.white.opacity(0.12)))
-                .padding(.bottom, 8)
-
                 ForEach(Array(doc.plainLines.enumerated()), id: \.offset) { _, line in
                     Text(line.isEmpty ? " " : line)
                         .font(.system(size: 22, weight: .bold))

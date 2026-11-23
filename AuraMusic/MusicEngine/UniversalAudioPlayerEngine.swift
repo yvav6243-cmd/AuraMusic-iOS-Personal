@@ -193,6 +193,8 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     private var hasReceivedFirstYouTubeProgressTick: Bool = false
     private var fallbackYouTubeVideoIDs: [String] = []
     private var crossfadeTriggeredForCurrentItem = false
+    private var lastPublishedArtworkTrackID: String?
+    private var lastPublishedArtwork: MPMediaItemArtwork?
 
     private let appleProvider = AppleMusicProvider()
     private let audiusProvider = AudiusProvider()
@@ -1837,37 +1839,11 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         }
     }
 
-    private static let defaultFallbackNowPlayingArtworkImage: UIImage = {
-        let dim: CGFloat = 512
-        let format = UIGraphicsImageRendererFormat()
-        format.scale = 1.0
-        format.opaque = true
-        let renderer = UIGraphicsImageRenderer(size: CGSize(width: dim, height: dim), format: format)
-        return renderer.image { ctx in
-            let cg = ctx.cgContext
-            let colors = [
-                UIColor(red: 0.98, green: 0.14, blue: 0.27, alpha: 1.0).cgColor,
-                UIColor(red: 0.48, green: 0.12, blue: 0.52, alpha: 1.0).cgColor
-            ] as CFArray
-            if let grad = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(), colors: colors, locations: [0.0, 1.0]) {
-                cg.drawLinearGradient(
-                    grad,
-                    start: CGPoint(x: 0, y: 0),
-                    end: CGPoint(x: dim, y: dim),
-                    options: []
-                )
-            }
-            if let note = UIImage(systemName: "music.note", withConfiguration: UIImage.SymbolConfiguration(pointSize: 210, weight: .bold))?
-                .withTintColor(.white, renderingMode: .alwaysOriginal) {
-                let sz = note.size
-                note.draw(in: CGRect(x: (dim - sz.width) * 0.5, y: (dim - sz.height) * 0.5, width: sz.width, height: sz.height))
-            }
-        }
-    }()
-
     private func refreshNowPlayingMetadata() {
         let center = MPNowPlayingInfoCenter.default()
         guard let track = currentTrack else {
+            lastPublishedArtworkTrackID = nil
+            lastPublishedArtwork = nil
             center.nowPlayingInfo = nil
             center.playbackState = .stopped
             DynamicIslandNowPlayingCoordinator.shared.updateLiveActivity(
@@ -1896,21 +1872,21 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
             MPNowPlayingInfoPropertyIsLiveStream: false
         ]
 
-        // Synchronously attach 1:1 square artwork immediately on frame 0 so iPhone Dynamic Island
-        // shows the song cover on the left and color-matched real-time bass waveform on the right!
+        // Synchronously attach the TRUE original 1:1 square song cover from RAM or local/disk cache (<2ms).
+        // NEVER flash a synthetic pink fallback placeholder in Dynamic Island!
         let effectiveArtURL = PersistenceController.shared.effectiveArtworkURL(for: track) ?? track.artworkURL
         var attachedImmediateArtwork = false
-        if let artworkURL = effectiveArtURL {
-            if let rawImmediate = ArtworkCacheManager.shared.cachedMemoryImage(for: artworkURL)
-                ?? (artworkURL.isFileURL ? UIImage(contentsOfFile: artworkURL.path) : nil) {
-                let squared = Self.squareNowPlayingArtworkImage(from: rawImmediate)
-                info[MPMediaItemPropertyArtwork] = MPMediaItemArtwork(boundsSize: squared.size) { _ in squared }
-                attachedImmediateArtwork = true
-            }
-        }
-        if !attachedImmediateArtwork {
-            let fallback = Self.defaultFallbackNowPlayingArtworkImage
-            info[MPMediaItemPropertyArtwork] = MPMediaItemArtwork(boundsSize: fallback.size) { _ in fallback }
+        if let artworkURL = effectiveArtURL,
+           let rawImmediate = ArtworkCacheManager.shared.cachedImageSynchronously(for: artworkURL) {
+            let squared = Self.squareNowPlayingArtworkImage(from: rawImmediate)
+            let mpArtwork = MPMediaItemArtwork(boundsSize: squared.size) { _ in squared }
+            info[MPMediaItemPropertyArtwork] = mpArtwork
+            lastPublishedArtworkTrackID = track.id
+            lastPublishedArtwork = mpArtwork
+            attachedImmediateArtwork = true
+        } else if lastPublishedArtworkTrackID == track.id, let preserved = lastPublishedArtwork {
+            info[MPMediaItemPropertyArtwork] = preserved
+            attachedImmediateArtwork = true
         }
 
         center.nowPlayingInfo = info
@@ -1951,6 +1927,8 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
                    self.currentTrack?.id == targetTrackID {
                     let squared = Self.squareNowPlayingArtworkImage(from: image)
                     let artwork = MPMediaItemArtwork(boundsSize: squared.size) { _ in squared }
+                    self.lastPublishedArtworkTrackID = targetTrackID
+                    self.lastPublishedArtwork = artwork
                     let latestRaw = self.duration > 0 ? self.duration : track.duration
                     var latest = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? info
                     latest[MPMediaItemPropertyArtwork] = artwork

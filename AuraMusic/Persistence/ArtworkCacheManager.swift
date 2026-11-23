@@ -32,6 +32,25 @@ public final class ArtworkCacheManager: ObservableObject, @unchecked Sendable {
         return memoryCache.object(forKey: NSString(string: url.absoluteString))
     }
 
+    /// Synchronous RAM + local/disk-cache lookup (< 2ms) so Lock Screen & iPhone Dynamic Island show the true
+    /// original song cover immediately on frame 0 without ever flashing a placeholder image!
+    public func cachedImageSynchronously(for url: URL?) -> UIImage? {
+        guard let url else { return nil }
+        let key = NSString(string: url.absoluteString)
+        if let mem = memoryCache.object(forKey: key) {
+            return mem
+        }
+        let sourceURL = url.isFileURL ? url : diskFileURL(for: url)
+        guard FileManager.default.fileExists(atPath: sourceURL.path),
+              let data = try? Data(contentsOf: sourceURL),
+              let rawImg = UIImage(data: data) else {
+            return nil
+        }
+        let decoded = rawImg.preparingForDisplay() ?? rawImg
+        memoryCache.setObject(decoded, forKey: key)
+        return decoded
+    }
+
     /// Instant O(1) cached dominant color palette for the full-screen Apple Music mesh background
     public func cachedDominantColors(for url: URL?) -> [Color]? {
         guard let url else { return nil }

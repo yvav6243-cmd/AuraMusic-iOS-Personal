@@ -10,7 +10,6 @@ public struct AppleMusicPlayerOverlayView: View {
     @ObservedObject var downloadManager: OfflineDownloadManager = .shared
 
     @State private var dragOffset: CGFloat = 0
-    @State private var dragResetTask: Task<Void, Never>?
     @State private var isPlayPauseCoolingDown: Bool = false
     @State private var playPauseCooldownResetTask: Task<Void, Never>?
     @State private var showAddToPlaylistSheet: Bool = false
@@ -29,13 +28,24 @@ public struct AppleMusicPlayerOverlayView: View {
         return min(340, min(widthBound, heightBound))
     }
 
-    /// Computes progressive iOS sheet top corner radius as the user pulls the expanded player downward.
+    /// Computes the continuous vertical sheet offset: `0` when resting expanded, `dragOffset` while pulling down,
+    /// and `screenHeight + 32` (just below bottom edge) when collapsed — keeping the view mounted guarantees
+    /// SwiftUI NEVER abruptly cuts off the dismiss animation!
+    public static func sheetVerticalOffset(
+        isExpanded: Bool,
+        dragOffset: CGFloat,
+        screenHeight: CGFloat
+    ) -> CGFloat {
+        isExpanded ? max(0, dragOffset) : (max(screenHeight, 568) + 32)
+    }
+
+    /// Computes progressive iOS sheet top corner radius as the user pulls or dismisses the expanded player downward.
     public static func sheetCornerRadius(
         isExpanded: Bool,
         dragOffset: CGFloat,
         screenHeight: CGFloat
     ) -> CGFloat {
-        guard isExpanded else { return 36 }
+        guard isExpanded else { return 38 }
         let clampedDrag = max(0, dragOffset)
         guard clampedDrag > 2 else { return 0 }
         let progress = min(1.0, clampedDrag / max(screenHeight * 0.45, 1))
@@ -60,6 +70,11 @@ public struct AppleMusicPlayerOverlayView: View {
             let fullHeight = max(safeGeo.size.height + safeTop + safeBottom, 568)
             let isExpanded = player.isPlayerExpanded
             let activeDrag = max(0, dragOffset)
+            let sheetOffsetY = Self.sheetVerticalOffset(
+                isExpanded: isExpanded,
+                dragOffset: activeDrag,
+                screenHeight: fullHeight
+            )
             let dismissProgress = isExpanded ? min(1.0, activeDrag / max(fullHeight * 0.55, 1)) : 1.0
             let cardCornerRadius = Self.sheetCornerRadius(
                 isExpanded: isExpanded,
@@ -87,7 +102,6 @@ public struct AppleMusicPlayerOverlayView: View {
                         .scaleEffect(isExpanded ? (0.95 + 0.05 * dismissProgress) : 1.0, anchor: .bottom)
                         .offset(y: isExpanded ? (12 * (1.0 - dismissProgress)) : 0)
                         .allowsHitTesting(!isExpanded)
-                        .animation(AuraTheme.springPlayerSheet, value: isExpanded)
                         .zIndex(10)
                 }
             }
@@ -95,47 +109,31 @@ public struct AppleMusicPlayerOverlayView: View {
             .overlay {
                 if let track = player.currentTrack {
                     ZStack(alignment: .bottom) {
-                        // Soft dimming backdrop behind the sheet — lightens smoothly as user drags down
+                        // Soft dimming backdrop behind the sheet — lightens smoothly as user drags/closes
                         Color.black
                             .opacity(isExpanded ? max(0, 0.48 * (1.0 - dismissProgress)) : 0)
                             .allowsHitTesting(isExpanded)
-                            .animation(AuraTheme.springPlayerSheet, value: isExpanded)
                             .zIndex(15)
 
-                        // Unified Full-Screen Player Sheet: background, artwork, title & controls travel as ONE
-                        // synchronized surface so text never appears ahead of the sheet and dismissing is silky-smooth!
-                        if isExpanded {
-                            expandedFullScreenPlayer(
-                                track: track,
-                                containerSize: CGSize(width: fullWidth, height: fullHeight),
-                                safeTop: safeTop,
-                                safeBottom: safeBottom
-                            )
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
-                            .clipShape(RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous))
-                            .shadow(color: .black.opacity(activeDrag > 2 ? 0.42 : 0.0), radius: 26, y: -4)
-                            .offset(y: activeDrag)
-                            .transition(.move(edge: .bottom))
-                            .zIndex(20)
-                        }
+                        // Permanently-mounted Full-Screen Player Sheet driven by continuous offset(y:):
+                        // guarantees 100% silky 120 FPS slide-up on open and slide-down on close — NEVER snaps or disappears abruptly!
+                        expandedFullScreenPlayer(
+                            track: track,
+                            containerSize: CGSize(width: fullWidth, height: fullHeight),
+                            safeTop: safeTop,
+                            safeBottom: safeBottom,
+                            isVisible: isExpanded
+                        )
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .clipShape(RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous))
+                        .shadow(color: .black.opacity(isExpanded && activeDrag > 2 ? 0.42 : 0.0), radius: 26, y: -4)
+                        .offset(y: sheetOffsetY)
+                        .allowsHitTesting(isExpanded)
+                        .accessibilityHidden(!isExpanded)
+                        .zIndex(20)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                     .ignoresSafeArea()
-                    .animation(AuraTheme.springPlayerSheet, value: isExpanded)
-                }
-            }
-        }
-        .onChange(of: player.isPlayerExpanded) { _, newExpanded in
-            dragResetTask?.cancel()
-            if newExpanded {
-                dragOffset = 0
-            } else {
-                // Preserve dragOffset during the exit slide-out so dismissal continues smoothly from finger position,
-                // then clear cleanly once the sheet finishes exiting off-screen.
-                dragResetTask = Task { @MainActor in
-                    try? await Task.sleep(nanoseconds: 480_000_000)
-                    guard !Task.isCancelled, !player.isPlayerExpanded else { return }
-                    dragOffset = 0
                 }
             }
         }
@@ -146,20 +144,16 @@ public struct AppleMusicPlayerOverlayView: View {
     }
 
     private func openExpandedPlayer() {
-        dragResetTask?.cancel()
         dragOffset = 0
         withAnimation(AuraTheme.springPlayerSheet) {
             player.isPlayerExpanded = true
         }
     }
 
-    private func closeExpandedPlayer(resetOffsetImmediately: Bool) {
-        dragResetTask?.cancel()
-        if resetOffsetImmediately {
-            dragOffset = 0
-        }
-        withAnimation(AuraTheme.springPlayerSheet) {
+    private func closeExpandedPlayer() {
+        withAnimation(AuraTheme.springPlayerDismiss) {
             player.isPlayerExpanded = false
+            dragOffset = 0
         }
     }
 
@@ -289,8 +283,8 @@ public struct AppleMusicPlayerOverlayView: View {
                     predictedEndHeight: value.predictedEndTranslation.height,
                     horizontalTranslation: value.translation.width
                 ) {
-                    // Keep current dragOffset so the sheet continues sliding smoothly downward from the user's finger!
-                    closeExpandedPlayer(resetOffsetImmediately: false)
+                    // Continuous offset interpolation from current finger dragOffset -> fullHeight + 32!
+                    closeExpandedPlayer()
                 } else {
                     withAnimation(AuraTheme.springPlayerSheet) {
                         dragOffset = 0
@@ -303,13 +297,14 @@ public struct AppleMusicPlayerOverlayView: View {
         track: UniversalTrack,
         containerSize: CGSize,
         safeTop: CGFloat,
-        safeBottom: CGFloat
+        safeBottom: CGFloat,
+        isVisible: Bool
     ) -> some View {
         let effectiveArt = persistence.effectiveArtworkURL(for: track) ?? track.artworkURL
         let artworkSize = Self.preferredExpandedArtworkSize(for: containerSize)
 
         return ZStack {
-            DynamicArtworkMeshBackground(artworkURL: effectiveArt, isAnimating: player.isPlaying)
+            DynamicArtworkMeshBackground(artworkURL: effectiveArt, isAnimating: isVisible && player.isPlaying)
                 .equatable()
 
             VStack(spacing: 0) {
@@ -323,7 +318,7 @@ public struct AppleMusicPlayerOverlayView: View {
                         .frame(maxWidth: .infinity)
                         .contentShape(Rectangle())
                         .onTapGesture {
-                            closeExpandedPlayer(resetOffsetImmediately: true)
+                            closeExpandedPlayer()
                         }
 
                     // Compact Header when Lyrics or Up Next is active
@@ -364,7 +359,7 @@ public struct AppleMusicPlayerOverlayView: View {
                             .transition(.opacity)
                     }
 
-                    ExpandedPlaybackScrubberView(track: track, player: player)
+                    ExpandedPlaybackScrubberView(track: track, player: player, isVisible: isVisible)
 
                     primaryTransportControls
 
@@ -883,6 +878,7 @@ private struct AuraTactileTransportButtonStyle: ButtonStyle {
 private struct ExpandedPlaybackScrubberView: View {
     let track: UniversalTrack
     let player: UniversalAudioPlayerEngine
+    let isVisible: Bool
     @ObservedObject private var clock: PlaybackClock = .shared
     @Environment(\.scenePhase) private var scenePhase
 
@@ -897,7 +893,7 @@ private struct ExpandedPlaybackScrubberView: View {
             ? scrubTimeValue
             : max(0, min(displayTotal, clock.currentTime - bounds.start))
         let remaining = max(0, displayTotal - labelTime)
-        let shouldAnimateBar = player.isPlaying && !player.isBuffering && !isScrubbing && scenePhase == .active
+        let shouldAnimateBar = isVisible && player.isPlaying && !player.isBuffering && !isScrubbing && scenePhase == .active
 
         VStack(spacing: 8) {
             SmoothAppleMusicScrubberBar(
