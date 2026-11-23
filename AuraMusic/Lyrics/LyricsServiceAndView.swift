@@ -718,8 +718,13 @@ public final class LyricsService: ObservableObject {
     }
 
     public func loadLyrics(for track: UniversalTrack, forceReload: Bool = false) async {
-        // Restore per-track persistent mode: user's custom lyrics ONLY if previously enabled for THIS song; otherwise original lyrics!
+        // Restore per-track persistent mode and clear stale lyrics from the previous track immediately
+        // so the previous song's text NEVER flashes on the newly opened song!
         if loadedTrackID != track.id || forceReload {
+            if loadedTrackID != track.id {
+                self.currentDocument = nil
+                self.errorMessage = nil
+            }
             let savedCustom = loadCachedCustomLyrics(for: track)
             self.customDocument = savedCustom
             let preferred = preferredLyricsMode(for: track)
@@ -2242,6 +2247,18 @@ public struct SynchronizedLyricsView: View {
                 .id(doc.id)
                 .padding(.horizontal, 20)
             }
+            .mask(
+                LinearGradient(
+                    stops: [
+                        .init(color: .clear, location: 0.0),
+                        .init(color: .black, location: 0.06),
+                        .init(color: .black, location: 0.90),
+                        .init(color: .clear, location: 1.0)
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            )
             .simultaneousGesture(
                 DragGesture(minimumDistance: 12)
                     .onChanged { _ in
@@ -2313,6 +2330,18 @@ public struct SynchronizedLyricsView: View {
             .padding(.horizontal, 26)
             .padding(.top, 16)
         }
+        .mask(
+            LinearGradient(
+                stops: [
+                    .init(color: .clear, location: 0.0),
+                    .init(color: .black, location: 0.05),
+                    .init(color: .black, location: 0.90),
+                    .init(color: .clear, location: 1.0)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        )
     }
 
     private var manualLyricsSearchSheet: some View {

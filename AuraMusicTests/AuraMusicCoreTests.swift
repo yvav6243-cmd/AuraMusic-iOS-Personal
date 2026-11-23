@@ -2974,4 +2974,50 @@ final class AuraMusicCoreTests: XCTestCase {
         XCTAssertNotNil(info[MPMediaItemPropertyArtwork] as? MPMediaItemArtwork, "Dynamic Island leading slot MUST always receive square artwork on frame 0")
         XCTAssertEqual(MPNowPlayingInfoCenter.default().playbackState, .playing)
     }
+
+    @MainActor
+    func testExpandedPlayerArtworkSizeAdaptsCleanlyAcrossAlliPhoneScreenSizes() {
+        // iPhone SE (375×667) — must shrink cleanly so artwork never pushes bottom controls off-screen
+        let seSize = AppleMusicPlayerOverlayView.preferredExpandedArtworkSize(for: CGSize(width: 375, height: 667))
+        XCTAssertGreaterThanOrEqual(seSize, 220)
+        XCTAssertLessThanOrEqual(seSize, 250)
+
+        // iPhone 15 / 16 (393×852) — balanced lush Apple Music cover
+        let regularSize = AppleMusicPlayerOverlayView.preferredExpandedArtworkSize(for: CGSize(width: 393, height: 852))
+        XCTAssertGreaterThanOrEqual(regularSize, 295)
+        XCTAssertLessThanOrEqual(regularSize, 320)
+
+        // iPhone 16 Pro Max (440×956) — capped cleanly at 340pt
+        let proMaxSize = AppleMusicPlayerOverlayView.preferredExpandedArtworkSize(for: CGSize(width: 440, height: 956))
+        XCTAssertEqual(proMaxSize, 340, accuracy: 0.5)
+    }
+
+    @MainActor
+    func testExpandedPlayerSheetDismissThresholdAndCornerRadiusProgression() {
+        // Resting expanded sheet is flush edge-to-edge (0pt corners); dragging downward smoothly rounds corners
+        XCTAssertEqual(
+            AppleMusicPlayerOverlayView.sheetCornerRadius(isExpanded: true, dragOffset: 0, screenHeight: 852),
+            0,
+            accuracy: 0.01
+        )
+        let midDragRadius = AppleMusicPlayerOverlayView.sheetCornerRadius(isExpanded: true, dragOffset: 120, screenHeight: 852)
+        XCTAssertGreaterThan(midDragRadius, 18)
+        XCTAssertLessThanOrEqual(midDragRadius, 44)
+
+        // Small accidental tap/nudge must NOT dismiss
+        XCTAssertFalse(
+            AppleMusicPlayerOverlayView.shouldDismissSheet(translationHeight: 40, predictedEndHeight: 60, horizontalTranslation: 5)
+        )
+        // Diagonal horizontal swipe must NOT dismiss
+        XCTAssertFalse(
+            AppleMusicPlayerOverlayView.shouldDismissSheet(translationHeight: 130, predictedEndHeight: 180, horizontalTranslation: 150)
+        )
+        // Deliberate downward drag or fast downward flick MUST dismiss cleanly
+        XCTAssertTrue(
+            AppleMusicPlayerOverlayView.shouldDismissSheet(translationHeight: 130, predictedEndHeight: 150, horizontalTranslation: 10)
+        )
+        XCTAssertTrue(
+            AppleMusicPlayerOverlayView.shouldDismissSheet(translationHeight: 70, predictedEndHeight: 300, horizontalTranslation: 8)
+        )
+    }
 }

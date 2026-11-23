@@ -421,7 +421,8 @@ public struct PlaylistDetailView: View {
                             .shadow(color: .black.opacity(0.25), radius: 16, y: 8)
                     } else {
                         AuraArtworkView(
-                            url: playlist.coverArtworkURLString.flatMap(URL.init(string:)) ?? tracks.first?.artworkURL,
+                            url: playlist.coverArtworkURLString.flatMap(URL.init(string:))
+                                ?? tracks.first.flatMap { persistence.effectiveArtworkURL(for: $0) },
                             size: 210,
                             cornerRadius: 14,
                             placeholderSymbol: playlist.isSmartPlaylist ? "gearshape.2.fill" : "music.note.list"
@@ -603,6 +604,7 @@ public struct PlaylistDetailView: View {
                 }
             }
         }
+        .contentMargins(.bottom, 88, for: .scrollContent)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {

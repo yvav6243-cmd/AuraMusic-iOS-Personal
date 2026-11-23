@@ -9,8 +9,8 @@ public struct AppleMusicPlayerOverlayView: View {
     @ObservedObject var persistence: PersistenceController = .shared
     @ObservedObject var downloadManager: OfflineDownloadManager = .shared
 
-    @Namespace private var playerAnimationNamespace
     @State private var dragOffset: CGFloat = 0
+    @State private var dragResetTask: Task<Void, Never>?
     @State private var isPlayPauseCoolingDown: Bool = false
     @State private var playPauseCooldownResetTask: Task<Void, Never>?
     @State private var showAddToPlaylistSheet: Bool = false
@@ -21,35 +21,145 @@ public struct AppleMusicPlayerOverlayView: View {
 
     public init() {}
 
-    public var body: some View {
-        ZStack(alignment: .bottom) {
-            // Single persistent YouTube Music engine instance — kept inside screen bounds so iOS WebKit never throttles timers, 100% invisible
-            if let videoID = player.activeYouTubeVideoID {
-                AuthorizedYouTubeIFramePlayerView(videoID: videoID)
-                    .frame(width: 8, height: 8)
-                    .opacity(0.005)
-                    .allowsHitTesting(false)
-                    .zIndex(-10)
-            }
+    /// Computes an ideal responsive 1:1 album cover size so the expanded player never clips or crowds
+    /// controls on iPhone SE / mini (small screens) while staying lush and full-sized on 6.1" and Pro Max models.
+    public static func preferredExpandedArtworkSize(for containerSize: CGSize) -> CGFloat {
+        let widthBound = max(180, containerSize.width - 56)
+        let heightBound = max(190, containerSize.height * 0.36)
+        return min(340, min(widthBound, heightBound))
+    }
 
-            if let track = player.currentTrack {
-                if player.isPlayerExpanded {
-                    expandedFullScreenPlayer(track: track)
-                        .transition(.asymmetric(insertion: .move(edge: .bottom), removal: .move(edge: .bottom)))
-                        .zIndex(20)
-                } else {
+    /// Computes progressive iOS sheet top corner radius as the user pulls the expanded player downward.
+    public static func sheetCornerRadius(
+        isExpanded: Bool,
+        dragOffset: CGFloat,
+        screenHeight: CGFloat
+    ) -> CGFloat {
+        guard isExpanded else { return 36 }
+        let clampedDrag = max(0, dragOffset)
+        guard clampedDrag > 2 else { return 0 }
+        let progress = min(1.0, clampedDrag / max(screenHeight * 0.45, 1))
+        return min(44, 18 + progress * 26)
+    }
+
+    /// Determines whether a downward swipe (or fast downward flick) on the player handle should dismiss the player.
+    public static func shouldDismissSheet(
+        translationHeight: CGFloat,
+        predictedEndHeight: CGFloat,
+        horizontalTranslation: CGFloat
+    ) -> Bool {
+        let verticalDominant = abs(translationHeight) > abs(horizontalTranslation) * 1.1
+        return verticalDominant && (translationHeight > 110 || predictedEndHeight > 260)
+    }
+
+    public var body: some View {
+        GeometryReader { safeGeo in
+            let safeTop = safeGeo.safeAreaInsets.top
+            let safeBottom = safeGeo.safeAreaInsets.bottom
+            let fullWidth = max(safeGeo.size.width + safeGeo.safeAreaInsets.leading + safeGeo.safeAreaInsets.trailing, 320)
+            let fullHeight = max(safeGeo.size.height + safeTop + safeBottom, 568)
+            let isExpanded = player.isPlayerExpanded
+            let activeDrag = max(0, dragOffset)
+            let dismissProgress = isExpanded ? min(1.0, activeDrag / max(fullHeight * 0.55, 1)) : 1.0
+            let cardCornerRadius = Self.sheetCornerRadius(
+                isExpanded: isExpanded,
+                dragOffset: activeDrag,
+                screenHeight: fullHeight
+            )
+
+            ZStack(alignment: .bottom) {
+                // Single persistent YouTube Music engine instance — kept inside screen bounds so iOS WebKit never throttles timers, 100% invisible
+                if let videoID = player.activeYouTubeVideoID {
+                    AuthorizedYouTubeIFramePlayerView(videoID: videoID)
+                        .frame(width: 8, height: 8)
+                        .opacity(0.005)
+                        .allowsHitTesting(false)
+                        .zIndex(-10)
+                }
+
+                // Persistent Floating Mini-Player Bar: stays mounted cleanly in safe area so expanding/closing
+                // smoothly fades & settles it without ever shooting the artwork icon off to the screen edge!
+                if let track = player.currentTrack {
                     floatingMiniPlayerBar(track: track)
                         .padding(.horizontal, 12)
                         .padding(.bottom, 54)
-                        .transition(.opacity)
+                        .opacity(isExpanded ? min(1.0, dismissProgress * 1.35) : 1.0)
+                        .scaleEffect(isExpanded ? (0.95 + 0.05 * dismissProgress) : 1.0, anchor: .bottom)
+                        .offset(y: isExpanded ? (12 * (1.0 - dismissProgress)) : 0)
+                        .allowsHitTesting(!isExpanded)
+                        .animation(AuraTheme.springPlayerSheet, value: isExpanded)
                         .zIndex(10)
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+            .overlay {
+                if let track = player.currentTrack {
+                    ZStack(alignment: .bottom) {
+                        // Soft dimming backdrop behind the sheet — lightens smoothly as user drags down
+                        Color.black
+                            .opacity(isExpanded ? max(0, 0.48 * (1.0 - dismissProgress)) : 0)
+                            .allowsHitTesting(isExpanded)
+                            .animation(AuraTheme.springPlayerSheet, value: isExpanded)
+                            .zIndex(15)
+
+                        // Unified Full-Screen Player Sheet: background, artwork, title & controls travel as ONE
+                        // synchronized surface so text never appears ahead of the sheet and dismissing is silky-smooth!
+                        if isExpanded {
+                            expandedFullScreenPlayer(
+                                track: track,
+                                containerSize: CGSize(width: fullWidth, height: fullHeight),
+                                safeTop: safeTop,
+                                safeBottom: safeBottom
+                            )
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .clipShape(RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous))
+                            .shadow(color: .black.opacity(activeDrag > 2 ? 0.42 : 0.0), radius: 26, y: -4)
+                            .offset(y: activeDrag)
+                            .transition(.move(edge: .bottom))
+                            .zIndex(20)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                    .ignoresSafeArea()
+                    .animation(AuraTheme.springPlayerSheet, value: isExpanded)
+                }
+            }
         }
-        .animation(AuraTheme.springInteractive, value: player.isPlayerExpanded)
+        .onChange(of: player.isPlayerExpanded) { _, newExpanded in
+            dragResetTask?.cancel()
+            if newExpanded {
+                dragOffset = 0
+            } else {
+                // Preserve dragOffset during the exit slide-out so dismissal continues smoothly from finger position,
+                // then clear cleanly once the sheet finishes exiting off-screen.
+                dragResetTask = Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 480_000_000)
+                    guard !Task.isCancelled, !player.isPlayerExpanded else { return }
+                    dragOffset = 0
+                }
+            }
+        }
         .onChange(of: player.currentTrack?.id) { _, _ in
             playPauseCooldownResetTask?.cancel()
             isPlayPauseCoolingDown = false
+        }
+    }
+
+    private func openExpandedPlayer() {
+        dragResetTask?.cancel()
+        dragOffset = 0
+        withAnimation(AuraTheme.springPlayerSheet) {
+            player.isPlayerExpanded = true
+        }
+    }
+
+    private func closeExpandedPlayer(resetOffsetImmediately: Bool) {
+        dragResetTask?.cancel()
+        if resetOffsetImmediately {
+            dragOffset = 0
+        }
+        withAnimation(AuraTheme.springPlayerSheet) {
+            player.isPlayerExpanded = false
         }
     }
 
@@ -68,10 +178,10 @@ public struct AppleMusicPlayerOverlayView: View {
     // MARK: - 1. Floating Apple Music Mini-Player Bar
 
     private func floatingMiniPlayerBar(track: UniversalTrack) -> some View {
-        HStack(spacing: 10) {
+        let effectiveArt = persistence.effectiveArtworkURL(for: track) ?? track.artworkURL
+        return HStack(spacing: 10) {
             HStack(spacing: 12) {
-                AuraArtworkView(url: track.artworkURL, size: 42, cornerRadius: 8)
-                    .matchedGeometryEffect(id: "playerArtwork", in: playerAnimationNamespace)
+                AuraArtworkView(url: effectiveArt, size: 42, cornerRadius: 8)
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text(track.title)
@@ -89,9 +199,7 @@ public struct AppleMusicPlayerOverlayView: View {
             }
             .contentShape(Rectangle())
             .onTapGesture {
-                withAnimation(AuraTheme.springInteractive) {
-                    player.isPlayerExpanded = true
-                }
+                openExpandedPlayer()
             }
 
             HStack(spacing: 6) {
@@ -148,12 +256,10 @@ public struct AppleMusicPlayerOverlayView: View {
                 .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
         )
         .simultaneousGesture(
-            DragGesture(minimumDistance: 24)
+            DragGesture(minimumDistance: 20)
                 .onEnded { value in
-                    if value.translation.height < -30 && abs(value.translation.height) > abs(value.translation.width) {
-                        withAnimation(AuraTheme.springInteractive) {
-                            player.isPlayerExpanded = true
-                        }
+                    if value.translation.height < -24 && abs(value.translation.height) > abs(value.translation.width) {
+                        openExpandedPlayer()
                     }
                 }
         )
@@ -171,75 +277,91 @@ public struct AppleMusicPlayerOverlayView: View {
     }
 
     private var dismissHandleDragGesture: some Gesture {
-        DragGesture(minimumDistance: 24)
+        DragGesture(minimumDistance: 18)
             .onChanged { value in
-                if value.translation.height > 16 && abs(value.translation.height) > abs(value.translation.width) * 1.3 {
+                if value.translation.height > 8 && abs(value.translation.height) > abs(value.translation.width) * 1.2 {
                     dragOffset = value.translation.height
                 }
             }
             .onEnded { value in
-                if value.translation.height > 120 && abs(value.translation.height) > abs(value.translation.width) * 1.1 {
-                    withAnimation(AuraTheme.springInteractive) {
-                        dragOffset = 0
-                        player.isPlayerExpanded = false
-                    }
+                if Self.shouldDismissSheet(
+                    translationHeight: value.translation.height,
+                    predictedEndHeight: value.predictedEndTranslation.height,
+                    horizontalTranslation: value.translation.width
+                ) {
+                    // Keep current dragOffset so the sheet continues sliding smoothly downward from the user's finger!
+                    closeExpandedPlayer(resetOffsetImmediately: false)
                 } else {
-                    withAnimation(AuraTheme.springInteractive) {
+                    withAnimation(AuraTheme.springPlayerSheet) {
                         dragOffset = 0
                     }
                 }
             }
     }
 
-    private func expandedFullScreenPlayer(track: UniversalTrack) -> some View {
-        ZStack {
-            DynamicArtworkMeshBackground(artworkURL: track.artworkURL, isAnimating: player.isPlaying)
+    private func expandedFullScreenPlayer(
+        track: UniversalTrack,
+        containerSize: CGSize,
+        safeTop: CGFloat,
+        safeBottom: CGFloat
+    ) -> some View {
+        let effectiveArt = persistence.effectiveArtworkURL(for: track) ?? track.artworkURL
+        let artworkSize = Self.preferredExpandedArtworkSize(for: containerSize)
+
+        return ZStack {
+            DynamicArtworkMeshBackground(artworkURL: effectiveArt, isAnimating: player.isPlaying)
                 .equatable()
 
             VStack(spacing: 0) {
                 // Top Dismiss Handle Zone (Grabber Pill + Compact Header) — always allows clean swipe-down to close
                 VStack(spacing: 0) {
                     Capsule()
-                        .fill(Color.white.opacity(0.4))
-                        .frame(width: 38, height: 5)
-                        .padding(.top, 12)
-                        .padding(.bottom, 10)
+                        .fill(Color.white.opacity(0.42))
+                        .frame(width: 40, height: 5)
+                        .padding(.top, max(safeTop, 14) + 6)
+                        .padding(.bottom, 12)
                         .frame(maxWidth: .infinity)
                         .contentShape(Rectangle())
                         .onTapGesture {
-                            withAnimation(AuraTheme.springInteractive) {
-                                player.isPlayerExpanded = false
-                            }
+                            closeExpandedPlayer(resetOffsetImmediately: true)
                         }
 
                     // Compact Header when Lyrics or Up Next is active
                     if player.activeOverlayTab != .none {
-                        compactNowPlayingHeader(track: track)
+                        compactNowPlayingHeader(track: track, artworkURL: effectiveArt)
                             .padding(.horizontal, 24)
                             .padding(.bottom, 8)
+                            .transition(.opacity.combined(with: .move(edge: .top)))
                     }
                 }
                 .contentShape(Rectangle())
                 .simultaneousGesture(dismissHandleDragGesture)
 
                 // Main Content Area: Standard Artwork View OR Synchronized Lyrics OR Up Next Queue
-                switch player.activeOverlayTab {
-                case .none:
-                    standardArtworkCenterSection(track: track)
-                        .contentShape(Rectangle())
-                        .simultaneousGesture(dismissHandleDragGesture)
-                case .lyrics:
-                    SynchronizedLyricsView(player: player)
-                case .upNext:
-                    upNextQueueOverlaySection(track: track)
+                Group {
+                    switch player.activeOverlayTab {
+                    case .none:
+                        standardArtworkCenterSection(track: track, artworkURL: effectiveArt, artworkSize: artworkSize)
+                            .contentShape(Rectangle())
+                            .simultaneousGesture(dismissHandleDragGesture)
+                            .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                    case .lyrics:
+                        SynchronizedLyricsView(player: player)
+                            .transition(.opacity)
+                    case .upNext:
+                        upNextQueueOverlaySection(track: track)
+                            .transition(.opacity)
+                    }
                 }
+                .animation(AuraTheme.springInteractive, value: player.activeOverlayTab)
 
-                Spacer(minLength: 10)
+                Spacer(minLength: 8)
 
                 // Track Info, Scrubber, Transport Controls & Bottom Mode Bar
-                VStack(spacing: 18) {
+                VStack(spacing: 16) {
                     if player.activeOverlayTab == .none {
                         trackTitleAndActionsRow(track: track)
+                            .transition(.opacity)
                     }
 
                     ExpandedPlaybackScrubberView(track: track, player: player)
@@ -251,13 +373,14 @@ public struct AppleMusicPlayerOverlayView: View {
                     bottomModeToggleButtons
                 }
                 .padding(.horizontal, 26)
-                .padding(.bottom, 28)
+                .padding(.bottom, max(safeBottom, 16) + 10)
             }
-            .offset(y: max(0, dragOffset))
         }
         .environment(\.colorScheme, .dark)
         .onChange(of: player.activeOverlayTab) { _, _ in
-            dragOffset = 0
+            withAnimation(AuraTheme.springInteractive) {
+                dragOffset = 0
+            }
         }
         .sheet(isPresented: $showAddToPlaylistSheet) {
             AddToPlaylistPickerSheet(track: track)
@@ -287,18 +410,17 @@ public struct AppleMusicPlayerOverlayView: View {
 
     // MARK: - Center Artwork / Pure Apple Music Square Cover Section
 
-    private func standardArtworkCenterSection(track: UniversalTrack) -> some View {
+    private func standardArtworkCenterSection(track: UniversalTrack, artworkURL: URL?, artworkSize: CGFloat) -> some View {
         VStack(spacing: 14) {
-            Spacer(minLength: 6)
+            Spacer(minLength: 4)
 
             AuraArtworkView(
-                url: track.artworkURL,
-                size: 315,
+                url: artworkURL,
+                size: artworkSize,
                 cornerRadius: AuraTheme.expandedArtworkCornerRadius,
                 isPlayingElevated: player.isPlaying
             )
-            .matchedGeometryEffect(id: "playerArtwork", in: playerAnimationNamespace)
-            .scaleEffect(player.isPlaying ? 1.0 : 0.84)
+            .scaleEffect(player.isPlaying ? 1.0 : 0.86)
             .animation(AuraTheme.springBouncy, value: player.isPlaying)
 
             // Live Synchronized Lyric Line Preview Pill (isolated from main player redraws -> 120 FPS!)
@@ -313,10 +435,9 @@ public struct AppleMusicPlayerOverlayView: View {
         }
     }
 
-    private func compactNowPlayingHeader(track: UniversalTrack) -> some View {
+    private func compactNowPlayingHeader(track: UniversalTrack, artworkURL: URL?) -> some View {
         HStack(spacing: 12) {
-            AuraArtworkView(url: track.artworkURL, size: 48, cornerRadius: 8)
-                .matchedGeometryEffect(id: "playerArtwork", in: playerAnimationNamespace)
+            AuraArtworkView(url: artworkURL, size: 48, cornerRadius: 8)
                 .onTapGesture {
                     withAnimation(AuraTheme.springInteractive) {
                         player.activeOverlayTab = .none
@@ -701,7 +822,11 @@ public struct AppleMusicPlayerOverlayView: View {
                 List {
                     ForEach(player.upNextQueue) { queuedTrack in
                         HStack(spacing: 12) {
-                            AuraArtworkView(url: queuedTrack.artworkURL, size: 44, cornerRadius: 7)
+                            AuraArtworkView(
+                                url: persistence.effectiveArtworkURL(for: queuedTrack) ?? queuedTrack.artworkURL,
+                                size: 44,
+                                cornerRadius: 7
+                            )
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(queuedTrack.title)
                                     .font(.system(size: 15, weight: .semibold))
@@ -901,6 +1026,7 @@ private struct LiveLyricPreviewPillView: View {
                         .font(.system(size: 14, weight: .bold))
                         .foregroundStyle(.white)
                         .lineLimit(1)
+                        .contentTransition(.opacity)
                 } else if lyricsService.isLoading {
                     Text("Loading Synchronized Lyrics…")
                         .font(.system(size: 13, weight: .semibold))
@@ -914,6 +1040,7 @@ private struct LiveLyricPreviewPillView: View {
                     .font(.system(size: 10, weight: .bold))
                     .foregroundStyle(.white.opacity(0.6))
             }
+            .animation(.easeInOut(duration: 0.2), value: displayedLine)
             .padding(.horizontal, 16)
             .padding(.vertical, 9)
             .background(

@@ -13,8 +13,9 @@ public enum AuraTheme {
     public static let miniPlayerHeight: CGFloat = 60
     public static let horizontalMargin: CGFloat = 20
 
-    public static let springInteractive = Animation.spring(response: 0.42, dampingFraction: 0.84, blendDuration: 0.15)
-    public static let springBouncy = Animation.spring(response: 0.36, dampingFraction: 0.72, blendDuration: 0.1)
+    public static let springInteractive = Animation.spring(response: 0.42, dampingFraction: 0.86, blendDuration: 0.12)
+    public static let springPlayerSheet = Animation.spring(response: 0.44, dampingFraction: 0.90, blendDuration: 0.10)
+    public static let springBouncy = Animation.spring(response: 0.36, dampingFraction: 0.78, blendDuration: 0.1)
 }
 
 // MARK: - Cached Artwork View with Apple Music Specular Rim & Shadow
@@ -71,7 +72,9 @@ public struct AuraArtworkView: View, Equatable {
                     .resizable()
                     .scaledToFill()
                     .frame(width: size, height: size)
+                    .clipped()
                     .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+                    .transition(.opacity)
             } else {
                 Image(systemName: placeholderSymbol)
                     .font(.system(size: size * 0.34, weight: .medium))
@@ -79,6 +82,7 @@ public struct AuraArtworkView: View, Equatable {
             }
         }
         .frame(width: size, height: size)
+        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
                 .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
@@ -98,7 +102,125 @@ public struct AuraArtworkView: View, Equatable {
                 loadedImage = memHit
                 return
             }
-            loadedImage = await ArtworkCacheManager.shared.image(for: url)
+            let fetched = await ArtworkCacheManager.shared.image(for: url)
+            withAnimation(.easeOut(duration: 0.2)) {
+                loadedImage = fetched
+            }
+        }
+    }
+}
+
+/// Adaptive 1:1 square artwork view that automatically fills any flexible LazyVGrid column cleanly across SE, 6.1", and Pro Max screens.
+public struct AuraFlexibleArtworkView: View {
+    public let url: URL?
+    public var cornerRadius: CGFloat = AuraTheme.artworkCornerRadius
+    public var placeholderSymbol: String = "music.note"
+
+    @State private var loadedImage: UIImage?
+    @Environment(\.colorScheme) private var colorScheme
+
+    public init(url: URL?, cornerRadius: CGFloat = AuraTheme.artworkCornerRadius, placeholderSymbol: String = "music.note") {
+        self.url = url
+        self.cornerRadius = cornerRadius
+        self.placeholderSymbol = placeholderSymbol
+        self._loadedImage = State(initialValue: ArtworkCacheManager.shared.cachedMemoryImage(for: url))
+    }
+
+    public var body: some View {
+        let displayImage = loadedImage ?? ArtworkCacheManager.shared.cachedMemoryImage(for: url)
+        GeometryReader { geo in
+            let side = max(geo.size.width, 1)
+            ZStack {
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: colorScheme == .dark
+                                ? [Color(white: 0.18), Color(white: 0.11)]
+                                : [Color(white: 0.92), Color(white: 0.84)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                if let displayImage {
+                    Image(uiImage: displayImage)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: side, height: side)
+                        .clipped()
+                } else {
+                    Image(systemName: placeholderSymbol)
+                        .font(.system(size: side * 0.32, weight: .medium))
+                        .foregroundStyle(Color.secondary.opacity(0.55))
+                }
+            }
+            .frame(width: side, height: side)
+            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                    .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
+            )
+            .shadow(color: Color.black.opacity(0.14), radius: 7, x: 0, y: 4)
+        }
+        .aspectRatio(1, contentMode: .fit)
+        .task(id: url) {
+            guard let url else {
+                loadedImage = nil
+                return
+            }
+            if let memHit = ArtworkCacheManager.shared.cachedMemoryImage(for: url) {
+                loadedImage = memHit
+                return
+            }
+            let fetched = await ArtworkCacheManager.shared.image(for: url)
+            withAnimation(.easeOut(duration: 0.2)) {
+                loadedImage = fetched
+            }
+        }
+    }
+}
+
+/// Unified playlist cover renderer that always honors custom user photo covers first, then remote cover, then first track artwork.
+public struct AuraPlaylistCoverView: View {
+    public let playlist: PersistedPlaylistEntity
+    public let size: CGFloat
+    public var cornerRadius: CGFloat = 10
+    @ObservedObject private var persistence: PersistenceController = .shared
+
+    public init(playlist: PersistedPlaylistEntity, size: CGFloat, cornerRadius: CGFloat = 10) {
+        self.playlist = playlist
+        self.size = size
+        self.cornerRadius = cornerRadius
+    }
+
+    private var fallbackTrackArtworkURL: URL? {
+        if let firstID = playlist.orderedTrackIDs.first,
+           let entity = persistence.libraryTracks.first(where: { $0.trackID == firstID }) {
+            return persistence.effectiveArtworkURL(for: entity.toUniversalTrack())
+        }
+        return nil
+    }
+
+    public var body: some View {
+        if let customData = playlist.customCoverImageData,
+           let uiImage = UIImage(data: customData) {
+            Image(uiImage: uiImage)
+                .resizable()
+                .scaledToFill()
+                .frame(width: size, height: size)
+                .clipped()
+                .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                        .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
+                )
+                .shadow(color: Color.black.opacity(0.16), radius: 8, x: 0, y: 4)
+        } else {
+            AuraArtworkView(
+                url: playlist.coverArtworkURLString.flatMap(URL.init(string:)) ?? fallbackTrackArtworkURL,
+                size: size,
+                cornerRadius: cornerRadius,
+                placeholderSymbol: playlist.isSmartPlaylist ? "gearshape.2.fill" : "music.note.list"
+            )
         }
     }
 }

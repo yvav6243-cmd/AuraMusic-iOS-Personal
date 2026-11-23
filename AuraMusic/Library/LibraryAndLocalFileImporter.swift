@@ -251,7 +251,10 @@ public struct LibraryTabView: View {
                                         player.play(track, queue: allTracks)
                                     } label: {
                                         VStack(alignment: .leading, spacing: 6) {
-                                            AuraArtworkView(url: track.artworkURL, size: 158, cornerRadius: 10)
+                                            AuraFlexibleArtworkView(
+                                                url: persistence.effectiveArtworkURL(for: track),
+                                                cornerRadius: 10
+                                            )
                                             Text(track.title)
                                                 .font(.system(size: 14, weight: .semibold))
                                                 .foregroundStyle(.primary)
@@ -403,12 +406,7 @@ public struct PlaylistsListView: View {
                         PlaylistDetailView(playlist: playlist)
                     } label: {
                         HStack(spacing: 14) {
-                            AuraArtworkView(
-                                url: playlist.coverArtworkURLString.flatMap(URL.init(string:)),
-                                size: 56,
-                                cornerRadius: 8,
-                                placeholderSymbol: playlist.isSmartPlaylist ? "gearshape.2.fill" : "music.note.list"
-                            )
+                            AuraPlaylistCoverView(playlist: playlist, size: 56, cornerRadius: 8)
                             VStack(alignment: .leading, spacing: 4) {
                                 HStack(spacing: 6) {
                                     Text(playlist.name)
@@ -435,6 +433,7 @@ public struct PlaylistsListView: View {
                 }
             }
         }
+        .contentMargins(.bottom, 88, for: .scrollContent)
         .navigationTitle("Playlists")
     }
 }
@@ -623,6 +622,8 @@ public struct LibrarySongsListView: View {
                         .buttonStyle(.plain)
                     }
                     .padding(.vertical, 2)
+                    .listRowBackground(Color.clear)
+                    .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
                 }
             }
 
@@ -637,6 +638,7 @@ public struct LibrarySongsListView: View {
                 }
             }
         }
+        .contentMargins(.bottom, 88, for: .scrollContent)
         .searchable(text: $filterText, prompt: "Find in Songs")
         .navigationTitle(onlyFavorites ? "Favourite Songs" : "Songs")
         .toolbar {
@@ -709,6 +711,7 @@ public struct LibraryArtistsListView: View {
                 }
             }
         }
+        .contentMargins(.bottom, 88, for: .scrollContent)
         .navigationTitle("Artists")
     }
 }
@@ -728,7 +731,7 @@ public struct LibraryAlbumsListView: View {
                 providerAlbumID: albumTitle,
                 title: albumTitle,
                 artist: tracks.first?.artist ?? "Various Artists",
-                artworkURL: tracks.first?.artworkURL,
+                artworkURL: tracks.first.flatMap { persistence.effectiveArtworkURL(for: $0) },
                 trackCount: tracks.count,
                 tracks: tracks
             )
@@ -752,6 +755,7 @@ public struct LibraryAlbumsListView: View {
                 }
             }
         }
+        .contentMargins(.bottom, 88, for: .scrollContent)
         .navigationTitle("Albums")
     }
 }
@@ -945,7 +949,7 @@ public struct AlbumDetailPageView: View {
 
                         Spacer()
 
-                        Text(track.formattedDuration)
+                        Text(persistence.effectiveFormattedDuration(for: track))
                             .font(.system(size: 12))
                             .foregroundStyle(.secondary)
                     }
@@ -956,6 +960,7 @@ public struct AlbumDetailPageView: View {
                 }
             }
         }
+        .contentMargins(.bottom, 88, for: .scrollContent)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {

@@ -284,7 +284,7 @@ public struct ListenNowTabView: View {
                                         player.play(track, queue: recentlyPlayedTracks)
                                     } label: {
                                         VStack(alignment: .leading, spacing: 5) {
-                                            AuraArtworkView(url: track.artworkURL, size: 145, cornerRadius: 10)
+                                            AuraArtworkView(url: persistence.effectiveArtworkURL(for: track), size: 145, cornerRadius: 10)
                                             Text(track.title)
                                                 .font(.system(size: 14, weight: .semibold))
                                                 .foregroundStyle(.primary)
@@ -329,12 +329,7 @@ public struct ListenNowTabView: View {
                                         PlaylistDetailView(playlist: pl)
                                     } label: {
                                         VStack(alignment: .leading, spacing: 5) {
-                                            AuraArtworkView(
-                                                url: pl.coverArtworkURLString.flatMap(URL.init(string:)),
-                                                size: 145,
-                                                cornerRadius: 10,
-                                                placeholderSymbol: pl.isSmartPlaylist ? "gearshape.2.fill" : "music.note.list"
-                                            )
+                                            AuraPlaylistCoverView(playlist: pl, size: 145, cornerRadius: 10)
                                             Text(pl.name)
                                                 .font(.system(size: 14, weight: .semibold))
                                                 .foregroundStyle(.primary)
@@ -475,7 +470,8 @@ public struct ListenNowTabView: View {
                             )
                             .frame(width: 86, height: 86)
 
-                        if let firstArt = favouriteTracks.first?.artworkURL {
+                        if let firstFav = favouriteTracks.first,
+                           let firstArt = persistence.effectiveArtworkURL(for: firstFav) {
                             AuraArtworkView(url: firstArt, size: 86, cornerRadius: 14)
                                 .overlay(
                                     ZStack {

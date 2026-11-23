@@ -1518,6 +1518,7 @@ public struct DownloadsManagementView: View {
                 }
             }
         }
+        .contentMargins(.bottom, 88, for: .scrollContent)
         .navigationTitle("Downloaded")
     }
 }
