@@ -191,7 +191,6 @@ public final class MusicDiscoveryViewModel: ObservableObject {
 public struct ListenNowTabView: View {
     @ObservedObject var discovery: MusicDiscoveryViewModel = .shared
     @ObservedObject var persistence: PersistenceController = .shared
-    @ObservedObject var player: UniversalAudioPlayerEngine = .shared
 
     @State private var showSettingsSheet: Bool = false
     @State private var showAppleImportSheet: Bool = false
@@ -221,7 +220,7 @@ public struct ListenNowTabView: View {
     public var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: 26) {
+                LazyVStack(alignment: .leading, spacing: 26) {
                     // 1. Favourite Songs Hero Playlist Section (Replaces "Top Picks for You")
                     AppleMusicSectionHeader(
                         title: "Favourite Songs",
@@ -232,7 +231,7 @@ public struct ListenNowTabView: View {
                         .padding(.horizontal, AuraTheme.horizontalMargin)
 
                     if !favouriteTracks.isEmpty {
-                        VStack(spacing: 8) {
+                        LazyVStack(spacing: 8) {
                             ForEach(favouriteTracks.prefix(6)) { track in
                                 TrackRowView(track: track, queueContext: favouriteTracks)
                                     .padding(.horizontal, AuraTheme.horizontalMargin)
@@ -247,7 +246,7 @@ public struct ListenNowTabView: View {
                             subtitle: "Recommended songs based on the genres of your Favourite Songs"
                         )
 
-                        VStack(spacing: 8) {
+                        LazyVStack(spacing: 8) {
                             ForEach(discovery.genreRecommendedTracks.prefix(6)) { track in
                                 TrackRowView(track: track, queueContext: discovery.genreRecommendedTracks)
                                     .padding(.horizontal, AuraTheme.horizontalMargin)
@@ -262,7 +261,7 @@ public struct ListenNowTabView: View {
                             subtitle: "Curated by producers, beatmakers & collaborators of your favorite tracks"
                         )
 
-                        VStack(spacing: 8) {
+                        LazyVStack(spacing: 8) {
                             ForEach(discovery.producerRecommendedTracks.prefix(6)) { track in
                                 TrackRowView(track: track, queueContext: discovery.producerRecommendedTracks)
                                     .padding(.horizontal, AuraTheme.horizontalMargin)
@@ -278,13 +277,14 @@ public struct ListenNowTabView: View {
                         )
 
                         ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 14) {
+                            LazyHStack(spacing: 14) {
                                 ForEach(recentlyPlayedTracks.prefix(12)) { track in
                                     Button {
-                                        player.play(track, queue: recentlyPlayedTracks)
+                                        UniversalAudioPlayerEngine.shared.play(track, queue: recentlyPlayedTracks)
                                     } label: {
                                         VStack(alignment: .leading, spacing: 5) {
                                             AuraArtworkView(url: persistence.effectiveArtworkURL(for: track), size: 145, cornerRadius: 10)
+                                                .equatable()
                                             Text(track.title)
                                                 .font(.system(size: 14, weight: .semibold))
                                                 .foregroundStyle(.primary)
@@ -311,7 +311,7 @@ public struct ListenNowTabView: View {
                             subtitle: "Inspired by your favorite artists & listening history"
                         )
 
-                        VStack(spacing: 8) {
+                        LazyVStack(spacing: 8) {
                             ForEach(discovery.personalizedTracks.prefix(6)) { track in
                                 TrackRowView(track: track, queueContext: discovery.personalizedTracks)
                                     .padding(.horizontal, AuraTheme.horizontalMargin)
@@ -323,7 +323,7 @@ public struct ListenNowTabView: View {
                     if !persistence.playlists.isEmpty {
                         AppleMusicSectionHeader(title: "Your Playlists")
                         ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 14) {
+                            LazyHStack(spacing: 14) {
                                 ForEach(persistence.playlists, id: \.playlistID) { pl in
                                     NavigationLink {
                                         PlaylistDetailView(playlist: pl)
@@ -352,13 +352,14 @@ public struct ListenNowTabView: View {
                     if !discovery.recommendedAlbums.isEmpty {
                         AppleMusicSectionHeader(title: "Recommended Albums")
                         ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 14) {
+                            LazyHStack(spacing: 14) {
                                 ForEach(discovery.recommendedAlbums) { album in
                                     NavigationLink {
                                         AlbumDetailPageView(album: album)
                                     } label: {
                                         VStack(alignment: .leading, spacing: 5) {
                                             AuraArtworkView(url: album.artworkURL, size: 150, cornerRadius: 10)
+                                                .equatable()
                                             Text(album.title)
                                                 .font(.system(size: 14, weight: .semibold))
                                                 .foregroundStyle(.primary)
@@ -382,7 +383,7 @@ public struct ListenNowTabView: View {
                     if !discovery.featuredArtists.isEmpty {
                         AppleMusicSectionHeader(title: "Favorite & Featured Artists")
                         ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 18) {
+                            LazyHStack(spacing: 18) {
                                 ForEach(discovery.featuredArtists) { artist in
                                     NavigationLink {
                                         ArtistDetailPageView(artist: artist)
@@ -394,6 +395,7 @@ public struct ListenNowTabView: View {
                                                 cornerRadius: 52,
                                                 placeholderSymbol: "music.mic"
                                             )
+                                            .equatable()
                                             Text(artist.name)
                                                 .font(.system(size: 13, weight: .semibold))
                                                 .foregroundStyle(.primary)
@@ -520,8 +522,8 @@ public struct ListenNowTabView: View {
                 HStack(spacing: 12) {
                     Button {
                         if let first = favouriteTracks.first {
-                            player.isShuffled = false
-                            player.play(first, queue: favouriteTracks)
+                            UniversalAudioPlayerEngine.shared.isShuffled = false
+                            UniversalAudioPlayerEngine.shared.play(first, queue: favouriteTracks)
                         }
                     } label: {
                         Label("Play", systemImage: "play.fill")
@@ -539,8 +541,8 @@ public struct ListenNowTabView: View {
                     Button {
                         let shuffled = favouriteTracks.shuffled()
                         if let first = shuffled.first {
-                            player.isShuffled = true
-                            player.play(first, queue: shuffled)
+                            UniversalAudioPlayerEngine.shared.isShuffled = true
+                            UniversalAudioPlayerEngine.shared.play(first, queue: shuffled)
                         }
                     } label: {
                         Label("Shuffle", systemImage: "shuffle")
@@ -569,21 +571,20 @@ public struct ListenNowTabView: View {
 
 public struct BrowseTabView: View {
     @ObservedObject var discovery: MusicDiscoveryViewModel = .shared
-    @ObservedObject var player: UniversalAudioPlayerEngine = .shared
 
     public init() {}
 
     public var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: 26) {
+                LazyVStack(alignment: .leading, spacing: 26) {
                     // Trending Full-Length Open Catalog Songs
                     AppleMusicSectionHeader(
                         title: "Trending Tracks (Full Stream)",
                         subtitle: "Direct 320kbps full playback & offline download ready"
                     )
 
-                    VStack(spacing: 8) {
+                    LazyVStack(spacing: 8) {
                         ForEach(discovery.trendingFullStreamTracks.prefix(10)) { track in
                             TrackRowView(track: track, queueContext: discovery.trendingFullStreamTracks)
                                 .padding(.horizontal, AuraTheme.horizontalMargin)
@@ -597,7 +598,7 @@ public struct BrowseTabView: View {
                             subtitle: "Most played global chart songs"
                         )
 
-                        VStack(spacing: 8) {
+                        LazyVStack(spacing: 8) {
                             ForEach(Array(discovery.appleTopChartTracks.prefix(12).enumerated()), id: \.element.id) { idx, track in
                                 HStack(spacing: 10) {
                                     Text("\(idx + 1)")
@@ -615,13 +616,14 @@ public struct BrowseTabView: View {
                     if !discovery.recommendedAlbums.isEmpty {
                         AppleMusicSectionHeader(title: "New & Essential Albums")
                         ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 14) {
+                            LazyHStack(spacing: 14) {
                                 ForEach(discovery.recommendedAlbums) { album in
                                     NavigationLink {
                                         AlbumDetailPageView(album: album)
                                     } label: {
                                         VStack(alignment: .leading, spacing: 5) {
                                             AuraArtworkView(url: album.artworkURL, size: 155, cornerRadius: 10)
+                                                .equatable()
                                             Text(album.title)
                                                 .font(.system(size: 14, weight: .semibold))
                                                 .foregroundStyle(.primary)
@@ -659,7 +661,7 @@ public struct BrowseTabView: View {
 // MARK: - 3. Radio Tab (Section 3)
 
 public struct RadioTabView: View {
-    @ObservedObject var player: UniversalAudioPlayerEngine = .shared
+    @ObservedObject var highlightState: TrackPlaybackHighlightState = .shared
     @State private var directoryStations: [RadioStation] = []
     @State private var selectedGenreTag: String = "electronic"
     @State private var isLoadingDirectory: Bool = false
@@ -672,20 +674,20 @@ public struct RadioTabView: View {
     public var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: 24) {
+                LazyVStack(alignment: .leading, spacing: 24) {
                     AppleMusicSectionHeader(
                         title: "Live Featured Stations",
                         subtitle: "Continuous 24/7 background internet radio streams"
                     )
 
+                    let featuredTracks = LiveRadioProvider.featuredStations.map { $0.asUniversalTrack() }
                     VStack(spacing: 14) {
                         ForEach(LiveRadioProvider.featuredStations) { station in
                             let stationTrack = station.asUniversalTrack()
-                            let isCurrent = (player.currentTrack?.id == stationTrack.id)
+                            let isCurrent = (highlightState.activeTrackID == stationTrack.id)
 
                             Button {
-                                let allTracks = LiveRadioProvider.featuredStations.map { $0.asUniversalTrack() }
-                                player.play(stationTrack, queue: allTracks)
+                                UniversalAudioPlayerEngine.shared.play(stationTrack, queue: featuredTracks)
                             } label: {
                                 HStack(spacing: 14) {
                                     ZStack {
@@ -707,7 +709,8 @@ public struct RadioTabView: View {
                                     VStack(alignment: .leading, spacing: 4) {
                                         HStack(spacing: 6) {
                                             if isCurrent {
-                                                NowPlayingEqualizerBars(isPlaying: player.isPlaying)
+                                                NowPlayingEqualizerBars(isPlaying: highlightState.isPlaying)
+                                                    .equatable()
                                             }
                                             Text(station.name)
                                                 .font(.system(size: 16, weight: .bold))
@@ -724,9 +727,10 @@ public struct RadioTabView: View {
 
                                     Spacer()
 
-                                    Image(systemName: isCurrent && player.isPlaying ? "pause.circle.fill" : "play.circle.fill")
+                                    Image(systemName: isCurrent && highlightState.isPlaying ? "pause.circle.fill" : "play.circle.fill")
                                         .font(.system(size: 30))
                                         .foregroundStyle(AuraTheme.accentPink)
+                                        .contentTransition(.symbolEffect(.replace))
                                 }
                                 .padding(12)
                                 .background(
@@ -749,7 +753,9 @@ public struct RadioTabView: View {
                         HStack(spacing: 8) {
                             ForEach(genreTags, id: \.self) { tag in
                                 Button {
-                                    selectedGenreTag = tag
+                                    withAnimation(AuraTheme.springSnappy) {
+                                        selectedGenreTag = tag
+                                    }
                                     Task { await loadGenreStations(tag) }
                                 } label: {
                                     Text(tag.capitalized)
@@ -780,12 +786,12 @@ public struct RadioTabView: View {
                         }
                         .padding(.horizontal, AuraTheme.horizontalMargin)
                     } else {
-                        VStack(spacing: 8) {
-                            ForEach(directoryStations) { station in
-                                let track = station.asUniversalTrack()
+                        let stationTracks = directoryStations.map { $0.asUniversalTrack() }
+                        LazyVStack(spacing: 8) {
+                            ForEach(stationTracks) { track in
                                 TrackRowView(
                                     track: track,
-                                    queueContext: directoryStations.map { $0.asUniversalTrack() }
+                                    queueContext: stationTracks
                                 )
                                 .padding(.horizontal, AuraTheme.horizontalMargin)
                             }

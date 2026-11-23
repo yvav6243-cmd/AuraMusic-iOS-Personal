@@ -389,7 +389,6 @@ public struct AppleMusicPlaylistImportSheet: View {
 public struct PlaylistDetailView: View {
     public let playlist: PersistedPlaylistEntity
     @ObservedObject var persistence: PersistenceController = .shared
-    @ObservedObject var player: UniversalAudioPlayerEngine = .shared
     @ObservedObject var downloadManager: OfflineDownloadManager = .shared
 
     @State private var showEditSheet: Bool = false
@@ -412,7 +411,11 @@ public struct PlaylistDetailView: View {
             Section {
                 VStack(spacing: 14) {
                     if let customData = playlist.customCoverImageData,
-                       let uiImage = UIImage(data: customData) {
+                       let uiImage = ArtworkCacheManager.shared.cachedPlaylistCoverImage(
+                           playlistID: playlist.playlistID,
+                           data: customData,
+                           maxPixelSize: 640
+                       ) {
                         Image(uiImage: uiImage)
                             .resizable()
                             .scaledToFill()
@@ -427,6 +430,7 @@ public struct PlaylistDetailView: View {
                             cornerRadius: 14,
                             placeholderSymbol: playlist.isSmartPlaylist ? "gearshape.2.fill" : "music.note.list"
                         )
+                        .equatable()
                     }
 
                     VStack(spacing: 4) {
@@ -459,8 +463,8 @@ public struct PlaylistDetailView: View {
                     HStack(spacing: 14) {
                         Button {
                             if let first = tracks.first {
-                                player.isShuffled = false
-                                player.play(first, queue: tracks)
+                                UniversalAudioPlayerEngine.shared.isShuffled = false
+                                UniversalAudioPlayerEngine.shared.play(first, queue: tracks)
                             }
                         } label: {
                             Label("Play", systemImage: "play.fill")
@@ -478,8 +482,8 @@ public struct PlaylistDetailView: View {
                         Button {
                             let shuffled = tracks.shuffled()
                             if let first = shuffled.first {
-                                player.isShuffled = true
-                                player.play(first, queue: shuffled)
+                                UniversalAudioPlayerEngine.shared.isShuffled = true
+                                UniversalAudioPlayerEngine.shared.play(first, queue: shuffled)
                             }
                         } label: {
                             Label("Shuffle", systemImage: "shuffle")
@@ -555,17 +559,10 @@ public struct PlaylistDetailView: View {
                     ForEach(tracks) { track in
                         HStack(spacing: 12) {
                             AuraArtworkView(url: persistence.effectiveArtworkURL(for: track), size: 46, cornerRadius: 7)
+                                .equatable()
 
                             VStack(alignment: .leading, spacing: 3) {
-                                HStack(spacing: 6) {
-                                    if player.currentTrack?.id == track.id {
-                                        NowPlayingEqualizerBars(isPlaying: player.isPlaying)
-                                    }
-                                    Text(track.title)
-                                        .font(.system(size: 15, weight: .semibold))
-                                        .foregroundStyle(player.currentTrack?.id == track.id ? AuraTheme.accentPink : .primary)
-                                        .lineLimit(1)
-                                }
+                                TrackRowTitleWithEqualizer(trackID: track.id, title: track.title)
                                 Text(track.artist)
                                     .font(.system(size: 13))
                                     .foregroundStyle(.secondary)
@@ -590,7 +587,7 @@ public struct PlaylistDetailView: View {
                         }
                         .contentShape(Rectangle())
                         .onTapGesture {
-                            player.play(track, queue: tracks)
+                            UniversalAudioPlayerEngine.shared.play(track, queue: tracks)
                         }
                     }
                     .onDelete { offsets in

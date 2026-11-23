@@ -156,7 +156,6 @@ public final class UnifiedSearchViewModel: ObservableObject {
 public struct UnifiedSearchView: View {
     @StateObject private var viewModel = UnifiedSearchViewModel()
     @ObservedObject var persistence: PersistenceController = .shared
-    @ObservedObject var player: UniversalAudioPlayerEngine = .shared
 
     private let browseCategories: [(title: String, query: String, gradient: [Color], symbol: String)] = [
         ("Spatial & Hi-Fi", "Electronic Pop", [Color(red: 0.96, green: 0.16, blue: 0.36), Color(red: 0.55, green: 0.08, blue: 0.35)], "waveform"),
@@ -328,7 +327,9 @@ public struct UnifiedSearchView: View {
                 HStack(spacing: 8) {
                     ForEach(UnifiedSearchScope.allCases) { scope in
                         Button {
-                            viewModel.selectedScope = scope
+                            withAnimation(AuraTheme.springSnappy) {
+                                viewModel.selectedScope = scope
+                            }
                         } label: {
                             Text(scope.rawValue)
                                 .font(.system(size: 13, weight: .bold))
@@ -353,7 +354,9 @@ public struct UnifiedSearchView: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
                     Button {
-                        viewModel.selectedProviderFilter = nil
+                        withAnimation(AuraTheme.springSnappy) {
+                            viewModel.selectedProviderFilter = nil
+                        }
                     } label: {
                         Text("All Providers")
                             .font(.system(size: 11, weight: .bold))
@@ -372,7 +375,9 @@ public struct UnifiedSearchView: View {
 
                     ForEach(ProviderCredentialsStore.shared.configuredCatalogProviders) { provider in
                         Button {
-                            viewModel.selectedProviderFilter = (viewModel.selectedProviderFilter == provider) ? nil : provider
+                            withAnimation(AuraTheme.springSnappy) {
+                                viewModel.selectedProviderFilter = (viewModel.selectedProviderFilter == provider) ? nil : provider
+                            }
                         } label: {
                             HStack(spacing: 4) {
                                 Image(systemName: provider.systemIconName)
@@ -411,12 +416,13 @@ public struct UnifiedSearchView: View {
             // Render Sections Based on Scope
             if viewModel.selectedScope == .all || viewModel.selectedScope == .songs {
                 if !filteredGroups.isEmpty {
+                    let allQueueTracks = filteredGroups.map(\.bestPlayableVariant)
                     AppleMusicSectionHeader(title: "Songs")
-                    VStack(spacing: 10) {
+                    LazyVStack(spacing: 10) {
                         ForEach(filteredGroups) { group in
                             GroupedTrackResultCard(
                                 group: group,
-                                allQueueTracks: filteredGroups.map(\.bestPlayableVariant)
+                                allQueueTracks: allQueueTracks
                             )
                         }
                     }
@@ -428,7 +434,7 @@ public struct UnifiedSearchView: View {
                 if !viewModel.artistResults.isEmpty {
                     AppleMusicSectionHeader(title: "Artists")
                     ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 16) {
+                        LazyHStack(spacing: 16) {
                             ForEach(viewModel.artistResults) { artist in
                                 NavigationLink {
                                     ArtistDetailPageView(artist: artist)
@@ -440,6 +446,7 @@ public struct UnifiedSearchView: View {
                                             cornerRadius: 49,
                                             placeholderSymbol: "music.mic"
                                         )
+                                        .equatable()
                                         Text(artist.name)
                                             .font(.system(size: 13, weight: .semibold))
                                             .foregroundStyle(.primary)
@@ -459,13 +466,14 @@ public struct UnifiedSearchView: View {
                 if !viewModel.albumResults.isEmpty {
                     AppleMusicSectionHeader(title: "Albums")
                     ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 16) {
+                        LazyHStack(spacing: 16) {
                             ForEach(viewModel.albumResults) { album in
                                 NavigationLink {
                                     AlbumDetailPageView(album: album)
                                 } label: {
                                     VStack(alignment: .leading, spacing: 5) {
                                         AuraArtworkView(url: album.artworkURL, size: 145, cornerRadius: 10)
+                                            .equatable()
                                         Text(album.title)
                                             .font(.system(size: 14, weight: .semibold))
                                             .foregroundStyle(.primary)
@@ -534,7 +542,6 @@ public struct GroupedTrackResultCard: View {
     public let group: TrackVariantGroup
     public let allQueueTracks: [UniversalTrack]
 
-    @ObservedObject var player: UniversalAudioPlayerEngine = .shared
     @ObservedObject var persistence: PersistenceController = .shared
     @State private var selectedVariant: UniversalTrack?
     @State private var showPlaylistPicker: Bool = false
@@ -547,17 +554,10 @@ public struct GroupedTrackResultCard: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 12) {
                 AuraArtworkView(url: activeVariant.artworkURL ?? group.primaryTrack.artworkURL, size: 54, cornerRadius: 9)
+                    .equatable()
 
                 VStack(alignment: .leading, spacing: 3) {
-                    HStack(spacing: 6) {
-                        if player.currentTrack?.id == activeVariant.id {
-                            NowPlayingEqualizerBars(isPlaying: player.isPlaying)
-                        }
-                        Text(activeVariant.title)
-                            .font(.system(size: 15, weight: .semibold))
-                            .foregroundStyle(player.currentTrack?.id == activeVariant.id ? AuraTheme.accentPink : .primary)
-                            .lineLimit(1)
-                    }
+                    TrackRowTitleWithEqualizer(trackID: activeVariant.id, title: activeVariant.title)
 
                     Text("\(activeVariant.artist) • \(activeVariant.album)")
                         .font(.system(size: 13))
@@ -575,7 +575,7 @@ public struct GroupedTrackResultCard: View {
                     ForEach(group.variants) { variant in
                         Button {
                             selectedVariant = variant
-                            player.play(variant, queue: allQueueTracks)
+                            UniversalAudioPlayerEngine.shared.play(variant, queue: allQueueTracks)
                         } label: {
                             Label(
                                 "Play via \(variant.provider.displayName)",
@@ -587,7 +587,7 @@ public struct GroupedTrackResultCard: View {
                     Divider()
 
                     Button {
-                        player.playNext(activeVariant)
+                        UniversalAudioPlayerEngine.shared.playNext(activeVariant)
                     } label: {
                         Label("Play Next", systemImage: "text.line.first.and.arrowtriangle.forward")
                     }
@@ -617,7 +617,7 @@ public struct GroupedTrackResultCard: View {
             }
             .contentShape(Rectangle())
             .onTapGesture {
-                player.play(activeVariant, queue: allQueueTracks)
+                UniversalAudioPlayerEngine.shared.play(activeVariant, queue: allQueueTracks)
             }
         }
         .padding(10)

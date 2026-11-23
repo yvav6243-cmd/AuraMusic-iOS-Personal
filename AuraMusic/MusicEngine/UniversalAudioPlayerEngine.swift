@@ -91,6 +91,29 @@ public final class PlaybackClock: ObservableObject {
     }
 }
 
+/// Minimalist observable state dedicated solely to track list row highlighting (`activeTrackID` + `isPlaying`).
+/// Decouples every Home, Library, Playlist, Radio, and Search list row from `UniversalAudioPlayerEngine`,
+/// so opening/closing the player, dragging, adjusting volume, switching lyrics/queue, or buffering triggers
+/// ZERO list row re-evaluations!
+@MainActor
+public final class TrackPlaybackHighlightState: ObservableObject {
+    public static let shared = TrackPlaybackHighlightState()
+
+    @Published public private(set) var activeTrackID: String? = nil
+    @Published public private(set) var isPlaying: Bool = false
+
+    public init() {}
+
+    public func update(trackID: String?, isPlaying: Bool) {
+        if activeTrackID != trackID {
+            activeTrackID = trackID
+        }
+        if self.isPlaying != isPlaying {
+            self.isPlaying = isPlaying
+        }
+    }
+}
+
 @MainActor
 public final class UniversalAudioPlayerEngine: ObservableObject {
     public static let shared = UniversalAudioPlayerEngine()
@@ -98,10 +121,18 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
 
     // MARK: - Published Playback State (Low-Frequency Only -> 120 FPS UI!)
 
-    @Published public private(set) var currentTrack: UniversalTrack?
+    @Published public private(set) var currentTrack: UniversalTrack? {
+        didSet {
+            TrackPlaybackHighlightState.shared.update(trackID: currentTrack?.id, isPlaying: isPlaying)
+        }
+    }
     @Published public var upNextQueue: [UniversalTrack] = []
     @Published public private(set) var playbackHistory: [UniversalTrack] = []
-    @Published public private(set) var isPlaying: Bool = false
+    @Published public private(set) var isPlaying: Bool = false {
+        didSet {
+            TrackPlaybackHighlightState.shared.update(trackID: currentTrack?.id, isPlaying: isPlaying)
+        }
+    }
     @Published public private(set) var isBuffering: Bool = false
 
     /// Proxied to `PlaybackClock.shared` so changing `currentTime` or `duration` NEVER invalidates views observing `UniversalAudioPlayerEngine`!
@@ -1177,6 +1208,19 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
 
         Task {
             await LyricsService.shared.loadLyrics(for: trackWithCustomArt)
+        }
+
+        // Pre-warm Retina artwork & liquid mesh background palette for the next 2 tracks in queue at low priority
+        // so tapping Next or auto-advancing transitions on frame 0 with zero loading flash!
+        let upcomingArtworkURLs: [URL] = upNextQueue.prefix(2).compactMap { upcoming in
+            PersistenceController.shared.effectiveArtworkURL(for: upcoming) ?? upcoming.artworkURL
+        }
+        if !upcomingArtworkURLs.isEmpty {
+            Task(priority: .utility) {
+                for url in upcomingArtworkURLs {
+                    await ArtworkCacheManager.shared.prefetchArtworkAndPalette(for: url)
+                }
+            }
         }
 
         // If full-length offline audio is already downloaded, start native AVPlayer IMMEDIATELY on frame 0!

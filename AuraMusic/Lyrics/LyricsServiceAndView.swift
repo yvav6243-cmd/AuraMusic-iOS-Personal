@@ -1819,11 +1819,11 @@ public struct AppleMusicInstrumentalDotsView: View, Equatable {
                 Circle()
                     .fill(Color.white.opacity(isLit ? 1.0 : 0.25))
                     .frame(width: 10, height: 10)
-                    .scaleEffect(isLit ? 1.12 : 0.92)
+                    .scaleEffect(isLit ? 1.14 : 0.90)
             }
         }
         .padding(.vertical, 6)
-        .animation(.easeInOut(duration: 0.2), value: litDotsCount)
+        .animation(AuraTheme.springBouncy, value: litDotsCount)
     }
 
     /// Computes how many dots (0...3) should be lit based on elapsed fraction of the pause
@@ -1876,19 +1876,21 @@ private struct SyncedLyricTextRowView: View, Equatable {
                     )
             }
         }
-        .scaleEffect(isCurrent ? 1.05 : 0.96, anchor: .leading)
-        .shadow(color: isCurrent ? .white.opacity(0.22) : .clear, radius: isCurrent ? 10 : 0)
+        .scaleEffect(isCurrent ? 1.04 : 0.96, anchor: .leading)
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.vertical, 8)
         .padding(.horizontal, 14)
         .background(
             RoundedRectangle(cornerRadius: 14, style: .continuous)
                 .fill(isCurrent ? Color.white.opacity(0.14) : Color.clear)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .strokeBorder(isCurrent ? Color.white.opacity(0.12) : Color.clear, lineWidth: 0.5)
+                )
         )
         .contentShape(Rectangle())
-        .animation(.easeOut(duration: 0.22), value: isCurrent)
-        .animation(.easeOut(duration: 0.22), value: isPast)
-        .animation(.interpolatingSpring(stiffness: 170, damping: 24), value: isCurrent)
+        .animation(AuraTheme.springInteractive, value: isCurrent)
+        .animation(.easeOut(duration: 0.24), value: isPast)
     }
 }
 
@@ -1903,6 +1905,7 @@ private struct SyncedInstrumentalDotsRowView: View, Equatable {
     var body: some View {
         HStack {
             AppleMusicInstrumentalDotsView(litDotsCount: isCurrent ? litDotsCount : 0)
+                .equatable()
             Spacer()
         }
         .opacity(isCurrent ? 1.0 : 0.28)
@@ -1913,7 +1916,7 @@ private struct SyncedInstrumentalDotsRowView: View, Equatable {
                 .fill(isCurrent ? Color.white.opacity(0.08) : Color.clear)
         )
         .contentShape(Rectangle())
-        .animation(.easeOut(duration: 0.22), value: isCurrent)
+        .animation(AuraTheme.springInteractive, value: isCurrent)
     }
 }
 
@@ -2214,7 +2217,7 @@ public struct SynchronizedLyricsView: View {
                             if !player.isPlaying {
                                 player.resume()
                             }
-                            withAnimation(.interpolatingSpring(stiffness: 145, damping: 22)) {
+                            withAnimation(.spring(response: 0.46, dampingFraction: 0.88)) {
                                 proxy.scrollTo(line.index, anchor: UnitPoint(x: 0.5, y: 0.38))
                             }
                         }
@@ -2275,7 +2278,7 @@ public struct SynchronizedLyricsView: View {
                 let previousIdx = activeLineIndex
                 let nextIdx = syncActiveLineAndDots(at: newTime, in: doc)
                 if nextIdx != previousIdx, !isUserManualScrolling, let target = nextIdx {
-                    withAnimation(.interpolatingSpring(stiffness: 145, damping: 22)) {
+                    withAnimation(.spring(response: 0.46, dampingFraction: 0.88)) {
                         proxy.scrollTo(target, anchor: UnitPoint(x: 0.5, y: 0.38))
                     }
                 }

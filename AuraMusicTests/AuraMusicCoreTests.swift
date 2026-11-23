@@ -3059,4 +3059,100 @@ final class AuraMusicCoreTests: XCTestCase {
             AppleMusicPlayerOverlayView.shouldDismissSheet(translationHeight: 70, predictedEndHeight: 300, horizontalTranslation: 8)
         )
     }
+
+    // MARK: - 120 FPS Smoothness, ImageIO Retina Downsampling & List Redraw Isolation Tests
+
+    func testArtworkCacheImageIODownsamplingShrinksOversizedPhotosWhilePreservingNativeResolutionAndByteCost() throws {
+        // 1. Oversized 2400×2400 gallery photo MUST downsample cleanly to <= 1024px (3x Retina quality, >5× less RAM!)
+        let largeFormat = UIGraphicsImageRendererFormat()
+        largeFormat.scale = 1.0
+        let largeImage = UIGraphicsImageRenderer(size: CGSize(width: 2400, height: 2400), format: largeFormat).image { ctx in
+            UIColor.systemIndigo.setFill()
+            ctx.fill(CGRect(x: 0, y: 0, width: 2400, height: 2400))
+        }
+        let largeData = try XCTUnwrap(largeImage.jpegData(compressionQuality: 0.85))
+        let downsampled = try XCTUnwrap(ArtworkCacheManager.downsampleImage(from: largeData, maxPixelSize: 1024))
+        let downsampledCG = try XCTUnwrap(downsampled.cgImage)
+        XCTAssertLessThanOrEqual(max(downsampledCG.width, downsampledCG.height), 1024)
+        XCTAssertGreaterThanOrEqual(max(downsampledCG.width, downsampledCG.height), 900)
+
+        let byteCost = ArtworkCacheManager.decodedByteCost(for: downsampled)
+        XCTAssertGreaterThanOrEqual(byteCost, downsampledCG.width * downsampledCG.height * 4)
+        XCTAssertLessThan(byteCost, 2400 * 2400 * 4 / 4, "Downsampled bitmap must consume at least 4× less RAM than raw 2400×2400 photo")
+
+        // 2. Smaller native 300×300 cover MUST keep its true 300×300 resolution (never artificially upscaled!)
+        let smallImage = UIGraphicsImageRenderer(size: CGSize(width: 300, height: 300), format: largeFormat).image { ctx in
+            UIColor.systemTeal.setFill()
+            ctx.fill(CGRect(x: 0, y: 0, width: 300, height: 300))
+        }
+        let smallData = try XCTUnwrap(smallImage.jpegData(compressionQuality: 0.90))
+        let nativeDecoded = try XCTUnwrap(ArtworkCacheManager.downsampleImage(from: smallData, maxPixelSize: 1024))
+        let nativeCG = try XCTUnwrap(nativeDecoded.cgImage)
+        XCTAssertEqual(nativeCG.width, 300)
+        XCTAssertEqual(nativeCG.height, 300)
+    }
+
+    func testArtworkCacheCachesDecodedPlaylistCoverDataWithoutReDecoding() throws {
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1.0
+        let rawCover = UIGraphicsImageRenderer(size: CGSize(width: 1200, height: 1200), format: format).image { ctx in
+            UIColor.systemPurple.setFill()
+            ctx.fill(CGRect(x: 0, y: 0, width: 1200, height: 1200))
+        }
+        let data = try XCTUnwrap(rawCover.jpegData(compressionQuality: 0.85))
+        let cache = ArtworkCacheManager.shared
+
+        let first = try XCTUnwrap(cache.cachedPlaylistCoverImage(playlistID: "perf-playlist-1", data: data, maxPixelSize: 512))
+        let second = try XCTUnwrap(cache.cachedPlaylistCoverImage(playlistID: "perf-playlist-1", data: data, maxPixelSize: 512))
+        XCTAssertTrue(first === second, "Second lookup MUST return exact cached UIImage instance without re-decoding bytes")
+        XCTAssertLessThanOrEqual(max(first.cgImage?.width ?? 0, first.cgImage?.height ?? 0), 512)
+
+        // Memory warning must cleanly purge RAM cache and allow clean re-decode on next access
+        cache.handleMemoryWarning()
+        let afterWarning = try XCTUnwrap(cache.cachedPlaylistCoverImage(playlistID: "perf-playlist-1", data: data, maxPixelSize: 512))
+        XCTAssertFalse(first === afterWarning, "Memory warning should release old cached bitmap so iOS never jetsams the app")
+    }
+
+    @MainActor
+    func testTrackPlaybackHighlightStatePublishesOnlyTrackIDAndIsPlayingWithoutUIStateNoise() {
+        let engine = UniversalAudioPlayerEngine.shared
+        let highlight = TrackPlaybackHighlightState.shared
+
+        var emissionCount = 0
+        let cancellable = highlight.objectWillChange.sink { _ in
+            emissionCount += 1
+        }
+        defer {
+            cancellable.cancel()
+            engine.isPlayerExpanded = false
+            engine.activeOverlayTab = .none
+        }
+
+        // Changing UI-only player state (sheet expand, lyrics tab, queue tab, volume, shuffle) MUST NOT notify TrackRowView list rows!
+        engine.isPlayerExpanded = true
+        engine.activeOverlayTab = .lyrics
+        engine.activeOverlayTab = .upNext
+        engine.activeOverlayTab = .none
+        engine.isPlayerExpanded = false
+        engine.volume = 0.75
+        engine.volume = 0.90
+        engine.toggleShuffle()
+        engine.toggleShuffle()
+        XCTAssertEqual(emissionCount, 0, "UI & volume player state mutations MUST cause ZERO TrackPlaybackHighlightState invalidations!")
+
+        // Updating active track ID or playing state notifies cleanly, and duplicate identical updates emit 0 times
+        let prevTrack = highlight.activeTrackID
+        let prevPlaying = highlight.isPlaying
+        highlight.update(trackID: "perf:track-unique-1", isPlaying: true)
+        XCTAssertEqual(highlight.activeTrackID, "perf:track-unique-1")
+        XCTAssertTrue(highlight.isPlaying)
+        let afterFirstUpdate = emissionCount
+        XCTAssertGreaterThan(afterFirstUpdate, 0)
+
+        highlight.update(trackID: "perf:track-unique-1", isPlaying: true)
+        XCTAssertEqual(emissionCount, afterFirstUpdate, "Redundant identical state update must not emit objectWillChange")
+
+        // Restore cleanly
+        highlight.update(trackID: prevTrack, isPlaying: prevPlaying)
+    }
 }

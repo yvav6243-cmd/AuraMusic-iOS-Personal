@@ -2,21 +2,120 @@ import Foundation
 import PhotosUI
 import SwiftUI
 
+// MARK: - Isolated 120 FPS Sheet Drag Controller (Prevents Full Player Tree Re-Evaluation During Drag)
+
+@MainActor
+private final class PlayerSheetDragController: ObservableObject {
+    @Published var dragOffset: CGFloat = 0
+
+    func openExpandedPlayer() {
+        dragOffset = 0
+        withAnimation(AuraTheme.springPlayerSheet) {
+            UniversalAudioPlayerEngine.shared.isPlayerExpanded = true
+        }
+    }
+
+    func closeExpandedPlayer() {
+        withAnimation(AuraTheme.springPlayerDismiss) {
+            UniversalAudioPlayerEngine.shared.isPlayerExpanded = false
+            dragOffset = 0
+        }
+    }
+
+    func resetDragAnimated() {
+        guard dragOffset != 0 else { return }
+        withAnimation(AuraTheme.springPlayerSheet) {
+            dragOffset = 0
+        }
+    }
+
+    func handleDragChanged(translation: CGSize) {
+        if translation.height > 8 && abs(translation.height) > abs(translation.width) * 1.2 {
+            dragOffset = translation.height
+        }
+    }
+
+    func handleDragEnded(translation: CGSize, predictedEndTranslation: CGSize) {
+        if AppleMusicPlayerOverlayView.shouldDismissSheet(
+            translationHeight: translation.height,
+            predictedEndHeight: predictedEndTranslation.height,
+            horizontalTranslation: translation.width
+        ) {
+            closeExpandedPlayer()
+        } else {
+            withAnimation(AuraTheme.springPlayerSheet) {
+                dragOffset = 0
+            }
+        }
+    }
+}
+
+/// Thin GPU-only compositor shell that observes `dragOffset` so dragging at 120Hz ONLY updates CoreAnimation
+/// transform/opacity/corner-radius layers without EVER re-evaluating `MiniContent` or `SheetContent`!
+private struct PlayerSheetAnimatedFrame<MiniContent: View, SheetContent: View>: View {
+    let isExpanded: Bool
+    let fullHeight: CGFloat
+    @ObservedObject var dragController: PlayerSheetDragController
+    let miniContent: MiniContent
+    let sheetContent: SheetContent
+
+    var body: some View {
+        let activeDrag = max(0, dragController.dragOffset)
+        let sheetOffsetY = AppleMusicPlayerOverlayView.sheetVerticalOffset(
+            isExpanded: isExpanded,
+            dragOffset: activeDrag,
+            screenHeight: fullHeight
+        )
+        let dismissProgress = isExpanded ? min(1.0, activeDrag / max(fullHeight * 0.55, 1)) : 1.0
+        let cardCornerRadius = AppleMusicPlayerOverlayView.sheetCornerRadius(
+            isExpanded: isExpanded,
+            dragOffset: activeDrag,
+            screenHeight: fullHeight
+        )
+
+        ZStack(alignment: .bottom) {
+            // Persistent Floating Mini-Player Bar: stays mounted cleanly in safe area so expanding/closing
+            // smoothly fades & settles it without ever shooting the artwork icon off to the screen edge!
+            miniContent
+                .padding(.horizontal, 12)
+                .padding(.bottom, 54)
+                .opacity(isExpanded ? min(1.0, dismissProgress * 1.35) : 1.0)
+                .scaleEffect(isExpanded ? (0.95 + 0.05 * dismissProgress) : 1.0, anchor: .bottom)
+                .offset(y: isExpanded ? (12 * (1.0 - dismissProgress)) : 0)
+                .allowsHitTesting(!isExpanded)
+                .zIndex(10)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+        .overlay {
+            ZStack(alignment: .bottom) {
+                // Soft dimming backdrop behind the sheet — lightens smoothly as user drags/closes
+                Color.black
+                    .opacity(isExpanded ? max(0, 0.48 * (1.0 - dismissProgress)) : 0)
+                    .allowsHitTesting(isExpanded)
+                    .zIndex(15)
+
+                // Permanently-mounted Full-Screen Player Sheet driven by continuous GPU offset(y:):
+                // guarantees 100% silky 120 FPS slide-up on open and slide-down on close — NEVER snaps or disappears abruptly!
+                sheetContent
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .clipShape(RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous))
+                    .shadow(color: .black.opacity(isExpanded && activeDrag > 2 ? 0.42 : 0.0), radius: 26, y: -4)
+                    .offset(y: sheetOffsetY)
+                    .allowsHitTesting(isExpanded)
+                    .accessibilityHidden(!isExpanded)
+                    .zIndex(20)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+            .ignoresSafeArea()
+        }
+    }
+}
+
 // MARK: - Persistent Mini-Player & Expanded Full-Screen Player Container
 
 public struct AppleMusicPlayerOverlayView: View {
     @ObservedObject var player: UniversalAudioPlayerEngine = .shared
-    @ObservedObject var persistence: PersistenceController = .shared
-    @ObservedObject var downloadManager: OfflineDownloadManager = .shared
-
-    @State private var dragOffset: CGFloat = 0
-    @State private var isPlayPauseCoolingDown: Bool = false
-    @State private var playPauseCooldownResetTask: Task<Void, Never>?
-    @State private var showAddToPlaylistSheet: Bool = false
-    @State private var showShareSheet: Bool = false
-    @State private var showCustomCoverPicker: Bool = false
-    @State private var showTrackTrimSheet: Bool = false
-    @State private var selectedCoverPhotoItem: PhotosPickerItem?
+    @StateObject private var dragController = PlayerSheetDragController()
 
     public init() {}
 
@@ -62,6 +161,15 @@ public struct AppleMusicPlayerOverlayView: View {
         return verticalDominant && (translationHeight > 110 || predictedEndHeight > 260)
     }
 
+    /// Full-screen vertical swipe-to-dismiss MUST only be enabled on the non-scrolling artwork view (`.none`).
+    /// When `.lyrics` or `.upNext` is open, vertical drags in the content area belong 100% to the `ScrollView`
+    /// so pulling lyrics up/down NEVER triggers player dismissal; users can still drag the top grabber/header to dismiss.
+    public static func shouldAllowFullScreenSwipeDismiss(
+        for activeOverlayTab: UniversalAudioPlayerEngine.ExpandedOverlayTab
+    ) -> Bool {
+        activeOverlayTab == .none
+    }
+
     public var body: some View {
         GeometryReader { safeGeo in
             let safeTop = safeGeo.safeAreaInsets.top
@@ -69,18 +177,6 @@ public struct AppleMusicPlayerOverlayView: View {
             let fullWidth = max(safeGeo.size.width + safeGeo.safeAreaInsets.leading + safeGeo.safeAreaInsets.trailing, 320)
             let fullHeight = max(safeGeo.size.height + safeTop + safeBottom, 568)
             let isExpanded = player.isPlayerExpanded
-            let activeDrag = max(0, dragOffset)
-            let sheetOffsetY = Self.sheetVerticalOffset(
-                isExpanded: isExpanded,
-                dragOffset: activeDrag,
-                screenHeight: fullHeight
-            )
-            let dismissProgress = isExpanded ? min(1.0, activeDrag / max(fullHeight * 0.55, 1)) : 1.0
-            let cardCornerRadius = Self.sheetCornerRadius(
-                isExpanded: isExpanded,
-                dragOffset: activeDrag,
-                screenHeight: fullHeight
-            )
 
             ZStack(alignment: .bottom) {
                 // Single persistent YouTube Music engine instance — kept inside screen bounds so iOS WebKit never throttles timers, 100% invisible
@@ -92,74 +188,45 @@ public struct AppleMusicPlayerOverlayView: View {
                         .zIndex(-10)
                 }
 
-                // Persistent Floating Mini-Player Bar: stays mounted cleanly in safe area so expanding/closing
-                // smoothly fades & settles it without ever shooting the artwork icon off to the screen edge!
                 if let track = player.currentTrack {
-                    floatingMiniPlayerBar(track: track)
-                        .padding(.horizontal, 12)
-                        .padding(.bottom, 54)
-                        .opacity(isExpanded ? min(1.0, dismissProgress * 1.35) : 1.0)
-                        .scaleEffect(isExpanded ? (0.95 + 0.05 * dismissProgress) : 1.0, anchor: .bottom)
-                        .offset(y: isExpanded ? (12 * (1.0 - dismissProgress)) : 0)
-                        .allowsHitTesting(!isExpanded)
-                        .zIndex(10)
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-            .overlay {
-                if let track = player.currentTrack {
-                    ZStack(alignment: .bottom) {
-                        // Soft dimming backdrop behind the sheet — lightens smoothly as user drags/closes
-                        Color.black
-                            .opacity(isExpanded ? max(0, 0.48 * (1.0 - dismissProgress)) : 0)
-                            .allowsHitTesting(isExpanded)
-                            .zIndex(15)
-
-                        // Permanently-mounted Full-Screen Player Sheet driven by continuous offset(y:):
-                        // guarantees 100% silky 120 FPS slide-up on open and slide-down on close — NEVER snaps or disappears abruptly!
-                        expandedFullScreenPlayer(
+                    PlayerSheetAnimatedFrame(
+                        isExpanded: isExpanded,
+                        fullHeight: fullHeight,
+                        dragController: dragController,
+                        miniContent: FloatingMiniPlayerBarView(
+                            track: track,
+                            dragController: dragController
+                        ),
+                        sheetContent: ExpandedFullScreenPlayerSheetView(
                             track: track,
                             containerSize: CGSize(width: fullWidth, height: fullHeight),
                             safeTop: safeTop,
                             safeBottom: safeBottom,
-                            isVisible: isExpanded
+                            isVisible: isExpanded,
+                            dragController: dragController
                         )
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .clipShape(RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous))
-                        .shadow(color: .black.opacity(isExpanded && activeDrag > 2 ? 0.42 : 0.0), radius: 26, y: -4)
-                        .offset(y: sheetOffsetY)
-                        .allowsHitTesting(isExpanded)
-                        .accessibilityHidden(!isExpanded)
-                        .zIndex(20)
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-                    .ignoresSafeArea()
+                    )
                 }
             }
-        }
-        .onChange(of: player.currentTrack?.id) { _, _ in
-            playPauseCooldownResetTask?.cancel()
-            isPlayPauseCoolingDown = false
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
         }
     }
+}
 
-    private func openExpandedPlayer() {
-        dragOffset = 0
-        withAnimation(AuraTheme.springPlayerSheet) {
-            player.isPlayerExpanded = true
-        }
-    }
+// MARK: - 1. Isolated Floating Apple Music Mini-Player Bar
 
-    private func closeExpandedPlayer() {
-        withAnimation(AuraTheme.springPlayerDismiss) {
-            player.isPlayerExpanded = false
-            dragOffset = 0
-        }
-    }
+private struct FloatingMiniPlayerBarView: View {
+    let track: UniversalTrack
+    let dragController: PlayerSheetDragController
 
-    private func triggerPlayPauseWithCooldownFeedback(hapticStyle: UIImpactFeedbackGenerator.FeedbackStyle) {
+    @ObservedObject private var player: UniversalAudioPlayerEngine = .shared
+    @ObservedObject private var persistence: PersistenceController = .shared
+    @State private var isPlayPauseCoolingDown: Bool = false
+    @State private var playPauseCooldownResetTask: Task<Void, Never>?
+
+    private func triggerPlayPause() {
         guard player.togglePlayPause() else { return }
-        UIImpactFeedbackGenerator(style: hapticStyle).impactOccurred()
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
         isPlayPauseCoolingDown = true
         playPauseCooldownResetTask?.cancel()
         playPauseCooldownResetTask = Task { @MainActor in
@@ -169,13 +236,12 @@ public struct AppleMusicPlayerOverlayView: View {
         }
     }
 
-    // MARK: - 1. Floating Apple Music Mini-Player Bar
-
-    private func floatingMiniPlayerBar(track: UniversalTrack) -> some View {
+    var body: some View {
         let effectiveArt = persistence.effectiveArtworkURL(for: track) ?? track.artworkURL
-        return HStack(spacing: 10) {
+        HStack(spacing: 10) {
             HStack(spacing: 12) {
                 AuraArtworkView(url: effectiveArt, size: 42, cornerRadius: 8)
+                    .equatable()
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text(track.title)
@@ -193,12 +259,12 @@ public struct AppleMusicPlayerOverlayView: View {
             }
             .contentShape(Rectangle())
             .onTapGesture {
-                openExpandedPlayer()
+                dragController.openExpandedPlayer()
             }
 
             HStack(spacing: 6) {
                 Button {
-                    triggerPlayPauseWithCooldownFeedback(hapticStyle: .light)
+                    triggerPlayPause()
                 } label: {
                     ZStack {
                         Circle()
@@ -253,57 +319,69 @@ public struct AppleMusicPlayerOverlayView: View {
             DragGesture(minimumDistance: 20)
                 .onEnded { value in
                     if value.translation.height < -24 && abs(value.translation.height) > abs(value.translation.width) {
-                        openExpandedPlayer()
+                        dragController.openExpandedPlayer()
                     }
                 }
         )
+        .onChange(of: track.id) { _, _ in
+            playPauseCooldownResetTask?.cancel()
+            isPlayPauseCoolingDown = false
+        }
     }
+}
 
-    // MARK: - 2. Full-Screen Expanded Apple Music Player
+// MARK: - 2. Isolated Full-Screen Expanded Apple Music Player Sheet
 
-    /// Full-screen vertical swipe-to-dismiss MUST only be enabled on the non-scrolling artwork view (`.none`).
-    /// When `.lyrics` or `.upNext` is open, vertical drags in the content area belong 100% to the `ScrollView`
-    /// so pulling lyrics up/down NEVER triggers player dismissal; users can still drag the top grabber/header to dismiss.
-    public static func shouldAllowFullScreenSwipeDismiss(
-        for activeOverlayTab: UniversalAudioPlayerEngine.ExpandedOverlayTab
-    ) -> Bool {
-        activeOverlayTab == .none
+private struct ExpandedFullScreenPlayerSheetView: View {
+    let track: UniversalTrack
+    let containerSize: CGSize
+    let safeTop: CGFloat
+    let safeBottom: CGFloat
+    let isVisible: Bool
+    let dragController: PlayerSheetDragController
+
+    @ObservedObject private var player: UniversalAudioPlayerEngine = .shared
+    @ObservedObject private var persistence: PersistenceController = .shared
+    @ObservedObject private var downloadManager: OfflineDownloadManager = .shared
+
+    @State private var isPlayPauseCoolingDown: Bool = false
+    @State private var playPauseCooldownResetTask: Task<Void, Never>?
+    @State private var showAddToPlaylistSheet: Bool = false
+    @State private var showShareSheet: Bool = false
+    @State private var showCustomCoverPicker: Bool = false
+    @State private var showTrackTrimSheet: Bool = false
+    @State private var selectedCoverPhotoItem: PhotosPickerItem?
+
+    private func triggerPlayPauseWithCooldownFeedback(hapticStyle: UIImpactFeedbackGenerator.FeedbackStyle) {
+        guard player.togglePlayPause() else { return }
+        UIImpactFeedbackGenerator(style: hapticStyle).impactOccurred()
+        isPlayPauseCoolingDown = true
+        playPauseCooldownResetTask?.cancel()
+        playPauseCooldownResetTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            guard !Task.isCancelled else { return }
+            isPlayPauseCoolingDown = false
+        }
     }
 
     private var dismissHandleDragGesture: some Gesture {
         DragGesture(minimumDistance: 18)
             .onChanged { value in
-                if value.translation.height > 8 && abs(value.translation.height) > abs(value.translation.width) * 1.2 {
-                    dragOffset = value.translation.height
-                }
+                dragController.handleDragChanged(translation: value.translation)
             }
             .onEnded { value in
-                if Self.shouldDismissSheet(
-                    translationHeight: value.translation.height,
-                    predictedEndHeight: value.predictedEndTranslation.height,
-                    horizontalTranslation: value.translation.width
-                ) {
-                    // Continuous offset interpolation from current finger dragOffset -> fullHeight + 32!
-                    closeExpandedPlayer()
-                } else {
-                    withAnimation(AuraTheme.springPlayerSheet) {
-                        dragOffset = 0
-                    }
-                }
+                dragController.handleDragEnded(
+                    translation: value.translation,
+                    predictedEndTranslation: value.predictedEndTranslation
+                )
             }
     }
 
-    private func expandedFullScreenPlayer(
-        track: UniversalTrack,
-        containerSize: CGSize,
-        safeTop: CGFloat,
-        safeBottom: CGFloat,
-        isVisible: Bool
-    ) -> some View {
+    var body: some View {
         let effectiveArt = persistence.effectiveArtworkURL(for: track) ?? track.artworkURL
-        let artworkSize = Self.preferredExpandedArtworkSize(for: containerSize)
+        let artworkSize = AppleMusicPlayerOverlayView.preferredExpandedArtworkSize(for: containerSize)
 
-        return ZStack {
+        ZStack {
             DynamicArtworkMeshBackground(artworkURL: effectiveArt, isAnimating: isVisible && player.isPlaying)
                 .equatable()
 
@@ -318,7 +396,7 @@ public struct AppleMusicPlayerOverlayView: View {
                         .frame(maxWidth: .infinity)
                         .contentShape(Rectangle())
                         .onTapGesture {
-                            closeExpandedPlayer()
+                            dragController.closeExpandedPlayer()
                         }
 
                     // Compact Header when Lyrics or Up Next is active
@@ -372,10 +450,12 @@ public struct AppleMusicPlayerOverlayView: View {
             }
         }
         .environment(\.colorScheme, .dark)
+        .onChange(of: track.id) { _, _ in
+            playPauseCooldownResetTask?.cancel()
+            isPlayPauseCoolingDown = false
+        }
         .onChange(of: player.activeOverlayTab) { _, _ in
-            withAnimation(AuraTheme.springInteractive) {
-                dragOffset = 0
-            }
+            dragController.resetDragAnimated()
         }
         .sheet(isPresented: $showAddToPlaylistSheet) {
             AddToPlaylistPickerSheet(track: track)
@@ -415,11 +495,12 @@ public struct AppleMusicPlayerOverlayView: View {
                 cornerRadius: AuraTheme.expandedArtworkCornerRadius,
                 isPlayingElevated: player.isPlaying
             )
+            .equatable()
             .scaleEffect(player.isPlaying ? 1.0 : 0.86)
             .animation(AuraTheme.springBouncy, value: player.isPlaying)
 
             // Live Synchronized Lyric Line Preview Pill (isolated from main player redraws -> 120 FPS!)
-            LiveLyricPreviewPillView {
+            LiveLyricPreviewPillView(isVisible: isVisible) {
                 withAnimation(AuraTheme.springInteractive) {
                     player.activeOverlayTab = .lyrics
                 }
@@ -431,8 +512,10 @@ public struct AppleMusicPlayerOverlayView: View {
     }
 
     private func compactNowPlayingHeader(track: UniversalTrack, artworkURL: URL?) -> some View {
-        HStack(spacing: 12) {
+        let isFav = persistence.isTrackFavorite(track.id)
+        return HStack(spacing: 12) {
             AuraArtworkView(url: artworkURL, size: 48, cornerRadius: 8)
+                .equatable()
                 .onTapGesture {
                     withAnimation(AuraTheme.springInteractive) {
                         player.activeOverlayTab = .none
@@ -453,19 +536,23 @@ public struct AppleMusicPlayerOverlayView: View {
             Spacer()
 
             Button {
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
                 persistence.toggleFavorite(track)
             } label: {
-                Image(systemName: persistence.isTrackFavorite(track.id) ? "star.fill" : "star")
+                Image(systemName: isFav ? "star.fill" : "star")
                     .font(.system(size: 16, weight: .bold))
-                    .foregroundStyle(persistence.isTrackFavorite(track.id) ? AuraTheme.accentPink : .white.opacity(0.8))
+                    .foregroundStyle(isFav ? AuraTheme.accentPink : .white.opacity(0.8))
+                    .symbolEffect(.bounce, value: isFav)
                     .padding(8)
                     .background(Circle().fill(.white.opacity(0.15)))
             }
+            .buttonStyle(AuraTactileTransportButtonStyle())
         }
     }
 
     private func trackTitleAndActionsRow(track: UniversalTrack) -> some View {
-        HStack(alignment: .center, spacing: 12) {
+        let isFav = persistence.isTrackFavorite(track.id)
+        return HStack(alignment: .center, spacing: 12) {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {
                     Text(track.title)
@@ -507,21 +594,26 @@ public struct AppleMusicPlayerOverlayView: View {
                         Image(systemName: isDownloaded ? "checkmark.circle.fill" : "arrow.down.circle.fill")
                             .font(.system(size: 17, weight: .bold))
                             .foregroundStyle(isDownloaded ? Color.green : .white)
+                            .contentTransition(.symbolEffect(.replace))
                     }
                 }
                 .frame(width: 34, height: 34)
                 .background(Circle().fill(.white.opacity(0.16)))
             }
+            .buttonStyle(AuraTactileTransportButtonStyle())
 
             Button {
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
                 persistence.toggleFavorite(track)
             } label: {
-                Image(systemName: persistence.isTrackFavorite(track.id) ? "star.fill" : "star")
+                Image(systemName: isFav ? "star.fill" : "star")
                     .font(.system(size: 17, weight: .bold))
-                    .foregroundStyle(persistence.isTrackFavorite(track.id) ? AuraTheme.accentPink : .white)
+                    .foregroundStyle(isFav ? AuraTheme.accentPink : .white)
+                    .symbolEffect(.bounce, value: isFav)
                     .frame(width: 34, height: 34)
                     .background(Circle().fill(.white.opacity(0.16)))
             }
+            .buttonStyle(AuraTactileTransportButtonStyle())
 
             Menu {
                 Button {
@@ -775,7 +867,10 @@ public struct AppleMusicPlayerOverlayView: View {
 
                 // Shuffle Toggle
                 Button {
-                    player.toggleShuffle()
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    withAnimation(AuraTheme.springInteractive) {
+                        player.toggleShuffle()
+                    }
                 } label: {
                     Image(systemName: "shuffle")
                         .font(.system(size: 15, weight: .bold))
@@ -787,14 +882,19 @@ public struct AppleMusicPlayerOverlayView: View {
                                 .fill(player.isShuffled ? Color.white : Color.white.opacity(0.16))
                         )
                 }
+                .buttonStyle(AuraTactileTransportButtonStyle())
 
                 // Repeat Cycle Toggle (Off / All / One)
                 Button {
-                    player.cycleRepeatMode()
+                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                    withAnimation(AuraTheme.springInteractive) {
+                        player.cycleRepeatMode()
+                    }
                 } label: {
                     Image(systemName: player.repeatMode.symbolName)
                         .font(.system(size: 15, weight: .bold))
                         .foregroundStyle(player.repeatMode != .off ? Color.black : Color.white)
+                        .contentTransition(.symbolEffect(.replace))
                         .padding(.horizontal, 12)
                         .padding(.vertical, 6)
                         .background(
@@ -802,6 +902,7 @@ public struct AppleMusicPlayerOverlayView: View {
                                 .fill(player.repeatMode != .off ? Color.white : Color.white.opacity(0.16))
                         )
                 }
+                .buttonStyle(AuraTactileTransportButtonStyle())
             }
             .padding(.horizontal, 24)
 
@@ -822,6 +923,7 @@ public struct AppleMusicPlayerOverlayView: View {
                                 size: 44,
                                 cornerRadius: 7
                             )
+                            .equatable()
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(queuedTrack.title)
                                     .font(.system(size: 15, weight: .semibold))
@@ -869,9 +971,9 @@ public struct AppleMusicPlayerOverlayView: View {
 private struct AuraTactileTransportButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .scaleEffect(configuration.isPressed ? 0.88 : 1.0)
-            .opacity(configuration.isPressed ? 0.78 : 1.0)
-            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+            .scaleEffect(configuration.isPressed ? 0.89 : 1.0)
+            .opacity(configuration.isPressed ? 0.80 : 1.0)
+            .animation(AuraTheme.springSnappy, value: configuration.isPressed)
     }
 }
 
@@ -937,9 +1039,9 @@ private struct ExpandedPlaybackScrubberView: View {
 }
 
 /// Ultra-lightweight Apple Music smooth progress bar:
-/// - Glides smoothly at 30 FPS via O(1) wall-clock linear interpolation between 4–5Hz engine ticks (~0.1% CPU)
+/// - Glides smoothly at 60 FPS via O(1) wall-clock linear interpolation between 4–5Hz engine ticks (~0.15% CPU)
 /// - Displays trim-relative elapsed time (`0:00 → newLength`) seamlessly as if the trimmed track were the original
-/// - Automatically pauses TimelineView (0% CPU) when paused, buffering, scrubbing, or backgrounded
+/// - Automatically pauses TimelineView (0% CPU) when collapsed, paused, buffering, scrubbing, or backgrounded
 /// - Never triggers PlaybackClock or UniversalAudioPlayerEngine invalidations
 private struct SmoothAppleMusicScrubberBar: View {
     let trimStart: TimeInterval
@@ -958,7 +1060,7 @@ private struct SmoothAppleMusicScrubberBar: View {
             let width = max(geo.size.width, 1)
             let barHeight: CGFloat = isScrubbing ? 10 : 6
 
-            TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !shouldAnimateBar)) { _ in
+            TimelineView(.animation(minimumInterval: 1.0 / 60.0, paused: !shouldAnimateBar)) { _ in
                 let rawInterpolated = clock.interpolatedTime(
                     isPlaying: isPlaying,
                     isBuffering: isBuffering,
@@ -980,7 +1082,7 @@ private struct SmoothAppleMusicScrubberBar: View {
                         .frame(width: progress <= 0.0005 ? 0 : fillWidth, height: barHeight)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
-                .animation(.spring(response: 0.22, dampingFraction: 0.82), value: isScrubbing)
+                .animation(AuraTheme.springSnappy, value: isScrubbing)
             }
             .contentShape(Rectangle())
             .gesture(
@@ -1007,6 +1109,7 @@ private struct SmoothAppleMusicScrubberBar: View {
 }
 
 private struct LiveLyricPreviewPillView: View {
+    let isVisible: Bool
     let onTap: () -> Void
     @ObservedObject private var lyricsService: LyricsService = .shared
     @State private var displayedLine: String? = nil
@@ -1036,7 +1139,7 @@ private struct LiveLyricPreviewPillView: View {
                     .font(.system(size: 10, weight: .bold))
                     .foregroundStyle(.white.opacity(0.6))
             }
-            .animation(.easeInOut(duration: 0.2), value: displayedLine)
+            .animation(.easeInOut(duration: 0.22), value: displayedLine)
             .padding(.horizontal, 16)
             .padding(.vertical, 9)
             .background(
@@ -1044,20 +1147,31 @@ private struct LiveLyricPreviewPillView: View {
                     .fill(Color.white.opacity(0.16))
             )
         }
-        .buttonStyle(.plain)
+        .buttonStyle(AuraTactileTransportButtonStyle())
         .onAppear {
+            guard isVisible else { return }
             displayedLine = lyricsService.activeLyricLineText(at: PlaybackClock.shared.currentTime)
         }
+        .onChange(of: isVisible) { _, nowVisible in
+            if nowVisible {
+                displayedLine = lyricsService.activeLyricLineText(at: PlaybackClock.shared.currentTime)
+            }
+        }
         .onChange(of: lyricsService.currentDocument?.id) { _, _ in
+            guard isVisible else { return }
             displayedLine = lyricsService.activeLyricLineText(at: PlaybackClock.shared.currentTime)
         }
         .onChange(of: lyricsService.customDocument?.id) { _, _ in
+            guard isVisible else { return }
             displayedLine = lyricsService.activeLyricLineText(at: PlaybackClock.shared.currentTime)
         }
         .onChange(of: lyricsService.lyricsMode) { _, _ in
+            guard isVisible else { return }
             displayedLine = lyricsService.activeLyricLineText(at: PlaybackClock.shared.currentTime)
         }
         .onReceive(PlaybackClock.shared.$currentTime) { newTime in
+            // Skip lyric line lookups completely when the full-screen sheet is collapsed (0% background CPU!)
+            guard isVisible else { return }
             let nextLine = lyricsService.activeLyricLineText(at: newTime)
             if nextLine != displayedLine {
                 displayedLine = nextLine

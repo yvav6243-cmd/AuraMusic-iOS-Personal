@@ -132,7 +132,6 @@ public final class LocalAudioFileImporter: ObservableObject {
 
 public struct LibraryTabView: View {
     @ObservedObject var persistence: PersistenceController = .shared
-    @ObservedObject var player: UniversalAudioPlayerEngine = .shared
 
     @State private var showFileImporter: Bool = false
     @State private var showNewPlaylistAlert: Bool = false
@@ -248,13 +247,14 @@ public struct LibraryTabView: View {
                             LazyVGrid(columns: columns, spacing: 18) {
                                 ForEach(allTracks.prefix(12)) { track in
                                     Button {
-                                        player.play(track, queue: allTracks)
+                                        UniversalAudioPlayerEngine.shared.play(track, queue: allTracks)
                                     } label: {
                                         VStack(alignment: .leading, spacing: 6) {
                                             AuraFlexibleArtworkView(
                                                 url: persistence.effectiveArtworkURL(for: track),
                                                 cornerRadius: 10
                                             )
+                                            .equatable()
                                             Text(track.title)
                                                 .font(.system(size: 14, weight: .semibold))
                                                 .foregroundStyle(.primary)
@@ -321,7 +321,7 @@ public struct LibraryTabView: View {
                     Task {
                         let imported = await LocalAudioFileImporter.shared.importAudioFiles(from: urls)
                         if let first = imported.first {
-                            player.play(first, queue: imported)
+                            UniversalAudioPlayerEngine.shared.play(first, queue: imported)
                         }
                     }
                 }
@@ -503,7 +503,6 @@ public struct SmartPlaylistBuilderSheet: View {
 public struct LibrarySongsListView: View {
     public let onlyFavorites: Bool
     @ObservedObject var persistence: PersistenceController = .shared
-    @ObservedObject var player: UniversalAudioPlayerEngine = .shared
     @ObservedObject var downloadManager: OfflineDownloadManager = .shared
     @State private var sortOrder: SongSortOption = .recentlyAdded
     @State private var filterText: String = ""
@@ -547,8 +546,8 @@ public struct LibrarySongsListView: View {
                         HStack(spacing: 12) {
                             Button {
                                 if let first = filteredTracks.first {
-                                    player.isShuffled = false
-                                    player.play(first, queue: filteredTracks)
+                                    UniversalAudioPlayerEngine.shared.isShuffled = false
+                                    UniversalAudioPlayerEngine.shared.play(first, queue: filteredTracks)
                                 }
                             } label: {
                                 Label("Play", systemImage: "play.fill")
@@ -563,8 +562,8 @@ public struct LibrarySongsListView: View {
                             Button {
                                 let shuffled = filteredTracks.shuffled()
                                 if let first = shuffled.first {
-                                    player.isShuffled = true
-                                    player.play(first, queue: shuffled)
+                                    UniversalAudioPlayerEngine.shared.isShuffled = true
+                                    UniversalAudioPlayerEngine.shared.play(first, queue: shuffled)
                                 }
                             } label: {
                                 Label("Shuffle", systemImage: "shuffle")
@@ -764,7 +763,6 @@ public struct LibraryAlbumsListView: View {
 
 public struct ArtistDetailPageView: View {
     public let artist: UniversalArtist
-    @ObservedObject var player: UniversalAudioPlayerEngine = .shared
     @State private var catalogTracks: [UniversalTrack] = []
     @State private var catalogAlbums: [UniversalAlbum] = []
 
@@ -778,7 +776,7 @@ public struct ArtistDetailPageView: View {
 
     public var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 22) {
+            LazyVStack(alignment: .leading, spacing: 22) {
                 VStack(spacing: 12) {
                     AuraArtworkView(
                         url: artist.artworkURL ?? allTracks.first?.artworkURL,
@@ -786,13 +784,14 @@ public struct ArtistDetailPageView: View {
                         cornerRadius: 75,
                         placeholderSymbol: "music.mic"
                     )
+                    .equatable()
                     Text(artist.name)
                         .font(.system(size: 28, weight: .bold))
                         .multilineTextAlignment(.center)
 
                     Button {
                         if let first = allTracks.first {
-                            player.play(first, queue: allTracks)
+                            UniversalAudioPlayerEngine.shared.play(first, queue: allTracks)
                         }
                     } label: {
                         Label("Play Top Songs", systemImage: "play.fill")
@@ -807,7 +806,7 @@ public struct ArtistDetailPageView: View {
                 .padding(.top, 12)
 
                 AppleMusicSectionHeader(title: "Top Songs")
-                VStack(spacing: 6) {
+                LazyVStack(spacing: 6) {
                     ForEach(allTracks.prefix(15)) { track in
                         TrackRowView(track: track, queueContext: allTracks)
                             .padding(.horizontal, AuraTheme.horizontalMargin)
@@ -817,13 +816,14 @@ public struct ArtistDetailPageView: View {
                 if !catalogAlbums.isEmpty {
                     AppleMusicSectionHeader(title: "Albums")
                     ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 16) {
+                        LazyHStack(spacing: 16) {
                             ForEach(catalogAlbums) { album in
                                 NavigationLink {
                                     AlbumDetailPageView(album: album)
                                 } label: {
                                     VStack(alignment: .leading, spacing: 6) {
                                         AuraArtworkView(url: album.artworkURL, size: 145, cornerRadius: 10)
+                                            .equatable()
                                         Text(album.title)
                                             .font(.system(size: 14, weight: .semibold))
                                             .foregroundStyle(.primary)
@@ -859,7 +859,6 @@ public struct ArtistDetailPageView: View {
 
 public struct AlbumDetailPageView: View {
     public let album: UniversalAlbum
-    @ObservedObject var player: UniversalAudioPlayerEngine = .shared
     @ObservedObject var persistence: PersistenceController = .shared
     @State private var loadedTracks: [UniversalTrack] = []
 
@@ -876,6 +875,7 @@ public struct AlbumDetailPageView: View {
             Section {
                 VStack(spacing: 12) {
                     AuraArtworkView(url: album.artworkURL, size: 215, cornerRadius: 12)
+                        .equatable()
                     Text(album.title)
                         .font(.system(size: 21, weight: .bold))
                         .multilineTextAlignment(.center)
@@ -896,7 +896,7 @@ public struct AlbumDetailPageView: View {
                     HStack(spacing: 14) {
                         Button {
                             if let first = tracks.first {
-                                player.play(first, queue: tracks)
+                                UniversalAudioPlayerEngine.shared.play(first, queue: tracks)
                             }
                         } label: {
                             Label("Play", systemImage: "play.fill")
@@ -911,8 +911,8 @@ public struct AlbumDetailPageView: View {
                         Button {
                             let shuffled = tracks.shuffled()
                             if let first = shuffled.first {
-                                player.isShuffled = true
-                                player.play(first, queue: shuffled)
+                                UniversalAudioPlayerEngine.shared.isShuffled = true
+                                UniversalAudioPlayerEngine.shared.play(first, queue: shuffled)
                             }
                         } label: {
                             Label("Shuffle", systemImage: "shuffle")
@@ -939,9 +939,7 @@ public struct AlbumDetailPageView: View {
                             .frame(width: 24)
 
                         VStack(alignment: .leading, spacing: 2) {
-                            Text(track.title)
-                                .font(.system(size: 15, weight: .semibold))
-                                .foregroundStyle(player.currentTrack?.id == track.id ? AuraTheme.accentPink : .primary)
+                            TrackRowTitleWithEqualizer(trackID: track.id, title: track.title)
                             Text(track.artist)
                                 .font(.system(size: 12))
                                 .foregroundStyle(.secondary)
@@ -955,7 +953,7 @@ public struct AlbumDetailPageView: View {
                     }
                     .contentShape(Rectangle())
                     .onTapGesture {
-                        player.play(track, queue: tracks)
+                        UniversalAudioPlayerEngine.shared.play(track, queue: tracks)
                     }
                 }
             }
@@ -1079,7 +1077,6 @@ public struct TrackRowView: View {
     public var isDownloaded: Bool = false
     public var isDownloading: Bool = false
 
-    @ObservedObject var player: UniversalAudioPlayerEngine = .shared
     @ObservedObject var persistence: PersistenceController = .shared
     @State private var showPlaylistPicker: Bool = false
     @State private var showShareSheet: Bool = false
@@ -1119,25 +1116,14 @@ public struct TrackRowView: View {
     public var body: some View {
         HStack(spacing: 12) {
             AuraArtworkView(url: effectiveCoverURL, size: 50, cornerRadius: 8)
+                .equatable()
 
             VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 6) {
-                    if player.currentTrack?.id == track.id {
-                        NowPlayingEqualizerBars(isPlaying: player.isPlaying)
-                    }
-                    Text(track.title)
-                        .font(.system(size: 15, weight: .semibold))
-                        .foregroundStyle(player.currentTrack?.id == track.id ? AuraTheme.accentPink : .primary)
-                        .lineLimit(1)
-                    if track.explicit {
-                        Text("E")
-                            .font(.system(size: 9, weight: .bold))
-                            .foregroundStyle(.secondary)
-                            .padding(.horizontal, 4)
-                            .padding(.vertical, 1)
-                            .background(RoundedRectangle(cornerRadius: 3).fill(Color.secondary.opacity(0.2)))
-                    }
-                }
+                TrackRowTitleWithEqualizer(
+                    trackID: track.id,
+                    title: track.title,
+                    explicit: track.explicit
+                )
 
                 Text(trackSubtitle)
                     .font(.system(size: 13))
@@ -1168,7 +1154,7 @@ public struct TrackRowView: View {
         }
         .contentShape(Rectangle())
         .onTapGesture {
-            player.play(track, queue: queueContext.isEmpty ? [track] : queueContext)
+            UniversalAudioPlayerEngine.shared.play(track, queue: queueContext.isEmpty ? [track] : queueContext)
         }
         .contextMenu {
             trackContextMenuItems
@@ -1192,7 +1178,7 @@ public struct TrackRowView: View {
                         for: track,
                         defaultArtworkURL: track.artworkURL
                     )
-                    player.applyUpdatedArtworkURL(newURL, forTrackID: track.id)
+                    UniversalAudioPlayerEngine.shared.applyUpdatedArtworkURL(newURL, forTrackID: track.id)
                 }
                 selectedCoverPhotoItem = nil
             }
@@ -1202,13 +1188,13 @@ public struct TrackRowView: View {
     @ViewBuilder
     private var trackContextMenuItems: some View {
         Button {
-            player.playNext(track)
+            UniversalAudioPlayerEngine.shared.playNext(track)
         } label: {
             Label("Play Next", systemImage: "text.line.first.and.arrowtriangle.forward")
         }
 
         Button {
-            player.addToQueue(track)
+            UniversalAudioPlayerEngine.shared.addToQueue(track)
         } label: {
             Label("Play Last", systemImage: "text.line.last.and.arrowtriangle.forward")
         }
@@ -1230,7 +1216,7 @@ public struct TrackRowView: View {
         if persistence.hasCustomArtwork(for: track) {
             Button {
                 let restoredURL = persistence.setCustomTrackArtwork(imageData: nil, for: track)
-                player.applyUpdatedArtworkURL(restoredURL, forTrackID: track.id)
+                UniversalAudioPlayerEngine.shared.applyUpdatedArtworkURL(restoredURL, forTrackID: track.id)
             } label: {
                 Label("Reset to Default Album Cover", systemImage: "arrow.counterclockwise")
             }
