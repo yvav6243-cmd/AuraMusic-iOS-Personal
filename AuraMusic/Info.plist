@@ -32,8 +32,6 @@
 	<true/>
 	<key>NSAppleMusicUsageDescription</key>
 	<string>AuraMusic uses Apple Music and MusicKit to search the catalog, import shared Apple Music playlists, and play authorized music.</string>
-	<key>NSSupportsLiveActivities</key>
-	<true/>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>audio</string>

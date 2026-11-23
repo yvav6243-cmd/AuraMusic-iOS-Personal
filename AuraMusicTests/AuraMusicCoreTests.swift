@@ -432,24 +432,50 @@ final class AuraMusicCoreTests: XCTestCase {
     }
 
     @MainActor
-    func testTwoPhaseAudioSessionOptionsAndAllRemoteCommandsEnabled() {
-        // Phase 1 (active playback): .mixWithOthers MUST be set so WKWebView WebContent & silent keep-alive
-        // NEVER trigger AVAudioSession.interruptionNotification (.began) causing every new song to start paused!
+    func testTwoPhaseAudioSessionOptionsAndAllRemoteCommandsEnabled() throws {
+        // 1. WebKit fallback session uses .mixWithOthers ONLY — NEVER .allowAirPlay/.allowBluetoothA2DP
+        //    which throw OSStatus -50 (paramErr) on .playback!
         XCTAssertTrue(
             UniversalAudioPlayerEngine.activePlaybackAudioSessionOptions.contains(.mixWithOthers),
-            "Active playback audio session MUST include .mixWithOthers so WKWebView never self-interrupts on startup"
+            "WebKit fallback playback audio session MUST include .mixWithOthers so WKWebView never self-interrupts"
         )
-        XCTAssertTrue(UniversalAudioPlayerEngine.activePlaybackAudioSessionOptions.contains(.allowAirPlay))
-        XCTAssertTrue(UniversalAudioPlayerEngine.activePlaybackAudioSessionOptions.contains(.allowBluetoothA2DP))
-
-        // Phase 2 (background soft-pause): .mixWithOthers MUST NOT be set so AuraMusic owns MPRemoteCommandCenter
-        // and the Lock Screen Play button stays 100% enabled and clickable!
         XCTAssertFalse(
-            UniversalAudioPlayerEngine.backgroundPausedLockScreenAudioSessionOptions.contains(.mixWithOthers),
-            "Background-paused Lock Screen audio session MUST omit .mixWithOthers so Lock Screen Play stays enabled"
+            UniversalAudioPlayerEngine.activePlaybackAudioSessionOptions.contains(.allowAirPlay),
+            ".allowAirPlay is invalid for .playback and throws OSStatus -50"
         )
-        XCTAssertTrue(UniversalAudioPlayerEngine.backgroundPausedLockScreenAudioSessionOptions.contains(.allowAirPlay))
-        XCTAssertTrue(UniversalAudioPlayerEngine.backgroundPausedLockScreenAudioSessionOptions.contains(.allowBluetoothA2DP))
+        XCTAssertFalse(
+            UniversalAudioPlayerEngine.activePlaybackAudioSessionOptions.contains(.allowBluetoothA2DP),
+            ".allowBluetoothA2DP is invalid for .playback (Bluetooth A2DP is automatic on .playback)"
+        )
+
+        // 2. Native long-form music session (triggers iPhone Dynamic Island Artwork + Live Bass Waveform!) MUST omit .mixWithOthers & invalid flags
+        XCTAssertEqual(
+            UniversalAudioPlayerEngine.backgroundPausedLockScreenAudioSessionOptions,
+            [],
+            "Native long-form music .playback session MUST use empty options so iOS renders the Music Dynamic Island with artwork & live bass waveform"
+        )
+
+        // 3. Verify REAL AVAudioSession.setCategory succeeds with ZERO OSStatus -50 error!
+        let session = AVAudioSession.sharedInstance()
+        XCTAssertNoThrow(
+            try session.setCategory(
+                .playback,
+                mode: .default,
+                policy: .longFormAudio,
+                options: UniversalAudioPlayerEngine.backgroundPausedLockScreenAudioSessionOptions
+            ),
+            "Long-form music .playback audio session MUST succeed with zero OSStatus -50 error"
+        )
+        XCTAssertEqual(session.category, .playback)
+        XCTAssertEqual(session.routeSharingPolicy, .longFormAudio)
+        XCTAssertNoThrow(
+            try session.setCategory(
+                .playback,
+                mode: .default,
+                options: UniversalAudioPlayerEngine.activePlaybackAudioSessionOptions
+            ),
+            "WebKit fallback .playback session with .mixWithOthers MUST succeed with zero OSStatus -50 error"
+        )
 
         // Initialize shared engine so remote command center is configured
         _ = UniversalAudioPlayerEngine.shared
@@ -2892,5 +2918,60 @@ final class AuraMusicCoreTests: XCTestCase {
             AppleMusicPlayerOverlayView.shouldAllowFullScreenSwipeDismiss(for: .upNext),
             "Dragging Up Next queue MUST NEVER trigger player swipe-to-dismiss"
         )
+    }
+
+    @MainActor
+    func testDynamicIslandNowPlayingPublishesLongFormAudioMetadataAndSquareArtwork() throws {
+        // 1. Verify rectangular 16:9 YouTube artwork is center-cropped to crisp 1:1 square for Dynamic Island leading slot
+        let rectRenderer = UIGraphicsImageRenderer(size: CGSize(width: 640, height: 360))
+        let wideCover = rectRenderer.image { ctx in
+            UIColor.systemPink.setFill()
+            ctx.fill(CGRect(x: 0, y: 0, width: 640, height: 360))
+        }
+        let squared = UniversalAudioPlayerEngine.squareNowPlayingArtworkImage(from: wideCover, targetDimension: 600)
+        XCTAssertEqual(squared.size.width, 600, accuracy: 1.0)
+        XCTAssertEqual(squared.size.height, 600, accuracy: 1.0)
+
+        // 2. Verify playing an offline audio file immediately sets .playback/.longFormAudio + complete MPNowPlayingInfoCenter
+        //    required for native iPhone Dynamic Island (song cover on left + live audio bass waveform on right)!
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let dlDir = docs.appendingPathComponent("AuraDownloads", isDirectory: true)
+        try FileManager.default.createDirectory(at: dlDir, withIntermediateDirectories: true)
+        let relPath = "AuraDownloads/dynamic_island_test.wav"
+        let fullURL = docs.appendingPathComponent(relPath)
+        try UniversalAudioPlayerEngine.buildSubAudibleKeepAliveWAVData().write(to: fullURL, options: .atomic)
+
+        let track = UniversalTrack(
+            provider: .youtubeMusic,
+            providerTrackID: "ISLAND_TEST_01",
+            title: "Starboy",
+            artist: "The Weeknd",
+            album: "Starboy",
+            duration: 210.0,
+            isStreamable: true
+        )
+        let engine = UniversalAudioPlayerEngine.shared
+        defer {
+            engine.pause()
+            engine.teardownYouTubeWebViewCompletely()
+            OfflineDownloadManager.shared.removeDownload(trackID: track.id)
+            try? FileManager.default.removeItem(at: fullURL)
+        }
+
+        OfflineDownloadManager.shared.registerCompletedDownloadForTesting(track: track, relativePath: relPath)
+        engine.play(track)
+
+        let session = AVAudioSession.sharedInstance()
+        XCTAssertEqual(session.category, .playback, "Music playback MUST run in .playback category for Dynamic Island")
+        XCTAssertFalse(session.categoryOptions.contains(.mixWithOthers), "Native playback MUST NOT set .mixWithOthers or iOS hides Music Dynamic Island")
+
+        let info = try XCTUnwrap(MPNowPlayingInfoCenter.default().nowPlayingInfo)
+        XCTAssertEqual(info[MPMediaItemPropertyTitle] as? String, "Starboy")
+        XCTAssertEqual(info[MPMediaItemPropertyArtist] as? String, "The Weeknd")
+        XCTAssertEqual(info[MPNowPlayingInfoPropertyMediaType] as? UInt, MPNowPlayingInfoMediaType.audio.rawValue)
+        XCTAssertEqual(info[MPNowPlayingInfoPropertyIsLiveStream] as? Bool, false)
+        XCTAssertEqual(info[MPNowPlayingInfoPropertyPlaybackRate] as? Double ?? 0, 1.0, accuracy: 0.01)
+        XCTAssertNotNil(info[MPMediaItemPropertyArtwork] as? MPMediaItemArtwork, "Dynamic Island leading slot MUST always receive square artwork on frame 0")
+        XCTAssertEqual(MPNowPlayingInfoCenter.default().playbackState, .playing)
     }
 }

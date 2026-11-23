@@ -249,36 +249,19 @@ public final class DynamicIslandNowPlayingCoordinator {
     private init() {}
 
     public func updateLiveActivity(track: UniversalTrack?, isPlaying: Bool, currentTime: TimeInterval, duration: TimeInterval) {
+        // Native iPhone Dynamic Island Music UI (album artwork on leading side + real-time audio bass/spectrum
+        // waveform on trailing side) is rendered directly by iOS MediaRemote/SpringBoard whenever the app runs
+        // AVAudioSession(.playback, mode: .default, policy: .longFormAudio, options: []) + MPNowPlayingInfoCenter.
+        // Dismiss any leftover empty ActivityKit Live Activities so they never shadow the system Music Island!
         #if canImport(ActivityKit)
         if #available(iOS 16.2, *) {
-            guard ActivityAuthorizationInfo().areActivitiesEnabled else { return }
-            guard let track else {
+            let existing = Activity<AuraNowPlayingAttributes>.activities
+            if !existing.isEmpty {
                 Task {
-                    for activity in Activity<AuraNowPlayingAttributes>.activities {
+                    for activity in existing {
                         await activity.end(nil, dismissalPolicy: .immediate)
                     }
                 }
-                return
-            }
-
-            let state = AuraNowPlayingAttributes.ContentState(
-                title: track.title,
-                artist: track.artist,
-                album: track.album,
-                providerBadge: track.provider.shortBadgeName,
-                isPlaying: isPlaying,
-                elapsedSeconds: Int(max(0, currentTime)),
-                durationSeconds: Int(max(0, duration))
-            )
-
-            if let existing = Activity<AuraNowPlayingAttributes>.activities.first {
-                Task {
-                    await existing.update(ActivityContent(state: state, staleDate: nil))
-                }
-            } else {
-                let attributes = AuraNowPlayingAttributes()
-                let content = ActivityContent(state: state, staleDate: nil)
-                _ = try? Activity.request(attributes: attributes, content: content, pushType: nil)
             }
         }
         #endif
