@@ -3155,4 +3155,63 @@ final class AuraMusicCoreTests: XCTestCase {
         // Restore cleanly
         highlight.update(trackID: prevTrack, isPlaying: prevPlaying)
     }
+
+    @MainActor
+    func testLyricsModePreventsScreenAutoLockOnlyWhenVisiblyActiveInForeground() {
+        // Screen MUST stay awake when full-screen player is open on Lyrics tab in foreground
+        XCTAssertTrue(
+            AppleMusicPlayerOverlayView.shouldPreventScreenAutoLock(
+                isPlayerExpanded: true,
+                activeOverlayTab: .lyrics,
+                hasCurrentTrack: true,
+                isAppActive: true
+            )
+        )
+
+        // Screen MUST immediately re-enable auto-lock when player collapses (even if last tab was .lyrics!)
+        XCTAssertFalse(
+            AppleMusicPlayerOverlayView.shouldPreventScreenAutoLock(
+                isPlayerExpanded: false,
+                activeOverlayTab: .lyrics,
+                hasCurrentTrack: true,
+                isAppActive: true
+            )
+        )
+
+        // Screen MUST allow normal auto-lock on Artwork (.none) and Queue (.upNext) tabs
+        XCTAssertFalse(
+            AppleMusicPlayerOverlayView.shouldPreventScreenAutoLock(
+                isPlayerExpanded: true,
+                activeOverlayTab: .none,
+                hasCurrentTrack: true,
+                isAppActive: true
+            )
+        )
+        XCTAssertFalse(
+            AppleMusicPlayerOverlayView.shouldPreventScreenAutoLock(
+                isPlayerExpanded: true,
+                activeOverlayTab: .upNext,
+                hasCurrentTrack: true,
+                isAppActive: true
+            )
+        )
+
+        // Screen MUST allow normal auto-lock when app is inactive/backgrounded or has no current track
+        XCTAssertFalse(
+            AppleMusicPlayerOverlayView.shouldPreventScreenAutoLock(
+                isPlayerExpanded: true,
+                activeOverlayTab: .lyrics,
+                hasCurrentTrack: true,
+                isAppActive: false
+            )
+        )
+        XCTAssertFalse(
+            AppleMusicPlayerOverlayView.shouldPreventScreenAutoLock(
+                isPlayerExpanded: true,
+                activeOverlayTab: .lyrics,
+                hasCurrentTrack: false,
+                isAppActive: true
+            )
+        )
+    }
 }

@@ -116,6 +116,7 @@ private struct PlayerSheetAnimatedFrame<MiniContent: View, SheetContent: View>: 
 public struct AppleMusicPlayerOverlayView: View {
     @ObservedObject var player: UniversalAudioPlayerEngine = .shared
     @StateObject private var dragController = PlayerSheetDragController()
+    @Environment(\.scenePhase) private var scenePhase
 
     public init() {}
 
@@ -170,6 +171,32 @@ public struct AppleMusicPlayerOverlayView: View {
         activeOverlayTab == .none
     }
 
+    /// Keeps the iPhone display awake ONLY while the full-screen Lyrics mode is visibly open in the foreground,
+    /// and immediately restores normal iOS Auto-Lock as soon as the user closes the player, switches tabs, or leaves the app.
+    public static func shouldPreventScreenAutoLock(
+        isPlayerExpanded: Bool,
+        activeOverlayTab: UniversalAudioPlayerEngine.ExpandedOverlayTab,
+        hasCurrentTrack: Bool,
+        isAppActive: Bool
+    ) -> Bool {
+        isPlayerExpanded && activeOverlayTab == .lyrics && hasCurrentTrack && isAppActive
+    }
+
+    private var keepScreenAwakeForLyrics: Bool {
+        Self.shouldPreventScreenAutoLock(
+            isPlayerExpanded: player.isPlayerExpanded,
+            activeOverlayTab: player.activeOverlayTab,
+            hasCurrentTrack: player.currentTrack != nil,
+            isAppActive: scenePhase == .active
+        )
+    }
+
+    private func applyIdleTimerPolicy(_ preventAutoLock: Bool) {
+        if UIApplication.shared.isIdleTimerDisabled != preventAutoLock {
+            UIApplication.shared.isIdleTimerDisabled = preventAutoLock
+        }
+    }
+
     public var body: some View {
         GeometryReader { safeGeo in
             let safeTop = safeGeo.safeAreaInsets.top
@@ -209,6 +236,15 @@ public struct AppleMusicPlayerOverlayView: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+        }
+        .onAppear {
+            applyIdleTimerPolicy(keepScreenAwakeForLyrics)
+        }
+        .onChange(of: keepScreenAwakeForLyrics) { _, shouldPreventAutoLock in
+            applyIdleTimerPolicy(shouldPreventAutoLock)
+        }
+        .onDisappear {
+            applyIdleTimerPolicy(false)
         }
     }
 }
