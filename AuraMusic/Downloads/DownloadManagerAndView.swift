@@ -59,6 +59,7 @@ public struct ResolvedAudioStreamCandidate: Equatable, Sendable {
     public let itag: Int
     public let mimeType: String
     public let isProgressiveMP4: Bool
+    public let isHLSManifest: Bool
     public let durationSeconds: TimeInterval
     public let headers: [String: String]
 
@@ -67,6 +68,7 @@ public struct ResolvedAudioStreamCandidate: Equatable, Sendable {
         itag: Int = 0,
         mimeType: String = "audio/mp4",
         isProgressiveMP4: Bool = false,
+        isHLSManifest: Bool = false,
         durationSeconds: TimeInterval = 0,
         headers: [String: String] = [:]
     ) {
@@ -74,6 +76,7 @@ public struct ResolvedAudioStreamCandidate: Equatable, Sendable {
         self.itag = itag
         self.mimeType = mimeType
         self.isProgressiveMP4 = isProgressiveMP4
+        self.isHLSManifest = isHLSManifest
         self.durationSeconds = durationSeconds
         self.headers = headers
     }
@@ -84,6 +87,60 @@ public struct ResolvedAudioStreamCandidate: Equatable, Sendable {
 public enum YouTubeInnertubeAudioResolver {
     public static let androidClientVersion = "20.10.38"
     public static let androidUserAgent = "com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip"
+    public static let iosClientVersion = "20.10.4"
+    public static let iosUserAgent = "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3 like Mac OS X)"
+    public static let androidVRClientVersion = "1.61.48"
+    public static let androidVRUserAgent = "com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip"
+
+    private struct InnertubeClientProfile {
+        let userAgent: String
+        let clientContext: [String: Any]
+    }
+
+    private static var clientProfiles: [InnertubeClientProfile] {
+        [
+            // 1. ANDROID client: ultra-fast HTTP-200 progressive itag=18 + adaptive audio/mp4 (itag=140)
+            InnertubeClientProfile(
+                userAgent: androidUserAgent,
+                clientContext: [
+                    "clientName": "ANDROID",
+                    "clientVersion": androidClientVersion,
+                    "androidSdkVersion": 34,
+                    "osName": "Android",
+                    "osVersion": "14",
+                    "hl": "en",
+                    "gl": "US"
+                ]
+            ),
+            // 2. IOS client: native Apple HLS (.m3u8) + direct audio/mp4 signed specifically for AVPlayer!
+            InnertubeClientProfile(
+                userAgent: iosUserAgent,
+                clientContext: [
+                    "clientName": "IOS",
+                    "clientVersion": iosClientVersion,
+                    "deviceMake": "Apple",
+                    "deviceModel": "iPhone16,2",
+                    "osName": "iPhone",
+                    "osVersion": "18.3.0.22D63",
+                    "hl": "en",
+                    "gl": "US"
+                ]
+            ),
+            // 3. ANDROID_VR client: un-gated fallback whenever ANDROID/IOS gets rate-limited or region-checked
+            InnertubeClientProfile(
+                userAgent: androidVRUserAgent,
+                clientContext: [
+                    "clientName": "ANDROID_VR",
+                    "clientVersion": androidVRClientVersion,
+                    "androidSdkVersion": 32,
+                    "osName": "Android",
+                    "osVersion": "12L",
+                    "hl": "en",
+                    "gl": "US"
+                ]
+            )
+        ]
+    }
 
     public static func resolvePlayableStreams(videoID: String, timeoutSeconds: TimeInterval = 10.0) async -> [ResolvedAudioStreamCandidate] {
         let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
@@ -93,20 +150,39 @@ public enum YouTubeInnertubeAudioResolver {
             return []
         }
 
+        var collected: [ResolvedAudioStreamCandidate] = []
+        let perClientTimeout = max(3.5, min(timeoutSeconds, 6.0))
+
+        for profile in clientProfiles {
+            let batch = await fetchStreams(
+                videoID: safeVideoID,
+                endpoint: endpoint,
+                profile: profile,
+                timeoutSeconds: perClientTimeout
+            )
+            for candidate in batch where !collected.contains(where: { $0.url == candidate.url }) {
+                collected.append(candidate)
+            }
+            // Stop early as soon as we have a direct progressive MP4 or pure audio/mp4 stream
+            if collected.contains(where: { $0.isProgressiveMP4 || (!$0.isHLSManifest && $0.mimeType.contains("audio/mp4")) }) {
+                break
+            }
+        }
+        return collected
+    }
+
+    private static func fetchStreams(
+        videoID: String,
+        endpoint: URL,
+        profile: InnertubeClientProfile,
+        timeoutSeconds: TimeInterval
+    ) async -> [ResolvedAudioStreamCandidate] {
         let payload: [String: Any] = [
-            "videoId": safeVideoID,
+            "videoId": videoID,
             "contentCheckOk": true,
             "racyCheckOk": true,
             "context": [
-                "client": [
-                    "clientName": "ANDROID",
-                    "clientVersion": androidClientVersion,
-                    "androidSdkVersion": 34,
-                    "osName": "Android",
-                    "osVersion": "14",
-                    "hl": "en",
-                    "gl": "US"
-                ]
+                "client": profile.clientContext
             ]
         ]
 
@@ -119,21 +195,32 @@ public enum YouTubeInnertubeAudioResolver {
         request.httpBody = bodyData
         request.timeoutInterval = timeoutSeconds
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue(androidUserAgent, forHTTPHeaderField: "User-Agent")
+        request.setValue(profile.userAgent, forHTTPHeaderField: "User-Agent")
 
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
                 return []
             }
-            return parsePlayerResponseJSON(data, headers: ["User-Agent": androidUserAgent])
+            return parsePlayerResponseJSON(data, headers: ["User-Agent": profile.userAgent])
         } catch {
             return []
         }
     }
 
+    /// Orders resolved candidates specifically for native live `AVPlayer` streaming:
+    /// 1) Pure audio-only AAC `audio/mp4` (zero video track -> native Dynamic Island Music + higher audio fidelity + 5× less data)
+    /// 2) Progressive MP4 `itag=18` (video track disabled at runtime for pure-audio Dynamic Island)
+    /// 3) Native Apple HLS `.m3u8` manifest (universal AVPlayer support across restricted music tracks)
+    public static func orderedStreamingCandidates(from raw: [ResolvedAudioStreamCandidate]) -> [ResolvedAudioStreamCandidate] {
+        let pureAudio = raw.filter { !$0.isProgressiveMP4 && !$0.isHLSManifest && $0.mimeType.contains("audio/mp4") }
+        let progressive = raw.filter { $0.isProgressiveMP4 && !$0.isHLSManifest }
+        let hls = raw.filter { $0.isHLSManifest }
+        return pureAudio + progressive + hls
+    }
+
     /// Parses YouTube `/youtubei/v1/player` JSON, prioritizing unthrottled HTTP-200 progressive MP4 (`itag=18`, avc1+mp4a)
-    /// which downloads full-length songs in 1–3s without PO-token 403 errors and strips cleanly to lossless `.m4a` on-device.
+    /// for offline single-file downloads, plus adaptive pure-audio `audio/mp4` (`itag=140`) and Apple native HLS (`hlsManifestUrl`).
     public static func parsePlayerResponseJSON(
         _ data: Data,
         headers: [String: String] = ["User-Agent": androidUserAgent]
@@ -176,6 +263,7 @@ public enum YouTubeInnertubeAudioResolver {
                         itag: itag,
                         mimeType: mime,
                         isProgressiveMP4: true,
+                        isHLSManifest: false,
                         durationSeconds: dur,
                         headers: headers
                     )
@@ -208,6 +296,7 @@ public enum YouTubeInnertubeAudioResolver {
                         itag: itag,
                         mimeType: mime,
                         isProgressiveMP4: false,
+                        isHLSManifest: false,
                         durationSeconds: dur,
                         headers: headers
                     )
@@ -215,7 +304,23 @@ public enum YouTubeInnertubeAudioResolver {
             }
         }
 
-        return progressiveCandidates + adaptiveAudioCandidates
+        var hlsCandidates: [ResolvedAudioStreamCandidate] = []
+        if let rawHLS = streaming["hlsManifestUrl"] as? String,
+           let hlsURL = URL(string: rawHLS) {
+            hlsCandidates.append(
+                ResolvedAudioStreamCandidate(
+                    url: hlsURL,
+                    itag: 0,
+                    mimeType: "application/vnd.apple.mpegurl",
+                    isProgressiveMP4: false,
+                    isHLSManifest: true,
+                    durationSeconds: detailsDur,
+                    headers: headers
+                )
+            )
+        }
+
+        return progressiveCandidates + adaptiveAudioCandidates + hlsCandidates
     }
 }
 
@@ -1064,11 +1169,11 @@ public final class OfflineDownloadManager: NSObject, ObservableObject {
             }
         }
 
-        // C. PRIMARY ULTRA-FAST RESOLVER: YouTube ANDROID Innertube API -> HTTP 200 full-length progressive MP4 (itag=18)!
+        // C. PRIMARY ULTRA-FAST RESOLVER: YouTube Multi-Client Innertube API -> HTTP 200 full-length MP4/M4A (skips .m3u8 HLS for single-file download)
         updateTask(id: track.id) { $0.progress = 0.08 }
         for vid in targetVideoIDs.prefix(2) {
             let resolved = await YouTubeInnertubeAudioResolver.resolvePlayableStreams(videoID: vid)
-            for stream in resolved {
+            for stream in resolved where !stream.isHLSManifest {
                 appendUnique(stream)
             }
             if candidates.contains(where: \.isProgressiveMP4) {
@@ -1083,7 +1188,7 @@ public final class OfflineDownloadManager: NSObject, ObservableObject {
             if let backups = try? await ytMusicProvider.searchTracks(query: query, limit: 3) {
                 for backup in backups where !backup.providerTrackID.isEmpty && !targetVideoIDs.contains(backup.providerTrackID) {
                     let resolved = await YouTubeInnertubeAudioResolver.resolvePlayableStreams(videoID: backup.providerTrackID)
-                    for stream in resolved {
+                    for stream in resolved where !stream.isHLSManifest {
                         appendUnique(stream)
                     }
                     if candidates.contains(where: \.isProgressiveMP4) {

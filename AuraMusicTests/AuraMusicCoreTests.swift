@@ -3214,4 +3214,97 @@ final class AuraMusicCoreTests: XCTestCase {
             )
         )
     }
+
+    func testInnertubeParserExtractsHLSManifestAndOrdersPureAudioFirstForNativeDynamicIslandStreaming() throws {
+        let jsonWithHLS = """
+        {
+          "playabilityStatus": { "status": "OK" },
+          "videoDetails": { "videoId": "ISLAND_HLS_01", "title": "Blinding Lights", "lengthSeconds": "200" },
+          "streamingData": {
+            "hlsManifestUrl": "https://manifest.googlevideo.com/api/manifest/hls_playlist/expire/1999999999/id/ISLAND_HLS_01/index.m3u8",
+            "formats": [
+              {
+                "itag": 18,
+                "url": "https://rr1---sn-test.googlevideo.com/videoplayback?itag=18&mime=video/mp4",
+                "mimeType": "video/mp4; codecs=\\"avc1.42001E, mp4a.40.2\\"",
+                "approxDurationMs": "200000"
+              }
+            ],
+            "adaptiveFormats": [
+              {
+                "itag": 140,
+                "url": "https://rr1---sn-test.googlevideo.com/videoplayback?itag=140&mime=audio/mp4",
+                "mimeType": "audio/mp4; codecs=\\"mp4a.40.2\\"",
+                "bitrate": 129800,
+                "approxDurationMs": "200000"
+              }
+            ]
+          }
+        }
+        """
+        let data = try XCTUnwrap(jsonWithHLS.data(using: .utf8))
+        let parsed = YouTubeInnertubeAudioResolver.parsePlayerResponseJSON(
+            data,
+            headers: ["User-Agent": YouTubeInnertubeAudioResolver.iosUserAgent]
+        )
+        XCTAssertEqual(parsed.count, 3)
+        XCTAssertEqual(parsed[0].itag, 18, "Download-first order keeps progressive itag=18 first")
+        XCTAssertEqual(parsed[1].itag, 140)
+        XCTAssertTrue(parsed[2].isHLSManifest, "Trailing candidate must capture native Apple HLS manifest")
+
+        let streamingOrder = YouTubeInnertubeAudioResolver.orderedStreamingCandidates(from: parsed)
+        XCTAssertEqual(streamingOrder.count, 3)
+        XCTAssertEqual(streamingOrder[0].itag, 140, "Live AVPlayer streaming MUST prefer pure audio/mp4 first for Dynamic Island Music mode")
+        XCTAssertFalse(streamingOrder[0].isProgressiveMP4)
+        XCTAssertFalse(streamingOrder[0].isHLSManifest)
+        XCTAssertEqual(streamingOrder[1].itag, 18, "Progressive MP4 comes second if pure audio/mp4 fails")
+        XCTAssertTrue(streamingOrder[2].isHLSManifest, "Native Apple HLS manifest serves as reliable 3rd native AVPlayer tier")
+    }
+
+    @MainActor
+    func testNativeAVPlayerConfiguresBackgroundPureMusicPolicyAndDisablesVideoTracks() throws {
+        let engine = UniversalAudioPlayerEngine.shared
+        XCTAssertTrue(
+            engine.isPrimaryPlayerConfiguredForBackgroundMusic,
+            "primaryPlayer MUST enable .continuesIfPossible and disable display sleep during video for pure Music Dynamic Island playback"
+        )
+
+        // Safe no-op on nil player item
+        UniversalAudioPlayerEngine.disableVideoTracksForPureMusicMode(on: nil)
+
+        // Playing a local audio file locks .playback + .longFormAudio with NO .mixWithOthers and audio mediaType
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let dlDir = docs.appendingPathComponent("AuraDownloads", isDirectory: true)
+        try FileManager.default.createDirectory(at: dlDir, withIntermediateDirectories: true)
+        let relPath = "AuraDownloads/island_persist_test.wav"
+        let fullURL = docs.appendingPathComponent(relPath)
+        try UniversalAudioPlayerEngine.buildSubAudibleKeepAliveWAVData().write(to: fullURL, options: .atomic)
+
+        let track = UniversalTrack(
+            provider: .youtubeMusic,
+            providerTrackID: "ISLAND_PERSIST_01",
+            title: "Save Your Tears",
+            artist: "The Weeknd",
+            album: "After Hours",
+            duration: 215.0,
+            isStreamable: true
+        )
+        defer {
+            engine.pause()
+            engine.teardownYouTubeWebViewCompletely()
+            OfflineDownloadManager.shared.removeDownload(trackID: track.id)
+            try? FileManager.default.removeItem(at: fullURL)
+        }
+
+        OfflineDownloadManager.shared.registerCompletedDownloadForTesting(track: track, relativePath: relPath)
+        engine.play(track)
+
+        let session = AVAudioSession.sharedInstance()
+        XCTAssertEqual(session.category, .playback)
+        XCTAssertFalse(session.categoryOptions.contains(.mixWithOthers))
+        let info = try XCTUnwrap(MPNowPlayingInfoCenter.default().nowPlayingInfo)
+        XCTAssertEqual(info[MPNowPlayingInfoPropertyMediaType] as? UInt, MPNowPlayingInfoMediaType.audio.rawValue)
+        XCTAssertEqual(info[MPNowPlayingInfoPropertyIsLiveStream] as? Bool, false)
+        XCTAssertEqual(MPNowPlayingInfoCenter.default().playbackState, .playing)
+    }
 }

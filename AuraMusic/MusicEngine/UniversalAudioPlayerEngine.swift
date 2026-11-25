@@ -202,6 +202,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     private var timeObserverToken: Any?
     private var endOfTrackCancellable: AnyCancellable?
     private var itemStatusObservation: NSKeyValueObservation?
+    private var playerTimeControlObservation: NSKeyValueObservation?
     private var outputVolumeObservation: NSKeyValueObservation?
     private var sleepTimerTask: Task<Void, Never>?
     private var youtubeWatchdogTask: Task<Void, Never>?
@@ -210,7 +211,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     private var delayedKeepAliveStopTask: Task<Void, Never>?
     private var nativeHandoffTask: Task<Void, Never>?
     private var nativeHandoffObservation: NSKeyValueObservation?
-    private var attemptedNativeHandoffVideoIDs: Set<String> = []
+    private var attemptedNativeHandoffURLsByVideoID: [String: Set<String>] = [:]
     private var isUserPaused: Bool = false
     private var secondaryAudioWasAlreadySilencedOnBackground: Bool = false
     private var lastUserPauseWallTime: TimeInterval = 0
@@ -225,6 +226,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     private var fallbackYouTubeVideoIDs: [String] = []
     private var crossfadeTriggeredForCurrentItem = false
     private var lastPublishedArtworkTrackID: String?
+    private var lastPublishedArtworkURLString: String?
     private var lastPublishedArtwork: MPMediaItemArtwork?
 
     private let appleProvider = AppleMusicProvider()
@@ -233,18 +235,56 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     private let soundCloudProvider = SoundCloudProvider()
     private let matcher = TrackMatchingEngine()
 
+    internal var isPrimaryPlayerConfiguredForBackgroundMusic: Bool {
+        primaryPlayer.audiovisualBackgroundPlaybackPolicy == .continuesIfPossible
+            && !primaryPlayer.preventsDisplaySleepDuringVideoPlayback
+    }
+
     private init() {
+        primaryPlayer.audiovisualBackgroundPlaybackPolicy = .continuesIfPossible
+        primaryPlayer.preventsDisplaySleepDuringVideoPlayback = false
         configureAudioSession(mixWithWebKit: false)
         let hwVol = AVAudioSession.sharedInstance().outputVolume
         if hwVol.isFinite && hwVol > 0 {
             self.volume = hwVol
         }
         observeSystemHardwareVolume()
+        observePrimaryPlayerTimeControlStatus()
         YouTubeAdBlockerRuleManager.shared.preloadRules()
         prepareSilentBackgroundKeepAlivePlayer()
         configureRemoteCommandCenter()
         configureAudioNotifications()
         attachPeriodicTimeObserver()
+    }
+
+    /// Disables any embedded video tracks on a progressive MP4 `AVPlayerItem` so iOS SpringBoard & MediaRemote
+    /// classify playback strictly as pure music audio and display the Dynamic Island Music waveform + artwork.
+    public static func disableVideoTracksForPureMusicMode(on item: AVPlayerItem?) {
+        guard let item else { return }
+        for track in item.tracks where track.assetTrack?.mediaType == .video {
+            if track.isEnabled {
+                track.isEnabled = false
+            }
+        }
+    }
+
+    private func observePrimaryPlayerTimeControlStatus() {
+        playerTimeControlObservation?.invalidate()
+        playerTimeControlObservation = primaryPlayer.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
+            let status = player.timeControlStatus
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if status == .playing,
+                   self.activeYouTubeVideoID == nil,
+                   self.currentTrack != nil,
+                   !self.isUserPaused {
+                    Self.disableVideoTracksForPureMusicMode(on: self.primaryPlayer.currentItem)
+                    self.setBackgroundKeepAliveActive(false)
+                    self.configureAudioSession(mixWithWebKit: false)
+                    self.refreshNowPlayingMetadata()
+                }
+            }
+        }
     }
 
     public func syncObservedHardwareVolume(_ hardwareVolume: Float) {
@@ -285,15 +325,20 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         }
         capturedYouTubeAudioStreamURLs[videoID] = url
 
-        // Attempt silent, zero-risk upgrade from WKWebView to 100% native AVPlayer for native iOS Lock Screen & background controls!
-        if isNativeFriendly,
-           !lower.contains("ump=1"),
+        // Attempt silent, zero-risk upgrade from WKWebView to 100% native AVPlayer for native iOS Dynamic Island Music UI!
+        let urlString = url.absoluteString
+        let alreadyAttempted = attemptedNativeHandoffURLsByVideoID[videoID] ?? []
+        let allowURL = isNativeFriendly && (!lower.contains("ump=1") || lower.contains(".m3u8") || lower.contains("manifest.googlevideo.com"))
+        if allowURL,
            activeYouTubeVideoID == videoID,
            isPlaying,
            !isUserPaused,
            let track = currentTrack,
-           !attemptedNativeHandoffVideoIDs.contains(videoID) {
-            attemptedNativeHandoffVideoIDs.insert(videoID)
+           alreadyAttempted.count < 3,
+           !alreadyAttempted.contains(urlString) {
+            var updated = alreadyAttempted
+            updated.insert(urlString)
+            attemptedNativeHandoffURLsByVideoID[videoID] = updated
             let gen = playbackGeneration
             attemptSeamlessNativeAVPlayerHandoff(streamURL: url, videoID: videoID, track: track, generation: gen)
         }
@@ -396,6 +441,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
                     self?.handleTrackFinished()
                 }
 
+                Self.disableVideoTracksForPureMusicMode(on: probeItem)
                 self.itemStatusObservation?.invalidate()
                 self.itemStatusObservation = nil
                 self.primaryPlayer.automaticallyWaitsToMinimizeStalling = true
@@ -741,8 +787,10 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         if activeYouTubeVideoID != nil {
             setBackgroundKeepAliveActive(true, mixWithWebKit: true)
         } else {
+            Self.disableVideoTracksForPureMusicMode(on: primaryPlayer.currentItem)
             configureAudioSession(mixWithWebKit: false)
             refreshNowPlayingMetadata()
+            reassertNowPlayingOwnershipAfterDelay()
         }
 
         // Continuous background watchdog: immediately recovers if iOS WebKit suspends <video> on transition or mid-song
@@ -859,26 +907,35 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
     public static let backgroundPausedLockScreenAudioSessionOptions: AVAudioSession.CategoryOptions = []
 
     private func configureAudioSession(mixWithWebKit: Bool = false) {
+        let session = AVAudioSession.sharedInstance()
+        let targetOptions = mixWithWebKit
+            ? Self.activePlaybackAudioSessionOptions
+            : Self.backgroundPausedLockScreenAudioSessionOptions
+        let alreadyConfigured = session.category == .playback
+            && session.mode == .default
+            && session.categoryOptions == targetOptions
+            && (mixWithWebKit || session.routeSharingPolicy == .longFormAudio)
+
         do {
-            let session = AVAudioSession.sharedInstance()
-            if mixWithWebKit {
-                try session.setCategory(
-                    .playback,
-                    mode: .default,
-                    options: Self.activePlaybackAudioSessionOptions
-                )
-            } else {
-                try session.setCategory(
-                    .playback,
-                    mode: .default,
-                    policy: .longFormAudio,
-                    options: Self.backgroundPausedLockScreenAudioSessionOptions
-                )
+            if !alreadyConfigured {
+                if mixWithWebKit {
+                    try session.setCategory(
+                        .playback,
+                        mode: .default,
+                        options: Self.activePlaybackAudioSessionOptions
+                    )
+                } else {
+                    try session.setCategory(
+                        .playback,
+                        mode: .default,
+                        policy: .longFormAudio,
+                        options: Self.backgroundPausedLockScreenAudioSessionOptions
+                    )
+                }
             }
             try session.setActive(true)
         } catch {
             // Fallback without routeSharingPolicy on constrained simulator environments
-            let session = AVAudioSession.sharedInstance()
             try? session.setCategory(.playback, mode: .default, options: mixWithWebKit ? [.mixWithOthers] : [])
             try? session.setActive(true)
         }
@@ -1177,7 +1234,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         nativeHandoffObservation?.invalidate()
         nativeHandoffObservation = nil
         primaryPlayer.isMuted = false
-        attemptedNativeHandoffVideoIDs.removeAll()
+        attemptedNativeHandoffURLsByVideoID.removeAll()
         lastTrackStartWallTime = CACurrentMediaTime()
         lastUserResumeWallTime = 0
         playPauseCooldownGate.reset()
@@ -1228,6 +1285,12 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
             isPlayingOfflineFile = true
             startAVPlayer(with: localURL, for: trackWithCustomArt, banner: nil)
             return
+        }
+
+        // Keep exclusive `.playback` + `.longFormAudio` active across any async network resolve gap in background
+        // so iOS never tears down the Dynamic Island Music session while fetching the next track's stream URL!
+        if activeYouTubeVideoID == nil && UIApplication.shared.applicationState != .active {
+            setBackgroundKeepAliveActive(true, mixWithWebKit: false)
         }
 
         refreshNowPlayingMetadata()
@@ -1314,12 +1377,25 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
             }
 
         case .youtubeMusic, .youtube:
-            // Try 100% AD-FREE direct native AVPlayer playback via ANDROID Innertube itag=18 FIRST (0 ads, 0 WebKit!)
+            // Try 100% AD-FREE direct native AVPlayer playback via Multi-Client Innertube FIRST (0 ads, pure Dynamic Island Music!)
             if await tryStartDirectAdFreeYouTubeAVStream(videoID: track.providerTrackID, for: track, generation: generation) {
                 Task {
                     await upgradeToSquareAppleMusicCoverIfNeeded(for: track)
                 }
                 return
+            }
+            guard generation == playbackGeneration, !isUserPaused else { return }
+            // Try one alternate YouTube Music audio upload before falling back to WKWebView so Dynamic Island stays native
+            let altQuery = "\(track.title) \(track.artist) official audio"
+            if let altCandidates = try? await ytMusicProvider.searchTracks(query: altQuery, limit: 3),
+               let alternate = altCandidates.first(where: { !$0.providerTrackID.isEmpty && $0.providerTrackID != track.providerTrackID }) {
+                guard generation == playbackGeneration, !isUserPaused else { return }
+                if await tryStartDirectAdFreeYouTubeAVStream(videoID: alternate.providerTrackID, for: track, generation: generation) {
+                    Task {
+                        await upgradeToSquareAppleMusicCoverIfNeeded(for: track)
+                    }
+                    return
+                }
             }
             guard generation == playbackGeneration, !isUserPaused else { return }
             startFullLengthYouTubeMusicPlayback(videoID: track.providerTrackID, for: track)
@@ -1377,28 +1453,32 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         return false
     }
 
-    /// Resolves a direct HTTP-200 progressive stream via YouTube ANDROID Innertube API and plays it on native `AVPlayer`:
-    /// 0.00% ads (ad servers are never contacted!), native background audio, native Lock Screen & native trim bounds!
+    /// Resolves a direct HTTP-200 pure-audio (`audio/mp4`), progressive MP4, or Apple HLS (`.m3u8`) stream via
+    /// YouTube Multi-Client Innertube API and plays it on native `AVPlayer` with pure-audio Dynamic Island Music UI!
     private func tryStartDirectAdFreeYouTubeAVStream(
         videoID: String,
         for track: UniversalTrack,
         generation: Int
     ) async -> Bool {
         guard !videoID.isEmpty else { return false }
-        let candidates = await YouTubeInnertubeAudioResolver.resolvePlayableStreams(videoID: videoID, timeoutSeconds: 5.5)
+        let rawCandidates = await YouTubeInnertubeAudioResolver.resolvePlayableStreams(videoID: videoID, timeoutSeconds: 8.5)
         guard generation == playbackGeneration, !isUserPaused else { return true }
 
-        for stream in candidates where stream.isProgressiveMP4 {
+        let ordered = YouTubeInnertubeAudioResolver.orderedStreamingCandidates(from: rawCandidates)
+        for stream in ordered {
             let asset = AVURLAsset(url: stream.url, options: ["AVURLAssetHTTPHeaderFieldsKey": stream.headers])
             if let (isPlayable, loadedDuration) = try? await asset.load(.isPlayable, .duration),
                generation == playbackGeneration,
                !isUserPaused,
-               isPlayable,
-               OfflineDownloadManager.isFullLengthDurationValid(
-                   actualDuration: loadedDuration.seconds,
-                   expectedTrackDuration: track.duration
-               ) {
-                if loadedDuration.seconds > self.duration {
+               isPlayable {
+                let effectiveActual = (stream.isHLSManifest && !loadedDuration.seconds.isFinite) ? track.duration : loadedDuration.seconds
+                guard OfflineDownloadManager.isFullLengthDurationValid(
+                    actualDuration: effectiveActual,
+                    expectedTrackDuration: track.duration
+                ) else {
+                    continue
+                }
+                if loadedDuration.seconds.isFinite && loadedDuration.seconds > self.duration {
                     self.duration = loadedDuration.seconds
                 }
                 startAVPlayer(
@@ -1406,6 +1486,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
                     for: track,
                     banner: nil,
                     customUserAgent: stream.headers["User-Agent"] ?? YouTubeInnertubeAudioResolver.androidUserAgent,
+                    customHeaders: stream.headers,
                     youtubeFallbackVideoID: videoID
                 )
                 return true
@@ -1486,6 +1567,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
             return
         }
         guard generation == playbackGeneration, !isUserPaused else { return }
+        setBackgroundKeepAliveActive(false)
         isBuffering = false
         isPlaying = false
         playbackStatusBanner = "Direct stream restricted by \(track.provider.displayName)."
@@ -1497,6 +1579,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         banner: String?,
         isFallbackRetry: Bool = false,
         customUserAgent: String? = nil,
+        customHeaders: [String: String]? = nil,
         youtubeFallbackVideoID: String? = nil
     ) {
         teardownYouTubeWebViewCompletely()
@@ -1509,7 +1592,9 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         playbackStatusBanner = banner
 
         var assetOptions: [String: Any] = [:]
-        if let customUserAgent {
+        if let customHeaders, !customHeaders.isEmpty {
+            assetOptions["AVURLAssetHTTPHeaderFieldsKey"] = customHeaders
+        } else if let customUserAgent {
             assetOptions["AVURLAssetHTTPHeaderFieldsKey"] = ["User-Agent": customUserAgent]
         }
         let asset = AVURLAsset(url: url, options: assetOptions.isEmpty ? nil : assetOptions)
@@ -1534,6 +1619,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
                 guard self.playbackGeneration == targetGen else { return }
                 switch item.status {
                 case .readyToPlay:
+                    Self.disableVideoTracksForPureMusicMode(on: item)
                     let itemDur = item.duration.seconds
                     if itemDur.isFinite && itemDur > 0 {
                         self.duration = itemDur
@@ -1553,9 +1639,11 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
                     self.isBuffering = false
                     if !self.isUserPaused {
                         self.isPlaying = true
+                        self.configureAudioSession(mixWithWebKit: false)
                         self.primaryPlayer.play()
                     }
                     self.refreshNowPlayingMetadata()
+                    self.reassertNowPlayingOwnershipAfterDelay()
                 case .failed:
                     if let ytVid = youtubeFallbackVideoID, !ytVid.isEmpty, !self.isUserPaused {
                         // Seamlessly fall back to WebKit if direct Innertube stream expired/failed
@@ -1887,6 +1975,7 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
         let center = MPNowPlayingInfoCenter.default()
         guard let track = currentTrack else {
             lastPublishedArtworkTrackID = nil
+            lastPublishedArtworkURLString = nil
             lastPublishedArtwork = nil
             center.nowPlayingInfo = nil
             center.playbackState = .stopped
@@ -1913,24 +2002,25 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
             MPNowPlayingInfoPropertyPlaybackRate: isPlaying ? 1.0 : 0.0,
             MPNowPlayingInfoPropertyDefaultPlaybackRate: 1.0,
             MPNowPlayingInfoPropertyMediaType: MPNowPlayingInfoMediaType.audio.rawValue,
-            MPNowPlayingInfoPropertyIsLiveStream: false
+            MPNowPlayingInfoPropertyIsLiveStream: (track.provider == .radio)
         ]
 
         // Synchronously attach the TRUE original 1:1 square song cover from RAM or local/disk cache (<2ms).
         // NEVER flash a synthetic pink fallback placeholder in Dynamic Island!
         let effectiveArtURL = PersistenceController.shared.effectiveArtworkURL(for: track) ?? track.artworkURL
-        var attachedImmediateArtwork = false
+        var attachedExactArtwork = false
         if let artworkURL = effectiveArtURL,
            let rawImmediate = ArtworkCacheManager.shared.cachedImageSynchronously(for: artworkURL) {
             let squared = Self.squareNowPlayingArtworkImage(from: rawImmediate)
             let mpArtwork = MPMediaItemArtwork(boundsSize: squared.size) { _ in squared }
             info[MPMediaItemPropertyArtwork] = mpArtwork
             lastPublishedArtworkTrackID = track.id
+            lastPublishedArtworkURLString = artworkURL.absoluteString
             lastPublishedArtwork = mpArtwork
-            attachedImmediateArtwork = true
+            attachedExactArtwork = true
         } else if lastPublishedArtworkTrackID == track.id, let preserved = lastPublishedArtwork {
             info[MPMediaItemPropertyArtwork] = preserved
-            attachedImmediateArtwork = true
+            attachedExactArtwork = (effectiveArtURL?.absoluteString == lastPublishedArtworkURLString)
         }
 
         center.nowPlayingInfo = info
@@ -1964,20 +2054,22 @@ public final class UniversalAudioPlayerEngine: ObservableObject {
             }
         }
 
-        if let artworkURL = effectiveArtURL, !attachedImmediateArtwork {
+        if let artworkURL = effectiveArtURL, !attachedExactArtwork {
             let targetTrackID = track.id
+            let targetArtURLString = artworkURL.absoluteString
             Task { @MainActor in
                 if let image = await ArtworkCacheManager.shared.image(for: artworkURL),
                    self.currentTrack?.id == targetTrackID {
                     let squared = Self.squareNowPlayingArtworkImage(from: image)
                     let artwork = MPMediaItemArtwork(boundsSize: squared.size) { _ in squared }
                     self.lastPublishedArtworkTrackID = targetTrackID
+                    self.lastPublishedArtworkURLString = targetArtURLString
                     self.lastPublishedArtwork = artwork
                     let latestRaw = self.duration > 0 ? self.duration : track.duration
                     var latest = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? info
                     latest[MPMediaItemPropertyArtwork] = artwork
                     latest[MPNowPlayingInfoPropertyMediaType] = MPNowPlayingInfoMediaType.audio.rawValue
-                    latest[MPNowPlayingInfoPropertyIsLiveStream] = false
+                    latest[MPNowPlayingInfoPropertyIsLiveStream] = (track.provider == .radio)
                     latest[MPNowPlayingInfoPropertyPlaybackRate] = self.isPlaying ? 1.0 : 0.0
                     latest[MPNowPlayingInfoPropertyElapsedPlaybackTime] = self.displayPlaybackTime(rawTime: self.currentTime, rawDuration: latestRaw)
                     latest[MPMediaItemPropertyPlaybackDuration] = self.displayPlaybackBounds(for: latestRaw).duration
